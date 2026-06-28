@@ -16,6 +16,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.junit.Before;
 import org.junit.Test;
 
+import static org.junit.Assert.*;
+
 /**
  * Abstract base for ML-DSA-WITH-SHA512 learning tests.
  * Subclasses provide the concrete parameter set and algorithm name.
@@ -52,7 +54,7 @@ public abstract class AbstractMLDSATest
 
         sig.initVerify(kp.getPublic());
         sig.update(msg);
-        org.junit.Assert.assertTrue(
+        assertTrue(
             "signature verification failed for " + getAlgorithmName(),
             sig.verify(signature));
     }
@@ -73,8 +75,8 @@ public abstract class AbstractMLDSATest
         log.info("[{}] expanded private key length: {}", getAlgorithmName(), expanded.length);
         log.info("[{}] public key bytes length: {}", getAlgorithmName(), pubBytes.length);
 
-        org.junit.Assert.assertTrue("seed should be 32 bytes", seed.length == 32);
-        org.junit.Assert.assertTrue("public key must not be empty", pubBytes.length > 0);
+        assertTrue("seed should be 32 bytes", seed.length == 32);
+        assertTrue("public key must not be empty", pubBytes.length > 0);
     }
 
     /**
