@@ -103,7 +103,7 @@ public final class BouncyCastleProvider extends Provider
 
     private static final String[] SYMMETRIC_GENERIC =
         {
-            "PBEPBKDF1", "PBEPBKDF2", "PBEPKCS12", "TLSKDF", "SCRYPT", "HKDF"
+            "PBEPBKDF1", "PBEPBKDF2", "PBEPKCS12", "TLSKDF", "SCRYPT", "ARGON2", "HKDF"
         };
 
     private static final String[] SYMMETRIC_MACS =
@@ -139,7 +139,7 @@ public final class BouncyCastleProvider extends Provider
     private static final String[] ASYMMETRIC_CIPHERS =
         {
             "DSA", "DH", "EC", "RSA", "GOST", "ECGOST", "ElGamal", "DSTU4145", "GM", "EdEC", "LMS", "NTRU", "Falcon", "CONTEXT", "SLHDSA", "MLDSA", "MLKEM",
-            "FrodoKEM", "Dilithium", "SPHINCSPlus", "CompositeKEMs"
+            "CMCE", "FrodoKEM", "Dilithium", "SPHINCSPlus", "CompositeKEMs"
         };
 
     /*
