@@ -28,6 +28,8 @@ println("Environment setup:")
 if (JavaVersion.current().isJava8Compatible()) {
     allprojects {
         tasks.withType(Javadoc) {
+            options.encoding = "UTF-8"
+            options.tags = ["implNote:a:Implementation Note:"]
             options.addStringOption('Xdoclint:none', '-quiet')
         }
     }
@@ -181,17 +183,28 @@ configure(subprojects.findAll {it.name != 'bom'}) {
 
 
     JavaVersion current = JavaVersion.current();
+    def isIdea = System.getProperty("idea.active") != null
     int releaseVersion = 8;
     if (current.compareTo(JavaVersion.VERSION_1_8) <= 0) {
         releaseVersion = 5
     }
 
-    compileJava {
-        options.release = releaseVersion;
-    }
+    if (!isIdea) {
+        compileJava {
+            options.release = releaseVersion;
+        }
 
-    compileTestJava {
-        options.release = 8;
+        compileTestJava {
+            options.release = 8;
+        }
+    } else {
+        tasks.withType(JavaCompile).configureEach {
+            // 关掉所有编译器警告
+            options.compilerArgs += [
+                    '-nowarn',
+                    '-Xlint:none'
+            ]
+        }
     }
 
 
@@ -276,7 +289,11 @@ configure(subprojects.findAll {it.name != 'bom'}) {
     }
 
     tasks.withType(JavaCompile).configureEach {
-        options.debug = false;
+        // 关掉所有编译器警告
+        options.compilerArgs += [
+                '-g' // 调试行号
+        ]
+        options.debug = true
     }
 
     tasks.withType(Test).configureEach {

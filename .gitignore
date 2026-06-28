@@ -58,3 +58,19 @@ bc-build.user.properties
 /mail/*.message
 /prov/ells
 /tls/ells
+
+
+.codegraph
+
+# Personal learning module — excluded from codegraph/AI analysis
+.mcp.json
+AGENTS.md
+test.log
+GEMINI.md
+opencode.jsonc
+test.gradle
+
+.cursor
+.claude
+.qoder
+.gemini

@@ -24,4 +24,7 @@
 
   <!-- Suppress warnings in this file -->
   <suppress files=".+[\\/]nohttp[\\/]suppressions.xml" checks="NoHttp"/>
+
+  <!-- 忽略 .codegraph 目录及其所有内容 -->
+<suppress files=".*[\\/]\.codegraph([\\/].*)?" checks=".*" />
 </suppressions> 

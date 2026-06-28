@@ -9,3 +9,5 @@ include "test"
 include "mls"
 include "mail"
 include "jmail"
+include "learning"
+

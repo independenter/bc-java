@@ -8,6 +8,11 @@
       <property name="fileNamePattern" value="bc\-test\-data[\\/]"/>
   </module>
 
+  <!-- 排除 .codegraph 目录 -->
+  <module name="BeforeExecutionExclusionFileFilter">
+    <property name="fileNamePattern" value="[\\/]\.codegraph[\\/]"/>
+  </module>
+
   <module name="io.spring.nohttp.checkstyle.check.NoHttpCheck">
     <property name="allowlistFileName" value="${nohttp.checkstyle.allowlistFileName}" default=""/>
   </module>

@@ -1,0 +1,98 @@
+// Learning module — depends on built jars, not gradle project sources.
+// Excluded from codegraph/AI analysis via .gitignore.
+
+plugins {
+    id 'java'
+}
+
+def bcVersion = '1.85-SNAPSHOT'
+
+dependencies {
+    // ✅ Lombok（IDEA 不红 + 能生成代码）
+    implementation 'org.projectlombok:lombok:1.18.46'
+    annotationProcessor 'org.projectlombok:lombok:1.18.46'
+    testAnnotationProcessor 'org.projectlombok:lombok:1.18.46'
+
+    // ✅ 日志
+    implementation 'org.slf4j:slf4j-api:2.0.18'
+    testImplementation 'org.slf4j:slf4j-simple:2.0.18'
+
+    // ✅ BC 库（运行时必须）
+    def isIdea = System.getProperty("idea.active") != null
+    if (isIdea) {
+        // ✅ 直接引用 BC 源码（不是 jar）
+        implementation project(':core')
+        implementation project(':util')
+        implementation project(':prov')
+        implementation project(':pkix')
+        implementation project(':pg')
+        implementation project(':tls')
+        implementation project(':mls')
+        implementation project(':mail')
+        implementation project(':jmail')
+    } else {
+        implementation fileTree(dir: rootProject.projectDir, includes: [
+                "core/build/libs/bccore-jdk18on-${bcVersion}.jar",
+                "util/build/libs/bcutil-jdk18on-${bcVersion}.jar",
+                "prov/build/libs/bcprov-jdk18on-${bcVersion}.jar",
+                "pkix/build/libs/bcpkix-jdk18on-${bcVersion}.jar",
+                "pg/build/libs/bcpg-jdk18on-${bcVersion}.jar",
+                "tls/build/libs/bctls-jdk18on-${bcVersion}.jar",
+                "mls/build/libs/bcmls-jdk18on-${bcVersion}.jar",
+                "mail/build/libs/bcmail-jdk18on-${bcVersion}.jar",
+                "jmail/build/libs/bcjmail-jdk18on-${bcVersion}.jar",
+        ])
+    }
+
+    testImplementation 'cn.hutool:hutool-all:5.8.46'
+    testImplementation 'org.slf4j:slf4j-simple:2.0.18'
+}
+
+def bcJarTasks = [
+    ':core:jar', ':util:jar', ':prov:jar', ':pkix:jar',
+    ':pg:jar', ':tls:jar', ':mls:jar', ':mail:jar', ':jmail:jar'
+]
+
+compileTestJava.dependsOn(bcJarTasks)
+
+// Run every learning test, overriding the root project's "AllTest*" filter.
+test {
+    filter {
+        setIncludePatterns("*")
+    }
+}
+
+// No coverage reports needed for learning code.
+tasks.named('jacocoTestReport') {
+    enabled = false
+}
+
+// Learning code — no style/errorprone enforcement
+checkstyle {
+    sourceSets = []
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.errorprone.enabled = false
+}
+
+//sourceSets {
+//    main {
+//        java {
+//            srcDirs = ['src/main/java']
+//        }
+//    }
+//    test {
+//        java {
+//            srcDirs = ['src/test/java']
+//        }
+//    }
+//}
+//
+if (project.hasProperty('idea')) {
+    idea {
+        module {
+            inheritOutputDirs = true
+        }
+    }
+}
