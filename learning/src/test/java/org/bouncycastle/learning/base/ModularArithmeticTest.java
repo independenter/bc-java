@@ -73,7 +73,7 @@ public class ModularArithmeticTest {
         int mod = 17;
         int base = 3;
         int exp = 5;
-        int result1 = Math.powExact(base, exp) % mod; // 注意 base ^ exp 在程序里面不是幂运算,是异或
+        int result1 = java.math.BigInteger.valueOf(base).pow(exp).intValue() % mod; // 注意 base ^ exp 在程序里面不是幂运算,是异或
         log.info("result1: {}", result1);
 
         int exp1 = 0b0101;
