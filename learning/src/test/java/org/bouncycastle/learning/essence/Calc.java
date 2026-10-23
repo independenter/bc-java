@@ -1,4 +1,4 @@
-package org.bouncycastle.learning.functional;
+package org.bouncycastle.learning.essence;
 
 import java.math.BigInteger;
 import java.security.MessageDigest;
@@ -6,30 +6,29 @@ import java.security.Security;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.function.BiFunction;
-import java.util.function.Function;
 
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 /**
- * 函数式学习模块的纯函数工具箱 —— 这里没有对象、没有继承、没有可变状态，
- * 只有"输入 -> 输出"的纯映射。所有算法本质都用 {@code java.util.function} 里的
- * JDK 内置函数接口（Function / UnaryOperator / LongBinaryOperator ...）表达，
- * 需要 3 个以上参数的函数一律用柯里化（curried）写法，因此不需要自定义接口。
+ * 学习用的小工具方法集 —— 只有字节/字/大端的互相转换、拼接、异或、十六进制打印，
+ * 加一个"注册 BC provider"和一个"拿 JCE 摘要当裁判"。
+ *
+ * <p>这里没有对象、没有继承、没有可变的全局状态，每个方法都是"参数进、新数组出"，
+ * 所以任何算法都可以直接调用它们，不需要先构造什么。
  *
  * <p>约定：32-bit 字统一放在 long 里并用 {@link #u32(long)} 掩码，避免 Java 有符号 int 的干扰。
  */
-final class Fp
+final class Calc
 {
     static final long M32 = 0xFFFFFFFFL;
 
-    private Fp()
+    private Calc()
     {
     }
 
     // ---------------------------------------------------------------- 注册 BC provider
 
-    /** 幂等的 provider 注册：函数式风格里这也是一个纯副作用出口，只在测试里调用一次。 */
+    /** 幂等的 provider 注册：只有要拿 JCE/BC 当裁判时才调一次。 */
     static void useBc()
     {
         if (Security.getProvider("BC") == null)
@@ -54,31 +53,9 @@ final class Fp
         return k == 0 ? v : (((v << k) & M32) | (v >>> (32 - k)));
     }
 
-    /** 64-bit 循环左移（SM2 大数运算里偶尔要用）。 */
-    static long rotl64(long x, int n)
-    {
-        int k = n & 63;
-        return k == 0 ? x : Long.rotateLeft(x, k);
-    }
+    // ---------------------------------------------------------------- 数组与字节
 
-    // ---------------------------------------------------------------- 数组：不可变更新
-
-    /** 返回"把第 i 个元素换成 v"的新数组 —— 这就是函数式里的 state threading。 */
-    static long[] replace(long[] a, int i, long v)
-    {
-        long[] out = a.clone();
-        out[i] = v;
-        return out;
-    }
-
-    static byte[] replace(byte[] a, int i, byte v)
-    {
-        byte[] out = a.clone();
-        out[i] = v;
-        return out;
-    }
-
-    /** 按 size 切块（最后一块可能不足 size），返回只读视图的拷贝列表。 */
+    /** 按 size 切块（最后一块可能不足 size）。 */
     static List<byte[]> chunks(byte[] data, int size)
     {
         List<byte[]> out = new ArrayList<byte[]>();
@@ -135,7 +112,7 @@ final class Fp
         return out;
     }
 
-    /** 等长异或 —— 分组密码所有模式都只用这一个组合子。 */
+    /** 等长异或 —— 分组密码所有模式都只用这一个操作。 */
     static byte[] xor(byte[] a, byte[] b)
     {
         byte[] out = new byte[Math.min(a.length, b.length)];
@@ -144,12 +121,6 @@ final class Fp
             out[i] = (byte)(a[i] ^ b[i]);
         }
         return out;
-    }
-
-    /** a ^ b ^ c（可读性用；本质还是 xor）。 */
-    static byte[] xor3(byte[] a, byte[] b, byte[] c)
-    {
-        return xor(xor(a, b), c);
     }
 
     static BigInteger toBigInt(byte[] b)
@@ -175,40 +146,6 @@ final class Fp
             System.arraycopy(raw, 0, out, length - raw.length, raw.length);
         }
         return out;
-    }
-
-    // ---------------------------------------------------------------- 柯里化调用糖
-
-    static <A, B, C, R> R apply3(Function<A, Function<B, Function<C, R>>> f, A a, B b, C c)
-    {
-        return f.apply(a).apply(b).apply(c);
-    }
-
-    static <A, B, C, D, R> R apply4(Function<A, Function<B, Function<C, Function<D, R>>>> f, A a, B b, C c, D d)
-    {
-        return f.apply(a).apply(b).apply(c).apply(d);
-    }
-
-    /** 左折叠：把"依次作用一串纯函数"写成显式 fold，避免 for 循环里的可变累加器。 */
-    static <S, V> S fold(List<V> items, S seed, BiFunction<S, V, S> step)
-    {
-        S acc = seed;
-        for (V v : items)
-        {
-            acc = step.apply(acc, v);
-        }
-        return acc;
-    }
-
-    /** 对 [from, to) 的整数做左折叠。 */
-    static <S> S foldRange(int from, int to, S seed, BiFunction<S, Integer, S> step)
-    {
-        S acc = seed;
-        for (int i = from; i < to; i++)
-        {
-            acc = step.apply(acc, i);
-        }
-        return acc;
     }
 
     // ---------------------------------------------------------------- 十六进制 / 打印
@@ -248,7 +185,9 @@ final class Fp
         return out;
     }
 
-    /** 标准摘要：给"我们的纯函数实现"和"JCE 实现"做对照的第三方裁判。 */
+    // ---------------------------------------------------------------- 裁判与杂项
+
+    /** 标准摘要：给"我们手写的实现"和"JCE 实现"做对照的第三方裁判。 */
     static byte[] digest(String algorithm, byte[] data)
         throws Exception
     {
