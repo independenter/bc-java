@@ -17,191 +17,81 @@ import static org.bouncycastle.learning.essence.Calc.rotl;
 import static org.bouncycastle.learning.essence.Calc.u32;
 
 /**
- * SM3（GB/T 32905-2016）的本质计算 —— 面向过程版。
+ * SM3（GB/T 32905-2016）的本质测试。
  *
- * <p>没有 Digest 对象、没有继承体系，SM3 只是几个普通静态方法串起来的直线代码：
+ * <p>实现本体在 {@link Sm3}（src/main）：那类纯静态方法没有状态，抽到 main 之后 SM9 引擎和
+ * JCE Provider 才能复用；这里逐块核对它的输出 —— 标准测试向量、Merkle–Damgård 可拼接性、
+ * 填充边界、布尔函数的线性/非线性分界，全部与 BC 的 SM3Digest 互相印证。
+ *
+ * <p>"状态"就是 {@link Sm3#cf} 循环里的局部变量（一个 long[8]），每轮就地改写它 ——
+ * 不克隆、不套函数、不传参绕圈，这就是面向过程写法的核心。
+ *
+ * <p><b>符号表 —— 本文件里出现的字母/记号</b>（算法本身的 W[j]、W′[j]、T_j、FF_j、GG_j、P0/P1、
+ * 链接值 V = A..H、轮号 j 等符号全部定义在 {@link Sm3} 的类注释里，这里只补测试自己的记号）
  * <pre>
- *   sm3(msg) = 大端序列化( 逐块压缩( MD填充(msg) ) )
- *   逐块压缩：用一个 for 循环把链接值 V 一块一块往前推：V = cf(V, block)   // Merkle–Damgård 迭代
+ *   msg / m      被摘要（或被认证）的消息字节串；H 表示 SM3 这个哈希函数本身
+ *   BLOCK_SIZE   分组长度 B = 64 字节 = 512 bit；HMAC 的密钥规约阈值、ipad/opad 的长度都是它
+ *   key / k      HMAC 的密钥（注意：HMAC 里的 k 是密钥，和 SM2 签名里那个随机数 k 毫无关系）
+ *   K            HMAC 密钥经规约后得到的 B 字节定长值（见 {@link #fitKey}）
+ *   ipad, opad   两个常量填充串：ipad = 0x36 重复 B 次，opad = 0x5c 重复 B 次（0x36 ⊕ 0x5c = 0x6a，
+ *                两者逐比特差异够大，保证内层/外层哈希看到的密钥"看起来"是两个独立值）
+ *   ⊕            逐字节异或 (XOR)；‖ 是字节串拼接（concatenate），两者别混
+ *   z            KDF 的输入密钥材料 (IKM, input keying material)，SM2 加密里就是共享点坐标 x₂‖y₂
+ *   klen         要派生的输出字节数；32 是 SM2 里取 128-bit 密钥流两次的量级来源
+ *   ct           KDF 的固定计数器 (counter)，从 1 开始每次加 1，编码成 4 字节大端
+ *   v            链接值 V（8 个 32-bit 字的 long 数组）；IV = 初始链接值，cf() = 压缩函数
+ *   len          测试里遍历的消息字节长度；55/56/63/64 是填充的分界点，理由见 {@link #hashPaddingIsLengthAwareNotBlockAware}
+ *   counts[i]    频率直方图第 i 个桶的样本数；H = −Σ pᵢ·log₂pᵢ 是香农熵（单位：比特）
  * </pre>
- * "状态"就是循环里的局部变量（一个 long[8]），每轮就地改写它 —— 不克隆、不套函数、不传参绕圈。
- * 这正是面向过程写法的核心：一条命令一条命令地执行，而不是把函数当值来回传递。
  */
 @Slf4j
 public class Sm3EssenceTest
 {
     /** HMAC / KDF 里 SM3 的分组长度（字节）。 */
-    private static final int BLOCK_SIZE = 64;
-
-    /**
-     * 轮常数 T_j：前 16 轮取 0x79cc4519，后 48 轮取 0x7a879d8a —— SM3 里唯一的"魔术数"，就两个常量。
-     * 写成普通静态方法：传进轮号 j，返回一个 32-bit 字。
-     */
-    static long tConstant(int j)
-    {
-        return j < 16 ? 0x79cc4519L : 0x7a879d8aL;
-    }
-
-    /**
-     * FF_j：布尔函数写成带三个参数 (a/b/c) 加轮号 j 的普通静态方法 —— 这就是它的本质。
-     * 前 16 轮只用异或（线性），后 48 轮才引入与/或（多数函数，非线性）—— 这是 SM3 抗碰撞的关键设计。
-     */
-    static long ff(long j, long a, long b, long c)
-    {
-        return u32(j < 16 ? (a ^ b ^ c) : ((a & b) | (a & c) | (b & c)));
-    }
-
-    /** GG_j：同理，前 16 轮纯异或（线性），后 48 轮是选择函数（非线性）。 */
-    static long gg(long j, long a, long b, long c)
-    {
-        return u32(j < 16 ? (a ^ b ^ c) : ((a & b) | ((~a & M32) & c)));
-    }
-
-    /**
-     * P0 是"扩散函数"：一个字的每一位靠它摊到 32 位上，本质只有 异或 + 循环左移。
-     * 普通静态方法，一个入参 x。
-     */
-    static long p0(long x)
-    {
-        return u32(x ^ rotl(x, 9) ^ rotl(x, 17));
-    }
-
-    /**
-     * P1 也是扩散函数。注意它的第二段移位是 23 位，不是 22 位 —— 网上大量资料把这一处抄错。
-     */
-    static long p1(long x)
-    {
-        return u32(x ^ rotl(x, 15) ^ rotl(x, 23));
-    }
-
-    /** 初始值 IV —— 标准的 8 个 32-bit 字。 */
-    private static long[] iv()
-    {
-        return new long[]{
-            0x7380166fL, 0x4914b2b9L, 0x172442d7L, 0xda8a0600L,
-            0xa96f30bcL, 0x163138aaL, 0xe38dee4dL, 0xb0fb0e4eL
-        };
-    }
-
-    /**
-     * SM3 全流程：MD 填充 -> 逐块压缩（for 循环往前推链接值）-> 大端序列化。
-     * 包级静态方法，供其他算法（SM2）直接调用。
-     */
-    static byte[] sm3(byte[] msg)
-    {
-        List<byte[]> blocks = mdPad(msg);
-        long[] v = iv();
-        for (int i = 0; i < blocks.size(); i++)
-        {
-            v = cf(v, blocks.get(i));
-        }
-        return Calc.bytes32(v);
-    }
-
-    /** MD 填充：m ‖ 0x80 ‖ 0^k ‖ len₆₄(m)。返回 64 字节块的列表 —— 一个普通过程，就地算完返回。 */
-    static List<byte[]> mdPad(byte[] msg)
-    {
-        int zeros = (56 - (msg.length + 1) % 64 + 64) % 64;
-        byte[] bits = new byte[8];
-        long bitLen = 8L * msg.length;
-        for (int i = 0; i < 8; i++)
-        {
-            bits[i] = (byte)(bitLen >>> (56 - 8 * i));
-        }
-        byte[] padded = Calc.concat(msg, new byte[]{ (byte)0x80 }, Calc.repeatedByte(0, zeros), bits);
-        return Calc.chunks(padded, 64);
-    }
-
-    /**
-     * 消息扩展：W[0..67]。递推式即标准公式，用一个 for 循环从 j=16 直接就地写进数组 w[j]。
-     * 只有 W[j-3] 和 W[j-13] 带循环移位，W[j-6] 是原值 —— 背错这一项是最常见的实现 bug。
-     */
-    static long[] wExpand(byte[] block)
-    {
-        long[] w = new long[68];
-        long[] seeded = Calc.words32(block);
-        System.arraycopy(seeded, 0, w, 0, 16);
-        for (int j = 16; j < 68; j++)
-        {
-            w[j] = u32(p1(u32(w[j - 16] ^ w[j - 9] ^ rotl(w[j - 3], 15)))
-                ^ rotl(w[j - 13], 7) ^ w[j - 6]);
-        }
-        return w;
-    }
-
-    /**
-     * 压缩函数 CF：一个 for 循环跑满 64 步，最后与上一个链接值逐字异或。
-     * 状态是 8 个局部变量 a..h（对应 A..H），每轮用临时变量算出新值再整体赋值 —— 就地推进，不克隆数组。
-     */
-    static long[] cf(long[] v, byte[] block)
-    {
-        long[] w = wExpand(block);
-        long[] wp = new long[64];
-        for (int i = 0; i < 64; i++)
-        {
-            wp[i] = u32(w[i] ^ w[i + 4]);
-        }
-
-        long a = v[0], b = v[1], c = v[2], d = v[3];
-        long e = v[4], f = v[5], g = v[6], h = v[7];
-        for (int j = 0; j < 64; j++)
-        {
-            long ss1 = rotl(u32(rotl(a, 12) + e + rotl(tConstant(j), j)), 7);
-            long ss2 = u32(ss1 ^ rotl(a, 12));
-            long tt1 = u32(ff(j, a, b, c) + d + ss2 + wp[j]);
-            long tt2 = u32(gg(j, e, f, g) + h + ss1 + w[j]);
-            // 先算出下一轮的 8 个字，再整体写回局部变量（不新建数组）
-            long na = tt1;
-            long nb = a;
-            long nc = rotl(b, 9);
-            long nd = c;
-            long ne = p0(tt2);
-            long nf = e;
-            long ng = rotl(f, 19);
-            long nh = g;
-            a = na;
-            b = nb;
-            c = nc;
-            d = nd;
-            e = ne;
-            f = nf;
-            g = ng;
-            h = nh;
-        }
-        return new long[]{
-            u32(a ^ v[0]), u32(b ^ v[1]), u32(c ^ v[2]), u32(d ^ v[3]),
-            u32(e ^ v[4]), u32(f ^ v[5]), u32(g ^ v[6]), u32(h ^ v[7])
-        };
-    }
+    private static final int BLOCK_SIZE = Sm3.BLOCK_SIZE;
 
     // ------------------------------------------------------------------ 测试
 
-    /** 标准测试向量：SM3("abc") 与 SM3("abcd"*16)。自己的面向过程实现必须一字不差。 */
+    /**
+     * 标准测试向量：SM3("abc") 与 SM3("abcd"*16)。自己的面向过程实现必须一字不差。
+     *
+     * <p>两个向量分别覆盖 3 字节（1 个块，填充后 0x80 + 53 个 0 + 8 字节长度）与
+     * 64 字节（恰好对齐，填充必须<b>再开一整块</b>）两种填充分支；
+     * 期望值是 GB/T 32905 附录里的原文，逐位（256 bit = 64 个十六进制字符）比对。
+     */
     @Test
     public void sm3EssenceMatchesGbt32905Vectors()
         throws Exception
     {
-        String abc = Calc.hex(sm3("abc".getBytes("UTF-8")));
+        String abc = Calc.hex(Sm3.sm3("abc".getBytes("UTF-8")));
         log.info("[SM3-本质] SM3(\"abc\")            = {}", abc);
         Assert.assertEquals("66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0", abc);
 
-        String abcd16 = Calc.hex(sm3(Calc.repeat("abcd", 16).getBytes("UTF-8")));
+        String abcd16 = Calc.hex(Sm3.sm3(Calc.repeat("abcd", 16).getBytes("UTF-8")));
         log.info("[SM3-本质] SM3(\"abcd\"*16)        = {}", abcd16);
         Assert.assertEquals("debe9ff92275b8a138604889c18e5a4d6fdb70e5387e5765293dcba39c0c5732", abcd16);
 
         // 与 JCE 第三方实现互相印证（不同长度覆盖所有填充分支）
         Calc.useBc();
+        // 55/56：0x80 之后还能不能塞下 8 字节长度字段；63/64：是否需要多切一整块；0：空消息也要出一个块
         for (int len : new int[]{ 0, 1, 55, 56, 57, 63, 64, 65, 119, 120, 128 })
         {
             byte[] data = new byte[len];
             Arrays.fill(data, (byte)'a');
             Assert.assertArrayEquals("长度 " + len + " 的填充/折叠不一致",
-                Calc.digest("SM3", data), sm3(data));
+                Calc.digest("SM3", data), Sm3.sm3(data));
         }
         log.info("[SM3-本质] 与 JCE SM3 在 11 种长度（含填充边界 55/56/63/64/119/120）上完全一致");
     }
 
-    /** Merkle–Damgård 的本质：hash(m1‖m2) = CF(CF(IV, pad 前若干块) …) —— 逐块 for 循环可拼接。 */
+    /**
+     * Merkle–Damgård 的本质：hash(m1‖m2) = CF(CF(IV, pad 前若干块) …) —— 逐块 for 循环可拼接。
+     *
+     * <p>符号：m1 = head（前半段消息）、m2 = tail（后半段）、‖ = 拼接、IV = 初始链接值、
+     * CF = 压缩函数、块序列 B₀..Bₙ₋₁ 来自 mdPad(head‖tail)。
+     * 折叠式 Vᵢ = CF(Vᵢ₋₁, Bᵢ₋₁) 只要求"上一块的输出当下一块的输入"，所以循环怎么切都不改变结果 ——
+     * 这就是可拼接性（streamability）的数学内容，也是 MessageDigest.update() 能分批喂的原因。
+     */
     @Test
     public void merkleDamgardIsJustALoopOverBlocks()
         throws Exception
@@ -210,14 +100,15 @@ public class Sm3EssenceTest
         byte[] tail = Calc.repeat("-tail", 7).getBytes("UTF-8");
 
         // 分块逐块推进后与整体推进必须相同（除了最后一块要带长度）：验证"推进顺序无关性"
-        long[] whole = iv();
-        List<byte[]> wholeBlocks = mdPad(Calc.concat(head, tail));
+        // whole 就是链接值 V：初值 V₀ = IV，循环里每步做 V = CF(V, B)
+        long[] whole = Sm3.iv();
+        List<byte[]> wholeBlocks = Sm3.mdPad(Calc.concat(head, tail));
         for (int i = 0; i < wholeBlocks.size(); i++)
         {
-            whole = cf(whole, wholeBlocks.get(i));
+            whole = Sm3.cf(whole, wholeBlocks.get(i));
         }
         log.info("[SM3-本质] 整体折叠        = {}", Calc.hex(whole));
-        Assert.assertArrayEquals(Calc.bytes32(whole), sm3(Calc.concat(head, tail)));
+        Assert.assertArrayEquals(Calc.bytes32(whole), Sm3.sm3(Calc.concat(head, tail)));
 
         // 逐字节喂入（流式）与一次性喂入等价 —— 这就是 MessageDigest.update() 的数学本质
         SM3Digest ref = new SM3Digest();
@@ -226,11 +117,16 @@ public class Sm3EssenceTest
         byte[] streamed = new byte[32];
         ref.doFinal(streamed, 0);
         Assert.assertArrayEquals("流式 update 与一次性 digest 必须等价（Merkle–Damgård 可拼接性）",
-            sm3(Calc.concat(head, tail)), streamed);
+            Sm3.sm3(Calc.concat(head, tail)), streamed);
         log.info("[SM3-本质] 流式 update == 一次性 digest：{}", Calc.hex(streamed));
     }
 
-    /** HMAC-SM3：只用"哈希函数"这一个抽象就能构造消息认证码（NIST 的意义所在）。 */
+    /**
+     * HMAC-SM3：只用"哈希函数"这一个抽象就能构造消息认证码（NIST 的意义所在）。
+     *
+     * <p>MAC (Message Authentication Code) = 带密钥的摘要：只有持有同一把密钥的人能算出同一个值，
+     * 它同时给出<b>完整性</b>和<b>来源认证</b> —— 而普通哈希两者都不给（任何人都能重算 H(m)）。
+     */
     @Test
     public void hmacSm3IsHashCompositionNotAClass()
         throws Exception
@@ -250,27 +146,59 @@ public class Sm3EssenceTest
         Assert.assertNotEquals("HMAC 必须依赖密钥", Calc.hex(ours), Calc.hex(hmacSm3("other-key".getBytes("UTF-8"), msg)));
     }
 
-    /** 密钥规约：过长先哈希、过短右侧补零 —— HMAC 唯一的"密钥预处理"，一个普通静态方法。 */
+    /**
+     * 密钥规约：过长先哈希、过短右侧补零 —— HMAC 唯一的"密钥预处理"，一个普通静态方法。
+     *
+     * <p>目标只有一个：把任意长度的密钥 key 变成<b>正好 B = BLOCK_SIZE = 64 字节</b>的 K，
+     * 因为 HMAC 的定义要求 K 能和 ipad/opad 逐字节异或（异或是等长运算，见 {@link Calc#xor}）。
+     * <pre>
+     *   key.length &gt; 64   用 K = SM3(key) ‖ 0³²：过长不能直接截断（截断会让"多出来的那一段密钥"完全不起作用，
+     *                     等于削弱熵），所以先用哈希把它压成 32 字节摘要，再在<b>右侧</b>补零凑满 64 字节
+     *   key.length ≤ 64   用 K = key ‖ 0^(64−len)：右侧补零到 B 字节，原密钥每一位都保留
+     * </pre>
+     */
     private static byte[] fitKey(byte[] key)
     {
         if (key.length > BLOCK_SIZE)
         {
-            return Arrays.copyOf(Calc.concat(sm3(key), new byte[BLOCK_SIZE - 32]), BLOCK_SIZE);
+            return Arrays.copyOf(Calc.concat(Sm3.sm3(key), new byte[BLOCK_SIZE - 32]), BLOCK_SIZE);
         }
         return Arrays.copyOf(Calc.concat(key, new byte[BLOCK_SIZE - key.length]), BLOCK_SIZE);
     }
 
-    /** HMAC(k, m) = H(k⊕opad ‖ H(k⊕ipad ‖ m)) —— 几步顺序调用 SM3，没有任何对象与函数值。 */
+    /**
+     * HMAC(k, m) = H(k⊕opad ‖ H(k⊕ipad ‖ m)) —— 几步顺序调用 SM3，没有任何对象与函数值。
+     *
+     * <p>逐个符号：
+     * <pre>
+     *   k      规约后的 64 字节密钥 K（见 {@link #fitKey}）；m 是消息；H 就是 SM3
+     *   ipad   0x36 重复 64 字节；opad 0x5c 重复 64 字节；两者相差 0x36⊕0x5c = 0x6a，逐比特差异足够大，
+     *          于是 K⊕ipad 与 K⊕opad 是两个"看起来互不相关"的 64 字节值
+     *   ‖      拼接；⊕ 逐字节异或
+     *   inner  = H((K⊕ipad) ‖ m)  内层摘要，32 字节
+     *   结果   = H((K⊕opad) ‖ inner)  外层摘要 —— 就是本方法的返回值
+     * </pre>
+     * 为什么要"套两层"：MD 构造本身扛不住长度扩展 —— 已知 H(m) 就能从中间态 V 继续折叠出 H(m‖pad‖m′)。
+     * 外层再哈希一次，攻击者拿不到"以密钥打头的那个块"的链接值，就无法继续往后推；
+     * 密钥同时出现在内层块的首块和外层块的首块，两个掩码值不同，也无法把内层的中间态复用。
+     * 结论：HMAC 把一个"只有哈希函数"的黑盒升级成消息认证码，安全性只需 H 是抗碰撞的 MD。
+     */
     private static byte[] hmacSm3(byte[] key, byte[] msg)
     {
         byte[] k = fitKey(key);
         byte[] ipad = Calc.repeatedByte(0x36, BLOCK_SIZE);
         byte[] opad = Calc.repeatedByte(0x5c, BLOCK_SIZE);
-        byte[] inner = sm3(Calc.concat(Calc.xor(k, ipad), msg));
-        return sm3(Calc.concat(Calc.xor(k, opad), inner));
+        byte[] inner = Sm3.sm3(Calc.concat(Calc.xor(k, ipad), msg));
+        return Sm3.sm3(Calc.concat(Calc.xor(k, opad), inner));
     }
 
-    /** KDF（SM2 加密里那个"计数器模式派生函数"）：本质 = hash(z ‖ 计数器) 的无限流取前 klen 字节。 */
+    /**
+     * KDF（SM2 加密里那个"计数器模式派生函数"）：本质 = hash(z ‖ 计数器) 的无限流取前 klen 字节。
+     *
+     * <p>为什么需要 KDF：共享点坐标 x₂‖y₂ 只有 64 字节，而且它是"两个比特串"而不是均匀密钥；
+     * KDF 的作用是把任意长度的密钥材料 z 展开成任意长度的输出，并且每一段输出都只依赖 z 一次哈希。
+     * 这里 klen 覆盖 1/16/32/33/64/100，专门测"不足一块""正好两块多"的截断分支。
+     */
     @Test
     public void kdfIsAnInfiniteHashStreamTruncated()
         throws Exception
@@ -291,24 +219,50 @@ public class Sm3EssenceTest
         log.info("[SM3-KDF] 结论：KDF 就是一个 for 循环，把 ct 从 1 递增、不断把 hash(z‖ct) 拼到尾部再截断");
     }
 
-    /** KDF 派生：for 循环把计数器 1..ceil(klen/32) 逐个 hash(z‖ct) 拼流，最后截断到 klen 字节。 */
+    /**
+     * KDF 派生：for 循环把计数器 1..ceil(klen/32) 逐个 hash(z‖ct) 拼流，最后截断到 klen 字节。
+     *
+     * <p>符号与公式（这就是 GM/T 0003.4 / ISO 18033-3 的 KDF 计数器模式，counter mode）：
+     * <pre>
+     *   z        输入密钥材料 (IKM)：SM2 加密里是共享点的坐标 x₂ ‖ y₂（各 32 字节大端）
+     *   klen     需要的输出字节数；blocks = ceil(klen / 32) 是"要哈希几次才够"
+     *   ct       固定计数器 (counter)，从 <b>1</b> 开始（不是 0！）逐个加 1，编码成 4 字节<b>大端</b>
+     *   ct₄      ct 的 4 字节大端表示：counterBytes[i] = ct &gt;&gt;&gt; (24 − 8i)，即 i=0 放最高字节
+     *   第 ct 段 = SM3(z ‖ ct₄)  —— 每段 32 字节（256 bit = SM3 的完整输出）
+     *   输出     = 第 1 段 ‖ 第 2 段 ‖ … ‖ 第 blocks 段，再截断到前 klen 字节
+     * </pre>
+     * 计数器存在的意义：保证各段输出互不重复（段与段的输入不同），这样"截断拼接"才等价于
+     * 从一个确定性无限密钥流里取前 klen 字节；少了 ct，KDF(x‖y) 只会给出同样 32 字节的重复。
+     */
     private static byte[] kdf(byte[] z, int klen)
     {
         int blocks = Calc.ceilDiv(klen, 32);
         byte[] stream = new byte[0];
         for (int ct = 1; ct <= blocks; ct++)
         {
+            // 把 32-bit 计数器 ct 摊成 4 个字节，高位在前（大端）：i = 0 取第 31..24 位
             byte[] counterBytes = new byte[4];
             for (int i = 0; i < 4; i++)
             {
                 counterBytes[i] = (byte)(ct >>> (24 - 8 * i));
             }
-            stream = Calc.concat(stream, sm3(Calc.concat(z, counterBytes)));
+            stream = Calc.concat(stream, Sm3.sm3(Calc.concat(z, counterBytes)));
         }
         return Arrays.copyOf(stream, klen);
     }
 
-    /** 填充模式的"哈希侧视角"：0x80 + 0 填充 vs 只追加长度 —— 说明为什么 SM3 不需要加密式填充。 */
+    /**
+     * 填充模式的"哈希侧视角"：0x80 + 0 填充 vs 只追加长度 —— 说明为什么 SM3 不需要加密式填充。
+     *
+     * <p>MD 填充式：m ‖ 0x80 ‖ 0^k ‖ len₆₄(m)，要求总长 ≡ 0 (mod 64)。
+     * 三条断言的分界点解释（len 是消息<b>字节</b>数，8 字节给长度字段，块长 64 字节）：
+     * <pre>
+     *   len = 0   空消息也要一个块：0x80 + 55 个 0 + 8 字节长度 = 64，绝不允许"输入为空就不压缩"
+     *   len = 55  55 + 1(0x80) = 56，正好停在长度字段前面 —— k = 0，一个块搞定
+     *   len = 56  56 + 1 = 57 已经越过 56 这个"必须给长度留 8 字节"的位置 —— k = 63，只能两个块
+     * </pre>
+     * 所以边界不是 64 而是 56 = 64 − 8：这是 MD 填充最容易写错的一处。
+     */
     @Test
     public void hashPaddingIsLengthAwareNotBlockAware()
         throws Exception
@@ -316,46 +270,79 @@ public class Sm3EssenceTest
         byte[] aligned = Calc.repeat("0123456789abcdef", 4).getBytes("UTF-8");   // 64 字节
         byte[] short0 = new byte[0];
 
-        log.info("[SM3-填充] 64 字节对齐消息的真实 SM3 = {}", Calc.hex(sm3(aligned)));
+        log.info("[SM3-填充] 64 字节对齐消息的真实 SM3 = {}", Calc.hex(Sm3.sm3(aligned)));
         log.info("[SM3-填充] 去掉长度字段的\"伪 SM3\"    = {}", Calc.hex(naiveNoLength(aligned)));
         Assert.assertNotEquals("真实 SM3 绝不能等于无长度字段的逐块推进",
-            Calc.hex(sm3(aligned)), Calc.hex(naiveNoLength(aligned)));
-        Assert.assertEquals("空消息也必须产生一个完整块（0x80 + 长度）", 1, mdPad(short0).size());
+            Calc.hex(Sm3.sm3(aligned)), Calc.hex(naiveNoLength(aligned)));
+        // 下面三条正是 0 / 55 / 56 三个填充分支的"块数"验证（块数 = 折叠次数，见 Sm3.mdPad）
+        Assert.assertEquals("空消息也必须产生一个完整块（0x80 + 长度）", 1, Sm3.mdPad(short0).size());
         Assert.assertEquals("56 字节消息要两个块（长度字段放不下）", 2,
-            mdPad(new byte[56]).size());
-        Assert.assertEquals("55 字节消息只要一个块", 1, mdPad(new byte[55]).size());
+            Sm3.mdPad(new byte[56]).size());
+        Assert.assertEquals("55 字节消息只要一个块", 1, Sm3.mdPad(new byte[55]).size());
     }
 
     /**
      * 反面教材：丢掉长度字段，直接按 64 字节切块逐块推进（这里只演示 64 字节对齐的输入不受影响）。
      * 少了 ENTL/长度字段，就等于给长度扩展攻击开了门。
+     *
+     * <p>符号：Calc.chunks(msg, 64) = 不做 MD 填充、只按块长 B = 64 切分（要求 len 已是 64 的倍数）；
+     * v = 链接值 V，V₀ = IV，循环体 V = CF(V, Bᵢ)；Calc.bytes32(v) = 大端序列化，
+     * 把 8 个 32-bit 字摊成 32 字节 = 256 bit。与真实 SM3 的<b>唯一</b>区别就是没有 ‖ 0x80 ‖ 0^k ‖ len₆₄。
+     * 危害：摘要值本身就是最后的链接值，攻击者可以直接拿它当新起点继续折叠 m′ 的块，
+     * 于是无需密钥/无需知道 m 就能算出 H(m ‖ pad(m) ‖ m′) —— 这就是长度扩展 (length extension)；
+     * len₆₄ 字段让"续接"后的长度与哈希里写死的长度对不上，再加上 HMAC 才是正解。
      */
     private static byte[] naiveNoLength(byte[] msg)
     {
         List<byte[]> blocks = Calc.chunks(msg, 64);
-        long[] v = iv();
+        long[] v = Sm3.iv();
         for (int i = 0; i < blocks.size(); i++)
         {
-            v = cf(v, blocks.get(i));
+            v = Sm3.cf(v, blocks.get(i));
         }
         return Calc.bytes32(v);
     }
 
-    /** 布尔函数与置换函数的本质：只由 与/或/非/异或/循环移位 构成，可被完全展开成表达式。 */
+    /**
+     * 布尔函数与置换函数的本质：只由 与/或/非/异或/循环移位 构成，可被完全展开成表达式。
+     *
+     * <p>这里的符号（与 {@link Sm3} 的符号表同名同义）：
+     * <pre>
+     *   a, b, c    FF_j / GG_j 的三个 32-bit 输入字（测试里取 0xdeadbeef、0x12345678、0xcafebabe 当样本，
+     *              实际压缩时它们是本轮的 (A,B,C) 或 (E,F,G)）
+     *   j          轮号：0 和 15 落在"前 16 轮线性区"，16 和 63 落在"后 48 轮非线性区"—— 边界就是 j = 16
+     *   ⊕ ∧ ¬ ∨    逐位异或 / 与 / 非 / 或；~a 是 long 取反，必须 &amp; M32 截回 32 位，否则高 32 位全是 1
+     *   多数函数   (a∧b)∨(a∧c)∨(b∧c)：逐位取三数的"多数比特"，输入差 1 比特时输出可能差很多 —— 非线性来源
+     *   选择函数   (a∧b)∨(¬a∧c)：逐位以 a 为开关选 b 或 c；SHA-256 的 Ch 与它同型
+     *   线性 vs    异或是 GF(2) 上的加法（线性映射，差分一算就中），掺进与/或以后才有真正的非线性
+     *   非线性     —— 这正是"前 16 轮线性、后 48 轮非线性"这个设计的含义
+     *   x          P0/P1 的入参字；rotl(x, n) 是 32-bit 循环左移，n 只取低 5 位（n &amp; 31）
+     *   bitCount   统计一个 32-bit 字里有几个 1，用来量化"1 个输入比特被扩散成了几个输出比特"
+     * </pre>
+     */
     @Test
     public void booleanFunctionsDecomposeToXorAndRotate()
     {
         long a = 0xdeadbeefL, b = 0x12345678L, c = 0xcafebabeL;
         // 前 16 轮 FF/GG 都是纯异或（线性）
-        Assert.assertEquals(u32(a ^ b ^ c), ff(0L, a, b, c));
-        Assert.assertEquals(u32(a ^ b ^ c), gg(15L, a, b, c));
+        Assert.assertEquals(u32(a ^ b ^ c), Sm3.ff(0L, a, b, c));
+        Assert.assertEquals(u32(a ^ b ^ c), Sm3.gg(15L, a, b, c));
         // 16 轮之后 FF 变成多数函数、GG 变成选择函数（引入非线性）
-        Assert.assertEquals(u32((a & b) | (a & c) | (b & c)), ff(16L, a, b, c));
-        Assert.assertEquals(u32((a & b) | ((~a & M32) & c)), gg(63L, a, b, c));
+        Assert.assertEquals(u32((a & b) | (a & c) | (b & c)), Sm3.ff(16L, a, b, c));
+        Assert.assertEquals(u32((a & b) | ((~a & M32) & c)), Sm3.gg(63L, a, b, c));
         // P0/P1 的"扩散"性质：单比特翻转，输出比特数远大于 1
-        int flipped = Long.bitCount(p0(1L)) + Long.bitCount(p1(1L));
+        int flipped = Long.bitCount(Sm3.p0(1L)) + Long.bitCount(Sm3.p1(1L));
         log.info("[SM3-布尔函数] bitCount(P0(1)) + bitCount(P1(1)) = {}", flipped);
         Assert.assertTrue("P0/P1 必须把 1 个输入比特扩散到多个输出比特", flipped >= 6);
-        Assert.assertNotEquals("P0 不是恒等映射", Long.valueOf(1L), Long.valueOf(p0(1L)));
+        Assert.assertNotEquals("P0 不是恒等映射", Long.valueOf(1L), Long.valueOf(Sm3.p0(1L)));
+        // 轮常数只有两个值：j<16 用 0x79cc4519，j>=16 全部用 0x7a879d8a（64 步共用第二个）
+        Assert.assertEquals(0x79cc4519L, Sm3.tConstant(0));
+        Assert.assertEquals(0x7a879d8aL, Sm3.tConstant(16));
+        Assert.assertEquals(Sm3.tConstant(16), Sm3.tConstant(63));
+        // 循环移位取 j 的低 5 位（n & 31）：所以 SS1 里 rotl(T_j, j) 在 j=32 时等于不旋转
+        Assert.assertEquals(Sm3.tConstant(16), rotl(Sm3.tConstant(16), 32));
+        // 最后一行是"P0 就是那三项异或"的逐项展开核对：rotl(1,9)、rotl(1,17) 与 1 本身异或，
+        // 说明 P0 完全由移位+异或构成，没有任何查表或隐藏状态；1L 代表只有最低位为 1 的那个字
+        Assert.assertEquals(u32(rotl(1L, 9) ^ rotl(1L, 17) ^ 1L), Sm3.p0(1L));
     }
 }
