@@ -64,28 +64,111 @@ import org.junit.Test;
  * <p>两个必须记对的数字：Dilithium 的 q = <b>8380417</b> = 2^23 - 2^13 + 1（不是 8380427），
  * Kyber 的 q = <b>3329</b> = 13·2^8 + 1。为什么是这两个数，见 {@link #moduliAreChosenForRootsOfUnity()}；
  * 密文长度 768/1088/1568 的由来见 {@link #kemCiphertextLengthIsJustTheSumOfCompressedCoefficients()}。
+ *
+ * <p><b>为什么需要后量子（动机三句话）</b>：RSA/ECC 的安全性建立在"整数分解"与"离散对数"上，
+ * 而 Shor 算法在量子机上把两者都化成"求周期"（用量子傅里叶变换），多项式时间可解 —— 一次性报废整族算法。
+ * 格密码换用两个新问题：<b>SIS（短整数解, Short Integer Solution）</b>：给定随机 A 与 t = A·s (mod q)，
+ * 找非零的短向量 s（或短组合）；<b>LWE（容错学习, Learning With Errors）</b>：区分样本 (A, A·s + e) 与均匀随机对，
+ * 小噪声 e 把"解线性方程组"变成带误差的最优化，可归约到格上的<b>最短向量问题 (SVP, Shortest Vector Problem)</b>，
+ * 已知最好（经典与量子）算法对 256 维格都是指数时间。<b>模块 LWE (Module-LWE)</b> 是 LWE 的省内存变体：
+ * 把矩阵换成立在多项式环 R_q 上的 k×l 矩阵（乘法 = 环乘），ML-DSA 与 ML-KEM 都建在它上面。
+ * 量子下唯一通用的加速是 <b>Grover 搜索</b>：它只把安全性<b>减半</b>（2^128 强度 → 2^64），
+ * 所以标准把哈希/对称长度统统翻倍取：128-bit 级别用 SHAKE256/SHA3-256，这就是 32 字节尾巴的由来。
+ *
+ * <p><b>两个安全目标（各一句话）</b>：<b>EUF-CMA</b>（选择消息攻击下的存在性不可伪造, existential unforgeability
+ * under chosen-message attack）是对<b>签名</b>的要求：拿到任意多条合法签名，也造不出一个新的 (消息, 签名) 对过验；
+ * <b>IND-CCA</b>（选择密文攻击下的不可区分, indistinguishability under chosen-ciphertext attack）是对<b>KEM</b>的要求：
+ * 敌人带着解密 oracle 也分不清"密文对应的密钥"与一串随机字节 —— ML-KEM 用 Fujisaki-Okamoto 变换把
+ * 只有 IND-CPA（无解密 oracle 的不可区分）的内核升级到 IND-CCA（见命题九的隐式拒绝）。
+ *
+ * <p><b>KAT 与"安全级别 1/3/5"</b>：NIST 随 FIPS 203/204 发布一组 <b>KAT（已知答案测试, known-answer test）</b>：
+ * 固定 seed，公布期望的 pk/sk/签名/密文 hex 串；本类不抄这些向量，只对照标准正文的<b>参数表</b>
+ * （q、ψ=1753、q=13·2^8+1、签名 2420/3309/4627、密文 768/1088/1568 等 —— 每个断言里的"常识值"都是官方表值）。
+ * "级别 1/3/5"指 NIST 安全强度等级，≈ 与 AES-128/192/256 暴力同级；名字里的 44/65/87 与 512/768/1024
+ * 只是 k、l、哈希位数的组合编号，不是强度本身。
+ *
+ * <p><b>符号表 —— 全类公式共享的字母/记号（各节另有局部表）</b>
+ * <pre>
+ *   q          模数。ML-DSA：q = 8380417 = 2^23 − 2^13 + 1；ML-KEM：q = 3329 = 13·2^8 + 1
+ *   Z_q        {0, 1, ..., q−1}，加减乘后都要 mod q 折回来（mod()）；center() 换成对称代表元区间 (−q/2, q/2]
+ *   N（书面的 d）  多项式次数 = 256；环元素 == int[256]，下标 i 是 X^i 的系数
+ *   X          形式不定元 (formal indeterminate)，不是数值；环规则 X^256 = −1（即 X^256 + 1 = 0）
+ *   R_q        商环 Z_q[X]/(X^256+1)："多项式模 X^256+1"。乘法 = 卷积 + 越界项乘 (−1)，见 mulPoly() 里的负号；
+ *              X^d ≡ −1 让次数永远折回 255（系数不爆炸），且卷积是负循环的 —— 这正是 NTT 能对角化的形式
+ *   ψ (PSI)    单位根 (root of unity) = 1753：ψ^256 ≡ −1、ψ^512 ≡ 1 (mod q)。"本原 (primitive)"= 阶恰好 512
+ *   r_i        第 i 个求值点 = ψ^(2i+1)，是 X^256+1 的 256 个根（roots()；奇数次幂才满足 r^256 = −1）
+ *   ω          = ψ^2，256 次本原单位根（ω^256 ≡ 1），nttFast 蝴蝶的旋转因子由它现场算
+ *   â = NTT(a) â[i] = a(r_i) = Σ_j a[j]·ψ^((2i+1)·j)：换到"求值坐标"后环乘 == 逐点乘，仅此而已
+ *   ξ (xi)     私钥种子，固定 32 字节；整把钥匙（ρ、K、tr、s1、s2、t0）都只是 ξ 的确定性展开
+ *   ρ (rho)    由 ξ 展开出的种子，用来展开公钥里的随机矩阵 A（拒绝采样出均匀多项式）
+ *   A          k×l 的多项式矩阵（ML-DSA）/ k×k（ML-KEM）；A·s 指环上矩阵乘，∘ 或 pointwiseMul 指逐点乘
+ *   s1, s2     私钥"短多项式"：系数限制在小范围（ML-DSA 的 [−η,η]；ML-KEM 的中心二项式），格"短基"的载体
+ *   t          公钥主体 t = A·s1 + s2 (mod q)；噪声 s2 让从 t 反解 s1 变成 LWE 难题
+ *   d (=D_T)   t 的拆分位宽 = 13：t = t1·2^d + t0（power2Round()）；t1 进公钥，t0 留私钥
+ *   y          签名掩码多项式：系数均匀、幅度 &lt; γ1 的一次性随机数（一次签名一枚）
+ *   c          挑战多项式：恰好 τ 个非零系数、系数只取 ±1 的稀疏多项式（sampleInBall()）
+ *   τ (tau)    挑战多项式的汉明权重 (hamming weight)。FIPS 204 真值 39/49/60；命题七的 demo 借用了 80（见该处说明）
+ *   c~         写进签名的挑战摘要，截断到 32/48/64 字节；验签时由它现场重新展开成 c
+ *   z          签名响应多项式 z = y + c·s1 (mod q)，签名里最大的一块（ml-dsa-44 每系数 18 bit）
+ *   w          签名侧 w = A·y；验签侧重构 w' = A·z − c·t（相差一个可控小噪声），两者高位要一致
+ *   w1, w0     w 经 decompose(α) 得到的高/低部分：a = a1·α + a0，α = 2γ2，a1 ∈ [0, M)，M = (q−1)/α = 44 或 16
+ *   h          hint 多项式/向量：每系数只补 1 bit，修复 a1 在模 M"绕回"边界处的歧义（MakeHint/UseHint 的对象）
+ *   ω提示上限   FIPS 204 用同一希腊字母记"每条签名允许的非零 hint 位数"（80/55/75）—— 与本表的单位根 ω 无关，
+ *              文件里 countCrossings() 数出来的就是 hint 密度，sampleInBall 的 demo 权重也借了这个 80
+ *   γ1, γ2     幅度参数：γ1 管 y 与 z（2^17 或 2^19），γ2 管 w0 与 hint（(q−1)/88 或 (q−1)/32）
+ *   η (eta)    噪声幅度：ML-DSA s1/s2 系数 ∈ [−η,η]（2/4/2）；ML-KEM 用 η1 抽密钥、η2 抽舍入噪声（3/2/2 与 2）
+ *   k, l       A 的行数/列数：ML-DSA (4,4)/(6,5)/(8,7)；ML-KEM 是 k×k 方矩阵，k = 2/3/4。
+ *              注意 MLDSAParameters.getK() 返回的是 FIPS 等级（2/3/5），引擎 getDilithiumK() 才是行数
+ *   μ (mu)     SHAKE256(tr ‖ M, 64)：签名算法真正吃的唯一消息表示；tr = SHAKE256(pk, 64) 是公钥指纹
+ *   ‖          字节串拼接 (concatenate)，Calc.concat 同款；不是异或
+ *   K, r, z′   ML-KEM：K = 32 字节共享密钥；r/coin = 封装随机硬币；z′ = 私钥尾部的 32 字节"拒绝密钥"
+ *              （与上面的 t0/短基符号无关，KEM 一节另有局部表）
+ *   d_u, d_v   ML-KEM 密文两段的压缩位数（compress() 的 d 参数：10/10/11 与 4/4/5）
+ *   R, qInv    Montgomery 记号（redc()）：R = 2^32，qInv = q^−1 mod R = 58728449，红字见该方法的符号表
+ *   Barrett /  Montgomery 是一对"把除 q 换成乘+移位"的工程技巧；本类演示 Montgomery（redc），
+ *              Barrett（预乘 ⌊2^k/q⌋ 的近似倒数）是另一族常用做法；q = 2^23 − 2^13 + 1 的形状还能直接移位折位
+ * </pre>
+ *
+ * <p><b>术语一行定义（后文直接使用，不再展开）</b>：
+ * <b>格 (lattice)</b> = 一组基向量的全部整数组合构成的点阵；<b>短基 (short basis)</b> = 基向量都很短的表示 ——
+ * 私钥本质上就是一把短基，公钥是它经过随机线性变换 + mod q"搅浑"之后的样子。
+ * <b>范数 (norm)</b>：本类主要用无穷范数 ‖a‖∞ = max|a[i]|（allAbsAtMost() 就是在查它）；
+ * <b>内积 (inner product)</b> ⟨a,b⟩ = Σ a[i]·b[i]。<b>模约减 (mod reduction)</b> = 把系数折回代表元区间
+ * （mod()/center()）。<b>中心表示</b>：把 [0,q) 的系数折成对称区间 (−q/2,q/2] —— 签名协议里"短"是用绝对量度的
+ * （‖z‖∞ 有界），中心化后小正数与小负数相邻，界检查与 hint 语义都只对"离零多远"敏感，不必在 [0,q) 里绕一大圈。
+ * <b>XOF（可扩展输出函数, extendable-output function）</b>= 输入任意短、输出可无限流的哈希（SHAKE128/256），
+ * 本类的一切"随机"都来自 shakeBytes() 这一处调用。<b>拒绝采样 (rejection sampling)</b> = 抽到不合格就丢、再抽。
+ * <b>高斯采样 (Gaussian sampling)</b> = 按高斯权重在格点上抽点（GPV/Falcon 一系签名的核心，本文件未实现），
+ * ML-DSA 改用"均匀 y + 拒绝"绕开它，ML-KEM 用中心二项式（cbd()）当它的廉价近似。
+ * <b>可表达性 vs 安全性</b>：断言"t1 装得进 10 bit""密文恰好 768 字节"讲的是可表达性（编码是否够用）；
+ * 安全性讲的是敌人能否从这些字节算出 s —— 两者互不蕴含，本类的长度断言只证明前者没有被高估。
+ * <b>签名是概率性的</b>：FIPS 204 签名内部有 while 重试环（y 要抽到 z 不越界、hint 数 ≤ ω 才接受），
+ * 所以一张签名可能要试多次；但默认确定性模式把重试用的随机数也由 ξ 导出，同一 (ξ, 消息) 仍逐字节可重复 ——
+ * 命题八断言的正是这一点。
  */
 @Slf4j
 public class PqcEssenceTest
 {
-    /** 环 R_q 的维数：所有多项式都是 256 个系数。 */
+    /** 环 R_q 的维数（教科书里也写作 d 或 n）：所有多项式都是 256 个系数，X^256 被折回 −X^0。 */
     private static final int N = 256;
 
-    /** ML-DSA 的模数（BC 把它作为 public 常量暴露，我们直接引用它当裁判）。 */
+    /** ML-DSA 的模数 q = 2^23 − 2^13 + 1（BC 把它作为 public 常量暴露，我们直接引用它当裁判）。 */
     private static final int Q_DSA = MLDSAEngine.DilithiumQ;
 
-    /** ML-KEM 的模数。 */
+    /** ML-KEM 的模数 q = 13·2^8 + 1：q−1 只含 2^8，所以它的 NTT 只能做 8 级（见命题三）。 */
     private static final int Q_KEM = 3329;
 
-    /** BC 源码里被注释掉的 DilithiumRootOfUnity —— 本类现场证明它确实是 512 次单位根。 */
+    /** BC 源码里被注释掉的 DilithiumRootOfUnity —— 本类现场证明它确实是 512 次本原单位根：ψ^256 ≡ −1。 */
     private static final int PSI_DSA = 1753;
 
-    /** ML-DSA 公私钥分离 t 时用的比特数（BC public 常量 DilithiumD）。 */
+    /** ML-DSA 公私钥分离 t = t1·2^d + t0 时用的比特数 d = 13（BC public 常量 DilithiumD）。 */
     private static final int D_T = MLDSAEngine.DilithiumD;
 
     /**
      * t1 的位宽 = bitlen(q-1) - d = 23 - 13 = <b>10</b> -> 256·10/8 = 320 字节。
      * 注意不是 "32 - d"：t1 的取值范围由 q 决定，不是由 int 决定。
+     * 这是"可表达性"的账（10 bit 装不装得下 t1）；"安全"是另一回事 ——
+     * 敌人要从高 10 bit 反推 s1，得先解 Module-LWE，两件事互不蕴含。
      */
     private static final int T1_BITS = (64 - Long.numberOfLeadingZeros(Q_DSA - 1L)) - D_T;
 
@@ -93,14 +176,24 @@ public class PqcEssenceTest
 
     // ---------------------------------------------------------------- 边界：整数取模 / 中心化 / 幂
 
-    /** 非负取模：数学上的 Z_q 元素代表元必须落在 [0,q)。 */
+    /**
+     * 非负取模：数学上的 Z_q 元素代表元必须落在 [0,q)。
+     * mod 约减 (modular reduction)：x mod q = x − q·⌊x/q⌋，把整数折回 {0,...,q−1} 这 q 个"刻度"之一。
+     */
     private static int mod(long x, int q)
     {
         long r = x % q;
         return (int)(r < 0 ? r + q : r);
     }
 
-    /** 中心化代表元：把 [0,q) 折到 (-q/2, q/2]，这就是"负系数"的唯一来源。 */
+    /**
+     * 中心化代表元：把 [0,q) 折到对称区间 (−q/2, q/2]，这就是"负系数"的唯一来源。
+     *
+     * <p>为什么签名/噪声侧要用"中心"表示：格问题的"短"是按绝对量度的（‖a‖∞ = max|a[i]|），
+     * 而 mod q 后 −1 与 q−1 是同一个元素。若坚持 [0,q) 表示，小负数会变成接近 q 的大正数，
+     * 界检查、CBD 噪声、hint 的"越界"语义全都乱掉；折成对称区间后，"离零多远"直接可读，
+     * center() 就是这条同构 [0,q) -> (−q/2, q/2] 的落地。
+     */
     private static int center(long x, int q)
     {
         int v = mod(x, q);
@@ -150,7 +243,14 @@ public class PqcEssenceTest
         return out;
     }
 
-    /** 从"字节流"里取第 index 个 23-bit 字（低位在前）—— ML-DSA 均匀采样的窗口。 */
+    /**
+     * 从"字节流"里取第 index 个 23-bit 字（低位在前）—— ML-DSA 均匀采样的窗口。
+     * <pre>
+     *   word = ( b[3i] + b[3i+1]·2^8 + b[3i+2]·2^16 ) mod 2^23     （&amp; 0x7fffff 就是截到 23 位）
+     *   i      = index，第几个窗口；ML-DSA 规范写作"从 XOF 流里滑 23-bit 窗口"
+     *   23     = bitlen(q) 的下取整：2^23 = 8388608 只比 q = 8380417 大 8191，所以 v ≥ q 的概率约 0.1%
+     * </pre>
+     */
     private static int word23(byte[] seed, int index)
     {
         byte[] b = shakeBytes(seed, 3 * index + 3);
@@ -165,6 +265,12 @@ public class PqcEssenceTest
      * 现场展开 count 个字节 —— 同一种子永远给出同一串字节。
      * 给定同一个 seed，所有采样、所有密钥导出都逐字节可重复 —— 这就是 BC 内部
      * "Internal functions are deterministic. No randomness is sampled inside them" 注释的意思。
+     *
+     * <p><b>XOF（可扩展输出函数, extendable-output function）</b>：SHAKE128/SHAKE256 是 SHA-3 家族的
+     * "absorb 任意长输入，squeeze 任意长输出"函数 —— 与普通哈希（输出定长 256/512 bit）的区别只在"能续着流"。
+     * 格密码里所有 H / G / ExpandA / ExpandS 都只是"换个前缀再 squeeze 若干字节"：
+     * 在随机 oracle 假设 (Random Oracle Model, ROM，把哈希理想成真随机函数) 下它就是免费随机源，
+     * ML-DSA 甚至因此能在真机上"现场展开"密钥而不必存储（seed 32 字节 == 全部私钥信息）。
      */
     private static byte[] shakeBytes(byte[] seed, int count)
     {
@@ -230,6 +336,15 @@ public class PqcEssenceTest
     /**
      * 环乘法 = 卷积 + "绕回来的那一项取负"。
      * X^256 + 1 = 0 写成 X^256 = -1，所以指数越界时多乘一个 -1 —— 这就是"negacyclic"的全部含义。
+     * <pre>
+     *   out[i] = Σ_{j=0}^{255} sgn · a[j] · b[(i−j) mod N]，        sgn = +1 (i ≥ j)，−1 (i &lt; j)
+     *   i, j            结果的次数下标与求和变量（卷积的两个来源多项式系数）
+     *   (i−j) mod N     X^{i−j} 当 i−j &lt; 0 时：X^{i−j} = X^{N+(i−j)}·X^{−N} = X^{N+(i−j)}·(X^N)^{−1}，
+     *                   而 X^256 ≡ −1 ⇒ 多出的那个 −1 就是循环里的 (i−j)&gt;=0 ? 1 : −1
+     *   acc             long 累加器：256 项、每项 &lt; q² ≈ 2^46，必须借 long 才不会溢出，最后统一 mod q
+     * </pre>
+     * "绕回取负"（负卷积, negacyclic convolution）同时干了两件事：次数永远折回 &lt; 256（系数不爆炸），
+     * 以及让 R_q 恰好能被 NTT 在 256 个根 r_i 上对角化 —— 普通循环卷积对应 X^256−1，根的条件就不同了。
      */
     private static int[] mulPoly(int q, int[] a, int[] b)
     {
@@ -421,7 +536,15 @@ public class PqcEssenceTest
         return out;
     }
 
-    /** X^256+1 的 256 个根：r_i = ψ^(2i+1)。ψ^256 = -1 保证每个 r_i 都满足 r_i^256 = -1。 */
+    /**
+     * X^256+1 的 256 个根：r_i = ψ^(2i+1)。ψ^256 = -1 保证每个 r_i 都满足 r_i^256 = -1。
+     * <pre>
+     *   r_i^256 = (ψ^(2i+1))^256 = (ψ^256)^(2i+1) = (−1)^(2i+1) = −1   —— 奇数次幂是关键：
+     *   ψ 的偶数次幂（如 ω^j = ψ^2j）满足的是 X^256 = +1，那是 X^256−1 的根，插值会把符号搞反
+     *   互不相同：ψ 的阶是 512，2i+1 (i=0..255) 恰好遍历全部 256 个奇指数 —— 这是"X^256+1 在 Z_q
+     *   上完全分裂成一次因子"的构造性证明，也是 NTT 是双射的前提
+     * </pre>
+     */
     private static int[] roots(int q, int psi)
     {
         int[] out = new int[N];
@@ -435,6 +558,11 @@ public class PqcEssenceTest
     /**
      * 教科书 NTT：â[i] = Σ_j a[j]·ψ^((2i+1)·j) == "多项式 a 在根 r_i 上的取值"，仅此而已。
      * 两层 for 循环：外层是 256 个求值点，内层是 Horner 意义上的逐项累加。
+     * <pre>
+     *   â[i] = a(r_i) = Σ_{j=0}^{255} a[j]·r_i^j = Σ_j a[j]·ψ^((2i+1)·j)   （把 X ← r_i 代入多项式）
+     *   "NTT 就是把多项式乘法变成逐点乘法"：两个多项式在 256 个点上取值都相等 ⇔ 它们相等（次数 &lt; 256），
+     *   所以 a·b 在每个 r_i 上的值 = â[i]·b̂[i]，逐点乘 + 插值回去 == 原环里的乘法。
+     * </pre>
      */
     private static int[] nttBook(int q, int psi, int[] a)
     {
@@ -456,6 +584,13 @@ public class PqcEssenceTest
     /**
      * 教科书逆 NTT：a[j] = 256^-1 · Σ_i â[i]·r_i^(-j)。
      * 它成立只因为 Σ_i r_i^m 在 256 | m 时等于 256、否则等于 0（等比级数）—— 正交性就是全部的证明。
+     * <pre>
+     *   正交性推导：r_i = ψ·ω^i（ω = ψ^2 是 256 次本原单位根），所以
+     *     Σ_i r_i^m = ψ^m · Σ_i (ω^m)^i = ψ^m · (ω^(256m) − 1)/(ω^m − 1)：
+     *     ω^m = 1（即 256 | m）时每格都是 1，和 = 256；否则分子为 0 而分母非 0，和 = 0。
+     *   于是 Σ_i â[i]·r_i^(−j) = Σ_k a[k]·Σ_i r_i^(k−j) = 256·a[j] —— 只剩 j 那一项活着。
+     *   256^−1 存在因为 gcd(256, q) = 1（q 是奇素数）；r_i^(−j) 用 r_i^(2N−j) 实现（r_i^(2N)=1，免求逆）
+     * </pre>
      */
     private static int[] invNttBook(int q, int psi, int[] hats)
     {
@@ -484,6 +619,15 @@ public class PqcEssenceTest
      *
      * <p>蝴蝶天生就地更新：一个 pair 的两个输出只依赖这个 pair 的两个输入，
      * 所以直接读写同一个数组 b 即可，不需要函数式写法里"每级复制一份新数组"。
+     *
+     * <pre>
+     *   b[i]    第 i 个蝴蝶槽：写入时 b[i] = a[j]·ψ^j，其中 j = reverse8(i)（i 的低 8 位按位反转，256 = 2^8）
+     *   len     当前级的块长：2,4,8,...,256 —— 共 log2(256) = 8 级；每级 N/2 对 (u,v)
+     *   w       旋转因子 (twiddle) = ω^((N/len)·low)：把"合并两个 len/2 子变换"的错位相位乘上
+     *   u,v     一对输入 (u, v) → 一对输出 (u+v, u−v)："蝴蝶"名字就来自这两条交叉连线
+     *   为什么对：n 点 DFT 拆成两个 n/2 点 DFT 的经典恒等式 F(a0,a1)(k) = a0+ω^k·a1、
+     *   F(a0,a1)(k+n/2) = a0−ω^k·a1，逐层套用 8 次 = Cooley-Tukey；复杂度从 n^2 降到 (n/2)·log2(n) 次蝶
+     * </pre>
      */
     private static int[] nttFast(int q, int psi, int[] a)
     {
@@ -518,7 +662,12 @@ public class PqcEssenceTest
     /**
      * 2 的幂分解（ML-DSA 用它把 t 拆成公钥里的 t1 与私钥里的 t0）。
      * 返回 {a1, a0} —— 一个两元素数组，不需要 DecompositionResult 类。
-     *
+     * <pre>
+     *   half = 2^(d−1)                                  d = 13 时 half = 4096
+     *   a0   = ((a + half − 1) mod 2^d) − (half − 1)    低 d bit 再"偏置"到对称区间 [−(half−1), half]
+     *   a1   = (a − a0) >> d                            高 bit 商（右移 d 位 == 除 2^d，a−a0 天然是 2^d 的倍数）
+     *   恒等式  a = a1·2^d + a0（mod q 下），a−a0 ≡ 0 (mod 2^d) 所以移位无损失
+     * </pre>
      * <p>边界必须和参考实现一致：a0 的范围是 [-(2^(d-1)-1), 2^(d-1)]，即"上界含、下界不含"。
      * 之所以必须是这一边而不是对称的那一边，是因为 t0 随后要以 (2^(d-1) - a0) 的形式装进 13 bit
      * —— 另一个约定会溢出 1 bit（见 {@link #publicKeyIsJustTheHighBitsOfOnePolynomial()}）。
@@ -535,6 +684,18 @@ public class PqcEssenceTest
      * γ2 分解（ML-DSA 签名里 z 与 r1 的那一步）。α = 2γ2，且 q-1 必须是 α 的整数倍 ——
      * 这解释了 q = 2^23-2^13+1 为什么被选中：q-1 = 2^13·3·11·31 有 44 与 16 这样的因子。
      * 返回 {a1, a0}，其中 a1 在商 M = (q-1)/α 上取模 —— 这个"绕回 0"就是 hint 存在的理由。
+     * <pre>
+     *   α (alpha)  = 2γ2：把 [0, q−1] 切成 M = (q−1)/α 段、每段宽 α 的"刻度"（44 档 α=(q−1)/44 → M=44；
+     *              65/87 档 α=(q−1)/16 → M=16）
+     *   a1         = ⌊(a + α/2)/α⌋ mod M   "四舍五入到最近段"的商；mod M 让最后一段与第 0 段在 q−1↔0 处接吻
+     *   a0         = a − a1·α 的中心化代表元，|a0| ≤ γ2 + 1（绕回段附近会多出 1 的余量）
+     *   恒等式      a ≡ a1·α + a0 (mod q)
+     * </pre>
+     * <p>"绕回"的麻烦：a 在 [0,q−1] 头部或尾部时，a1 一个跳到 0 一个跳到 M−1，两者其实只隔着
+     * 一条模 q 的接缝。验签端重构的 w' 与签名端的 w 差一个小噪声，一旦落在接缝两侧，
+     * 单靠 w1 就无法对齐 —— MakeHint 记下"有没有跨界"这 1 bit，UseHint 把它加回高位模 M 即可对齐。
+     * 一条签名总共只允许 ω 个这样的位（80/55/75），这就是 hint 泄漏有 O(ω) bit（每系数 1 bit、
+     * 且只说"跨没跨界"，不指出跨了多远）的根本原因。
      */
     private static int[] decompose(int q, int alpha, int a)
     {
@@ -547,6 +708,11 @@ public class PqcEssenceTest
     /**
      * 加一个小噪声 e 后，有多少个探针点的 a1 改变了 —— hint 密度就是它。
      * 一个 for 循环，逐点比较 decompose 前后的高位。
+     * <pre>
+     *   pts[i]  探针点 a（铺满整个 [0,q) 才碰得到分界线）
+     *   noise   加的噪声 e；只有"a 恰好落在某条分界线下方 e 宽的那段"才会把 a1 推过刻度
+     *   结论     changed / len(pts) ≈ e/α：刻度越宽（α 大）或噪声越小，越不需要 hint —— ω 的物理意义
+     * </pre>
      */
     private static long countCrossings(int alpha, int noise, int[] pts)
     {
@@ -567,6 +733,11 @@ public class PqcEssenceTest
 
     /**
      * ML-KEM 的 compress：round(2^d·x/q)，即"把 q 个刻度量化成 2^d 个刻度"。
+     * <pre>
+     *   x  ∈ [0, q)   量化前的系数（q = 3329 个刻度）
+     *   d  ∈ {4,5,10,11}  压缩到的位数；2^d 个输出刻度
+     *   式  y = ⌊ (2^d·x + q/2) / q ⌋   —— "+q/2 再整除" 就是四舍五入；再 mod 2^d
+     * </pre>
      * 末尾那个 mod 2^d 不是防御性代码：x = q-1 时结果正好等于 2^d，必须绕回 0 ——
      * 这与"量化误差在 Z_q 里中心化"是同一件事（见 kemCiphertextLengthIs... 里的误差断言）。
      */
@@ -575,7 +746,15 @@ public class PqcEssenceTest
         return (int)(((((long)x << d) + q / 2) / q) & ((1L << d) - 1));
     }
 
-    /** ML-KEM 的 decompress：round(q·y/2^d)，量化必然有误差，误差上界就是安全性证明里的噪声预算。 */
+    /**
+     * ML-KEM 的 decompress：round(q·y/2^d)，把 2^d 个刻度映回 q 个刻度的代表元。
+     * <pre>
+     *   式  x' = ⌊ (q·y + 2^(d−1)) / 2^d ⌋ = ⌊ q·y/2^d + 1/2 ⌋   （"(q·y + 半格) >> d" 同样是四舍五入）
+     *   误差 |x' − x| ≤ ⌈q / 2^(d+1)⌉：一段量化宽度是 q/2^d，四舍五入最多差半个宽度
+     *   这条误差就是 KEM 解密正确性预算：u/v 里每个量化项最多吃掉这么多，累加后仍要小于噪声容限
+     * </pre>
+     * 量化必然有误差，误差上界就是安全性证明里的噪声预算。
+     */
     private static int decompress(int q, int d, int y)
     {
         return (int)(((long)q * y + (1L << (d - 1))) >> d);
@@ -586,6 +765,12 @@ public class PqcEssenceTest
     /**
      * 低位在前的比特打包：ML-DSA/ML-KEM 的所有"编码"都只是这件事。
      * {@code pack(bits, coeffs)} 得到的字节数必须与 BC 的公开常量逐字节相等。
+     * <pre>
+     *   bits      每个系数占的位数：t1=10、t0=13、η=4、z=18/20、ML-KEM 系数=12、w1=6 …
+     *   全局比特序号 m = 8i + k（i 字节号，k 字节内位号，LSB 在前）
+     *   out[i] 的第 k 位 = coeffs[m / bits] 的第 (m mod bits) 位   —— 系数之间"比特流式"紧挨，无字节对齐
+     *   长度      coeffs.length·bits/8 字节；256 系数 ⇒ 每 8 位凑 1 字节的整数倍才允许（bits 都整除 8·32）
+     * </pre>
      */
     private static byte[] pack(int bits, int[] coeffs)
     {
@@ -603,7 +788,7 @@ public class PqcEssenceTest
         return bytesOf(out);
     }
 
-    /** 逆操作：从字节流里按 bits 位一段地读出系数。 */
+    /** 逆操作：从字节流里按 bits 位一段地读出系数 —— out[i] = Σ_k bitAt(data, i·bits + k)·2^k。 */
     private static int[] unpack(int bits, int count, byte[] data)
     {
         int[] out = new int[count];
@@ -624,6 +809,15 @@ public class PqcEssenceTest
     /**
      * 中心二项式采样（ML-KEM 的密钥噪声）：2η 个随机 bit 分成两半，各数 1 的个数再相减。
      * 它是"噪声"的全部来源：系数落在 [-η, η]，因为它是 η 个 ±1 的和。
+     * <pre>
+     *   η (eta)     ML-KEM 密钥噪声参数 η1 = 3/2/2（按 512/768/1024），舍入噪声 η2 = 2
+     *   out[i]      = #A − #B，#A = 第 i 组前 η 个 bit 的 1 数，#B = 后 η 个 bit 的 1 数
+     *   第 i 组消耗  2η 个 bit，起始全局位号 = 2η·i（bitAt 逐位取，无需任何算术）
+     *   分布         中心二项分布 (centered binomial distribution)：#A,#B ~ Bin(η, 1/2)，
+     *                均值 0、方差 = 2·(η·1/4) = η/2；η 大时与离散高斯统计上几乎不可分 ——
+     *                它是格密码"高斯采样"最便宜、且天然常数时间（无分支、无泄漏）的近亲
+     *   count        = src.length·8/(2η)：给 64 字节/η=2 恰好得 256 个系数
+     * </pre>
      */
     private static int[] cbd(int eta, byte[] src)
     {
@@ -650,6 +844,11 @@ public class PqcEssenceTest
      * ML-DSA 的均匀采样 = 一条可见的拒绝循环：23-bit 窗口取一个候选，&ge; q 就丢掉，
      * while 循环直到凑够 need 个。教科书写作 while(count &lt; n)，这里就是一模一样的 while；
      * ML-DSA 的 η 采样、r1 采样全是这个形状，index 与 filled 都是普通局部变量。
+     * <pre>
+     *   循环条件   v = word23(seed, index) ；接受 iff v &lt; q（拒绝条件 v ≥ q）
+     *   丢弃率     2^23 − q = 8191 个坏值 / 2^23 ≈ 0.098%，可忽略但必须在（否则分布偏向 [0,2^23) 非均匀）
+     *   均匀性     每个 v &lt; q 被接受的概率都是 1（同一段比特窗口唯一决定它），所以拒绝不改变条件分布
+     * </pre>
      */
     private static int[] rejectField(int need, byte[] seed)
     {
@@ -669,7 +868,11 @@ public class PqcEssenceTest
         return out;
     }
 
-    /** 4-bit 版拒绝采样：16 个符号里 6 个要丢，丢弃率看得见 —— 用来演示"拒绝不改变均匀性"。 */
+    /**
+     * 4-bit 版拒绝采样：16 个符号里 6 个要丢，丢弃率看得见 —— 用来演示"拒绝不改变均匀性"。
+     * 接受域 {0..9}：每个符号的接受概率同为 1/16，条件分布就是 [0,10) 上的均匀分布；
+     * 丢弃率 6/16 = 37.5%，所以 bucket 图应该十个桶都在 200±40 附近（命题七里断言）。
+     */
     private static int[] rejectNibble(int need, byte[] seed)
     {
         int[] out = new int[need];
@@ -693,6 +896,13 @@ public class PqcEssenceTest
      * ML-DSA 的挑战多项式 c：恰好 tau 个非零位置（系数只有 ±1）。
      * "位置撞车就再抽一次"就是一个 while + 一个线性查找的局部循环；
      * 权重精确等于 tau，这就是 c 便宜的原因（见下面的稀疏乘法）。
+     * <pre>
+     *   slot 公式   slot = (24-bit 窗口 word23 同形状) >>> 9 &amp; 0xff：取 bit 9..16，均匀落在 [0, 256)
+     *   拒绝        contains(used, slot) 撞车就丢 —— 这是"不放回抽样"的近亲：得到 τ 个互不相同的位置
+     *   符号        真规范再抽 1 bit 定 ±1；本类 demo 用 slot 的奇偶当符号（只为演示稀疏乘法）
+     *   τ (tau)     权重 = 非零系数个数 = 汉明重量 (hamming weight)。FIPS 204 真值 39/49/60；
+     *               这里的 demo 借用 80（恰好是 ml-dsa-44 的 hint 上限 ω），性质断言与 τ 的具体值无关
+     * </pre>
      */
     private static int[] sampleInBall(int tau, byte[] seed)
     {
@@ -720,6 +930,14 @@ public class PqcEssenceTest
      * Montgomery 约减：R = 2^32，redc(x) = (x - ((x·q^-1) mod R)·q) / R = x·R^-1 mod q。
      * 注意这里是<b>减</b>：教科书写作 -q^-1 mod R 然后加，BC 存的是 +q^-1 mod 2^32 = 58728449，
      * 所以必须减 —— 两种写法凑出的都是 R 的整数倍，结果同样落在 [0, q)。
+     * <pre>
+     *   R      = 2^32："便宜模数"，mod R 就是取低 32 位（&amp; 0xFFFFFFFFL），除 R 就是右移 32 位
+     *   qInv   = q^−1 mod R，满足 m = x·qInv mod R 时 (x − m·q) ≡ 0 (mod R) —— 整除性是 m 的定义
+     *   m      = (x·qInv) mod R：唯一能把 x 的"低 32 位"凑成 2^32 倍数的乘子
+     *   redc   = (x − m·q)/R ≡ x·R^−1 (mod q)：商式 (x/R) 是精确整数除法，全程没有除 q
+     *   用途   Montgomery 域约定：值先乘 R 存着（"待在 Montgomery 域"），最后 invNttToMont 一次性 redc 折回，
+     *          中间每次乘法都省掉最贵的"除 q 取模"。Barrett 归约（预乘 ⌊2^k/q⌋ 近似倒数）是同类技巧的另一族。
+     * </pre>
      */
     private static int redc(long x, long qInv)
     {
@@ -761,7 +979,16 @@ public class PqcEssenceTest
         return s.verifySignature(sig);
     }
 
-    /** FIPS 204 表里的 η（噪声幅度），按级别排 —— 一张常量表，不是三个子类。 */
+    /**
+     * FIPS 204 表里的 η（s1/s2 的系数幅度，噪声幅度），按级别排 —— 一张常量表，不是三个子类。
+     * 完整参数表（k, l, η, τ, γ1, γ2, ω, z 每项位数）：
+     * <pre>
+     *   ml-dsa-44   k=4, l=4, η=2, τ=39, γ1=2^17, γ2=(q−1)/88, ω=80,  z 每项 18 bit（576 字节/多项式）
+     *   ml-dsa-65   k=6, l=5, η=4, τ=49, γ1=2^19, γ2=(q−1)/32, ω=55,  z 每项 20 bit（640 字节/多项式）
+     *   ml-dsa-87   k=8, l=7, η=2, τ=60, γ1=2^19, γ2=(q−1)/32, ω=75,  z 每项 20 bit（640 字节/多项式）
+     *   签名长度 = c~ 字节 + l·(位数·256/8) + (ω + k) 字节 —— 2420 / 3309 / 4627 全部由这一行算出来
+     * </pre>
+     */
     private static final int[] ETA = new int[]{ 2, 4, 2 };
 
     // ---------------------------------------------------------------- 测试
@@ -880,6 +1107,9 @@ public class PqcEssenceTest
         Assert.assertEquals("Kyber 的 q 就是 13*2^8+1", 13 * (1 << 8) + 1, Q_KEM);
 
         // Z_q^* 是 q-1 阶循环群 -> 512 次单位根存在 <=> 512 | (q-1)
+        // 术语：循环群 (cyclic group) = 全体非零元素恰是某个生成元 g 的幂 g^0..g^(q−2)（素数域的经典结论）；
+        // 于是"g^(m/k) 的阶 = m" ⟺ k | (q−1)（拉格朗日定理：元素的阶整除群的阶）—— 这就是"有 512 次
+        // 单位根 ⟺ 512 | q−1"的全部理由；"本原单位根 (primitive root of unity)"= 阶恰好等于该次数的那个。
         Assert.assertEquals("512 必须整除 q_dsa - 1（否则 NTT 无法把 X^256+1 拆成一次因子）",
             0, (Q_DSA - 1) % (2 * N));
         Assert.assertNotEquals("512 不整除 q_kem - 1：这就是 Kyber 的 NTT 只做 8 级、最后要用 2x2 基例的原因",
@@ -930,6 +1160,22 @@ public class PqcEssenceTest
     /**
      * 命题四（"填充模式"之一）：t = t1·2^13 + t0 就是二进制切一刀；
      * 我们的 10/13 bit 打包必须和 BC 真实密钥字节逐字节相同。
+     *
+     * <p><b>符号表 —— 本节新出现的字母</b>
+     * <pre>
+     *   ξ        32 字节私钥种子；BC 的 MLDSAPrivateKeyParameters 只存它，s1/s2/t0/rho/tr 全部现场展开
+     *   ρ (rho)  从 ξ 展开的种子之一，用来生成随机矩阵 A（均匀多项式由拒绝采样展开成 k·l 份）
+     *   A        k×l 多项式矩阵；t = A∘s1 + s2 (mod q)，s1 是 l 个多项式组成的向量（"模块"就是这套矩阵）
+     *   t1       公钥里的高位：t1 = (t + 2^12 − 1) >> 13，每系数 10 bit（0..1023），k 项共 k·320 字节
+     *   t0       私钥里的低位：t0 = t − t1·2^13 ∈ [−4095, 4096]，编码成 (2^12 − t0) 恰好装 13 bit
+     *   pk       公钥编码 = ρ(32字节) ‖ pack10(t1) 的 k 份 —— "32 + k·320" 没有别的名堂
+     * </pre>
+     *
+     * <p><b>为什么只发 t1 还能签/验</b>：验签要重构 w' = A·z − c·t（相差 c·t0 这类小项）。
+     * 用 t1·2^13 代替 t 引入的误差相对分解刻度 α = (q−1)/44 或 (q−1)/16 只是"小尾巴"，
+     * 只有落在 α 的边界附近才会翻转 a1 —— 而那正是 hint 负责修补的少数系数。
+     * 安全性侧：少发低 13 bit 让每个系数多出 2^13 种候选，配上短噪声 s2 后正是 Module-LWE
+     * 样本的形状 —— 公钥字节发得出去，s1 仍算不出来。
      */
     @Test
     public void publicKeyIsJustTheHighBitsOfOnePolynomial()
@@ -1017,6 +1263,21 @@ public class PqcEssenceTest
 
     /**
      * 命题五（"填充模式"之二）：γ2 分解与 hint —— 边界那一格就是 hint 存在的全部理由。
+     *
+     * <p><b>符号表 —— 本节公式里的字母</b>
+     * <pre>
+     *   m（循环变量）  = M = (q−1)/α：商/高位的个数。44 档 M=44（α=2γ2=(q−1)/44，γ2=(q−1)/88=95232）；
+     *                  65/87 档 M=16（α=(q−1)/16，γ2=(q−1)/32）。44↔ml-dsa-44，16↔ml-dsa-65/87
+     *   α (alpha)      刻度宽度；a = a1·α + a0 把 [0, q−1] 切成 M 段（每段宽 α），段号就是 a1
+     *   probes         探针点集：[0, γ2]、[q−1−γ2, q−1]（绕回接缝两侧）+ 400 个步长遍历点
+     *   e (noise)      故意加的小噪声（本测试取 α/16）；countCrossings 数"被 e 推过分界线"的点数
+     *   期望 changed   = 20000 · e/α：分界线共 M 条、每条下方 e 宽的条带会把 a1 推高一格，占全域比例 e/α
+     *   ω              真签名里 hint 非零位数的上限（80/55/75）—— 由 e 的分布尾部概率选出，保证重试率低
+     * </pre>
+     *
+     * <p>与真实协议的对应：签名端 w = A·y 分解出 (r1, r0)（这里叫 a1/a0），验签端重构的 w' = w + 小误差；
+     * 两者只在"绕回接缝"附近可能给出不同的 a1，MakeHint 记下这批系数（≤ ω 个），UseHint 只需
+     * "高位加 hint 再 mod M"就把两边对齐 —— 每个 hint 只说"跨没跨界"这 1 bit，不泄漏跨界多少。
      */
     @Test
     public void gammaDecompositionHasExactlyOneBoundaryProblemAndThatIsWhereHintsLive()
@@ -1085,6 +1346,17 @@ public class PqcEssenceTest
     /**
      * 命题六（"填充模式"之三）：ML-KEM 的 compress 就是把 q 个刻度量化成 2^d 个刻度，
      * 密文长度 = 32·(k·d_u + d_v)，一个比特都不多。
+     *
+     * <p><b>符号表 —— 本节公式里的字母</b>
+     * <pre>
+     *   k          ML-KEM 的模块维度（不是 FIPS 等级！）：512→2，768→3，1024→4；A 是 k×k，向量 s/e 长 k
+     *   d_u, d_v   密文两段的压缩位数：(10,4)/(10,4)/(11,5)
+     *   c1, c2     密文 = compress(u, d_u) 的 k 个多项式 ‖ compress(v, d_v) 的 1 个多项式
+     *   32·(k·d_u + d_v)   推导：一个多项式 256 个系数 × d bit = 256d/8 = 32d 字节；u 有 k 份、v 有 1 份
+     *   pk 长度    = 384·k + 32：t 的 k 个多项式按 12 bit（q &lt; 2^12）打包 + 种子 ρ 的 32 字节
+     *   sk 长度    = 768k + 96：IND-CPA 私钥 s 的 k·384 字节 + 整份公钥 k·384+32 + 尾巴 H(pk)(32) ‖ z′(32)
+     *   误差预算    ⌈q/2^(d_u+1)⌉：解密时 decompress∘compress 每系数的最大模偏差（在 Z_q 里中心化数）
+     * </pre>
      */
     @Test
     public void kemCiphertextLengthIsJustTheSumOfCompressedCoefficients()
@@ -1151,6 +1423,11 @@ public class PqcEssenceTest
     /**
      * 命题七（"填充模式"之四）：采样就是一个可见的拒绝循环 + 二项式差分；
      * 挑战多项式只有 τ 个非零系数，所以"乘 c"== τ 次移位加 —— 这是格签名便宜的那一半。
+     *
+     * <p>两条"便宜"的来源各占一半：<b>签名便宜</b>靠 c 稀疏（τ 项 ±1，乘法退化成 τ 次带符号循环移位）；
+     * <b>采样便宜</b>靠全程只有两种原语 —— CBD（数 bit，无分支，天然抗侧信道）和 23-bit 窗口拒绝
+     * （丢弃率 ~0.1%，条件分布仍是均匀的）。ML-DSA 全程不做高斯采样（GPV/Falcon 一系的核心技术）：
+     * 均匀 y + 拒绝等价的"翻转到界内"就能让 z 的分布与私钥无关，工程上简单得多。
      */
     @Test
     public void samplingIsARejectionLoopAndABinomialDifferenceMadeVisible()
@@ -1194,7 +1471,9 @@ public class PqcEssenceTest
         }
         Assert.assertTrue("每个桶都应在期望 200 附近：" + Arrays.toString(bucket), bucketsEven);
 
-        // ML-DSA 的挑战多项式：权重恰好 τ，位置互不相同
+        // ML-DSA 的挑战多项式：权重恰好 τ，位置互不相同。
+        // 注意：这里 demo 取的"τ=80"不是 ml-dsa-44 的真挑战权重（FIPS 真值 τ=39/49/60），
+        // 80 恰好是它的 hint 上限 ω；SampleInBall 的性质（权重精确、位置互异、落在 [0,256)）与权重值无关。
         int tau = 80;
         int[] slots = sampleInBall(tau, "ball".getBytes());
         Assert.assertEquals("权重必须精确等于 τ", tau, slots.length);
@@ -1228,6 +1507,18 @@ public class PqcEssenceTest
     /**
      * 命题八：ML-DSA 的密钥生成与签名都只由种子决定（确定性过程）；6 种"算法模式"全部走通，
      * 并且和 JCE 互通。
+     *
+     * <p><b>确定性的含义</b>：私钥只是 ξ（32 字节），签名过程内部的随机掩码 y 由 XOF(κ‖计数器) 现场展开，
+     * 连"拒绝后重抽"消耗的字节数都由 ξ 定死 —— 所以同一 (ξ, M) 两次签名逐字节相同（本测试断言）。
+     * FIPS 204 另有 hedged/随机化模式（再喂 32 字节 rn 进去）：那时同一消息可出多张合法签名，
+     * 但内部仍是"抽到 z 不越界、hint 数 ≤ ω 才停"的 while 重试环 —— "签名可能重试"是格签名的固有属性。
+     * 密码学目标是 <b>EUF-CMA</b>（选择多组消息求签，仍伪造不出第三条有效签名）；本测试用"改一位必失败、
+     * 换消息必失败"做最朴素的旁证。
+     *
+     * <p><b>mu-mode 与哈希结构</b>：算法真正吃的不是 M 而是 μ = SHAKE256(tr ‖ M, 64)，
+     * tr = SHAKE256(pk, 64) 是公钥指纹（把签名"钉"在这把公钥上，防止跨公钥移植）。
+     * 签名里的 c~ 是另一条哈希：c~ = SHAKE256(r ‖ M, 32/48/64)（r = 掩码 y 的承诺 w1 的压缩摘要），
+     * c 再由 c~ 经 SampleInBall 展开 —— "Hash-then-sign" 的 PreHashed 变体只换 M 的进入方式，管线不变。
      */
     @Test
     public void mldsaIsAPureFunctionOfItsSeedAcrossEveryMode()
@@ -1248,6 +1539,9 @@ public class PqcEssenceTest
             byte[] seed = shakeBytes(new byte[]{ (byte)(i + 1) }, MLDSAEngine.SeedBytes);
 
             // 私钥 = 种子的展开；同一份种子给 BC 与"我们包出去的函数"，必须得到同一把钥匙
+            // 展开链（全部是 XOF + 拒绝采样，没有任何"魔法密钥对象"）：
+            //   ξ ─XOF→ ρ‖K‖tr ；ρ ─XOF→ 矩阵 A（k·l 个均匀多项式）；K ─XOF→ s1‖s2（η 折返采样）
+            //   t = A∘s1 + s2 ─power2Round→ (t1, t0)；公钥只发 ρ‖t1，t0 与 s1/s2 留在 ξ 的展开里
             MLDSAPrivateKeyParameters priv = dsaPriv(p, seed);
             byte[][] direct = MLDSAEngine.getInstance(p, ANY).generateKeyPairInternal(seed);
             Assert.assertArrayEquals("rho 是种子的确定性展开", direct[0], priv.getRho());
@@ -1276,6 +1570,8 @@ public class PqcEssenceTest
             Assert.assertFalse("改一位必须失败", dsaVerify(pub, msg, bad));
 
             // mu-mode：ML-DSA 只吃 mu = SHAKE256(tr ‖ M)，先把 mu 算出来再签，结果必须一模一样
+            // 符号：tr = SHAKE256(pk, 64) 是公钥指纹（把签名钉死在这把公钥上，防跨公钥移植）；μ 恒 64 字节 = CrhBytes；
+            // "签 μ 与签 M 同结果"证明算法内部消息只以 μ 的形态进入 —— 预哈希模式换的仅是这一层入口
             MLDSASigner prep = new MLDSASigner();
             prep.init(true, priv);
             prep.update(msg, 0, msg.length);
@@ -1356,6 +1652,24 @@ public class PqcEssenceTest
     /**
      * 命题九：ML-KEM 是 KEM 不是加密 —— 密文不携带密钥，而是"约束"出同一个密钥；
      * 无效密文不会报错，它静默地导出一个假密钥（Fujisaki-Okamoto 的 implicit rejection），这正是 FO 变换的本质。
+     *
+     * <p><b>符号表 —— 本节公式里的字母/记号</b>
+     * <pre>
+     *   ξ=(d‖z′)   私钥种子：d 展开 IND-CPA 密钥对（s、t），z′ 是 32 字节"拒绝密钥"（别和签名侧的 t0 混）
+     *   coin / m   封装熵（BC 参数名 randBytes；FIPS 203 里叫消息 m，32 字节）——"换硬币必换密钥"的根源
+     *   (K, r)     G(coin ‖ H(pk)) 的前 64 字节：K = 共享密钥（取 32 字节），r = IND-CPA 加密内部硬币
+     *              H = SHA3-256（公钥指纹），G = SHA3-512（一劈两半）—— 都是 32 字节体系里的"2× 长度"选择
+     *   c=(c1‖c2)  IND-CPA 密文：u = Aᵀ∘r + e1 压 d_u 位、v = tᵀ∘r + e2 + 量化后的消息 压 d_v 位
+     *   K̃          隐式拒绝值 = J(z′ ‖ c)，J = SHAKE256 截 32 字节：密文自检不通过时用"它"当密钥返回
+     * </pre>
+     *
+     * <p><b>为什么"静默假密钥"恰好是 IND-CCA 的关键一步</b>：FO 变换给解密端加了一条自检
+     * （re-encrypt(c) 得回原密文才认账）。若失败就<b>报错</b>，敌人把报错当判定器逐位试探（典型的
+     * Manger/gap-选择密文攻击面）；若失败就<b>返回确定性的假密钥 K̃</b>，敌人拿到的仍是 32 字节随机样
+     * 输出、没有任何"错/对"通道可区分 —— 判定器被拆掉，IND-CPA 内核就升格为 IND-CCA。
+     * KEM 的应用层（TLS AEAD 密钥派生等）因此永远只见到"一把能用但不对的密钥"，而不是异常。
+     * 另注意常见误解（本测试断言纠正过）：密钥不是嵌在密文里的明文，而是双方各自从
+     * (coin, pk) 用同一条 G 现场重算出来的 —— 密文只是把 coin"藏"进格问题里的手段。
      */
     @Test
     public void mlkemEncapsulationIsPureAndRejectionIsSilent()
@@ -1440,6 +1754,37 @@ public class PqcEssenceTest
     /**
      * 综合题：ML-DSA 的签名流程就是一次环乘法 + 一次分解 + 一次打包，
      * 用普通静态方法把这些步骤逐个摆出来，再让 BC 裁判我们的所有猜想不至于跑偏。
+     *
+     * <p><b>符号表 —— 本节公式里的字母/记号</b>
+     * <pre>
+     *   ξ        种子 "mldsa-essence" 展开出 (ρ, κ, tr)；κ (kappa) 是抽 y 的 XOF 种子（本类用固定串代替）
+     *   s1, s2   私钥短多项式向量（l 份 / k 份）；s1 系数 ∈ [−η, η]，η=2（ml-dsa-44），存储为 4 bit 偏置值 η−s1[i]
+     *   y        掩码向量（l 份），系数均匀 ∈ (−γ1, γ1)；本类用 rejectField 仿制，真实协议 XOF(κ‖i) 逐份抽
+     *   γ1, γ2   2^17 与 (q−1)/88（44 档）；α = 2γ2，刻度数 M = 44
+     *   w = A∘y  环上矩阵-向量乘（本类拿 NTT(y·s1) 当演示替身，只考换基恒等式）；w1/w0 = decompose 的高/低位
+     *   c~ → c   32 字节挑战摘要 → SampleInBall 展开的 τ=39 项 ±1 稀疏多项式（demo 权重借 80，见命题七）
+     *   z        响应多项式 z = y + c∘s1 (mod q)，中心折回后按 18 bit/系数打包（576 字节/份 × l=4 份 = 2304）
+     *   h        k 个多项式的 hint 拼段，共 ω + k = 80 + 4 = 84 字节；签名 2420 = 32 (c~) + 2304 (z) + 84 (h)
+     *   β        = τ·η 的范数上界（44 档 39·2 = 78）：‖c∘s1‖∞ ≤ β —— 下面不等式的来源
+     * </pre>
+     *
+     * <p><b>验签不等式为什么成立（‖z‖ 的上界从哪来）</b>：验签端重构
+     * w' = A∘z − c∘t1·2^13，把 z = y + c∘s1 与 t = A∘s1 + s2 代入得
+     * w' = A∘y + (c∘s2 − c∘t0 的 2^13 缩放与舍入小项) = w + 小误差 —— 所以只要 (1) z 的分解不引入额外
+     * 误差、(2) w' 与 w 的 a1 一致（靠 h 修补边界），验签就通过。
+     * (1) 的界是纯加法账：‖z‖∞ = ‖y + c∘s1‖∞ ≤ ‖y‖∞ + ‖c∘s1‖∞。
+     * 第一项 &lt; γ1 由采样保证；第二项因为 c 只有 τ 个 ±1 单项式（汉明权重 τ），c∘s1 的每个系数是
+     * "τ 个 s1 系数各带符号相加"，而 |s1[·]| ≤ η，所以 ≤ τ·η = β —— 这就是"z 的上界来自 s1 的长度
+     * 与 c 的汉明权重"。于是签名端要求 z 折回中心后 ‖z‖∞ ≤ γ1 − β（留 β 的余量给负方向），
+     * 打包位数 18 = bitlen(γ1) + 1（γ1 = 2^17 时平移后的 z 全范围不足 2^18）—— 界、位宽、重试条件是同一笔账的三个面。
+     *
+     * <p><b>为什么必须拒绝采样才能不泄漏私钥</b>：y 均匀，但 z = y + c∘s1 把分布整体"推"了 β 那么远，
+     * z 的边缘分布带着 s1 的方向信息。ML-DSA 的处理是把 y 的采样域取成以 0 为中心的对称球，
+     * 一旦 z 折回后出界（‖z‖∞ ≥ γ1 − β）或 hint 数超 ω，就整轮丢弃重抽 y ——
+     * 被接受的 z 条件分布与"直接从中心均匀球里抽"统计上贴合，泄漏的互信息 ≤ 拒绝率的量级。
+     * 对照：不做这层"翻折+拒绝"（比如把 y 抽在不对称区间），η 与 τ 再小也架不住多次签名对方程组解 s1。
+     * hint 只泄漏 O(1) bit：每条 hint 一个"跨没跨 α 刻度边界"的判定位，共 ≤ ω=80 bit，
+     * 相对 2420 字节签名 ≈ 3% 且与 s1/s2 的取值无关（它只依赖公开刻度与噪声落点）。
      */
     @Test
     public void signingIsOneRingMultiplyOneDecompositionAndOnePack()
@@ -1453,6 +1798,8 @@ public class PqcEssenceTest
             new MLDSAPublicKeyParameters(p, priv.getRho(), priv.getT1()).getEncoded());
 
         // 步骤 0：s1 是"η 采样 + 4 bit（其实 3 bit）偏置打包"的产物 —— 用我们的 unpack 还原，幅度必须 <= η
+        // 符号：η = 系数幅度（44 档 = 2）；stored ∈ [0, 2η] 只需 ⌈log2(2η+1)⌉ = 3 bit，标准仍按 4 bit/系数打包（128 字节/份）；
+        // 真值 s1[i] = η − stored —— "偏置打包"就是用偏移量 η 把 [0,2η] 翻成 [−η, η]，中心化表示的又一次现身
         int eta = ETA[0];
         int etaBytes = eng.getDilithiumPolyEtaPackedBytes();
         int etaBits = etaBytes * 8 / N;
@@ -1468,6 +1815,8 @@ public class PqcEssenceTest
             Arrays.copyOf(priv.getS1(), etaBytes), pack(etaBits, s1Stored));
 
         // 步骤 1：y 是一个"幅度 < γ1"的多项式 —— 这里用 23-bit 窗口的拒绝采样自己抽一个（while 循环直到凑满 256 个）
+        // 符号：γ1 = 2^17（44 档）；真实协议是 y_i ← XOF(κ‖(256+i)) 以 21/22-bit 窗口拒绝后折成 (−γ1, γ1)，
+        // 本类用 rejectField 同形状仿制：y = (γ1−1) − (v mod (γ1−1)) ∈ [1, γ1−1]，结论不变 —— 幅度 < γ1
         int gamma1 = 1 << 17;
         int[] yRaw = rejectField(N, "y-sample".getBytes());
         int[] y = new int[N];
@@ -1483,6 +1832,8 @@ public class PqcEssenceTest
             same(wy, pointwiseMul(Q_DSA, nttFast(Q_DSA, PSI_DSA, y), nttFast(Q_DSA, PSI_DSA, s1))));
 
         // 步骤 3：分解出 w1 并打包 —— γ2 分解（ml-dsa-44 用 γ2 = (q-1)/88，所以 w1 ∈ [0,44) 只要 6 bit）
+        // 符号：w1 = HighBits(w) = decompose 的段号 a1；真实协议里它被压缩成 r（Compress(r1, 2γ2→4 bit/系数)），
+        // 与消息一起进 c~ = H(r ‖ M) —— "承诺"就是这个被哈希进去的高位摘要
         int gamma2 = (Q_DSA - 1) / 88;
         int[] w1 = new int[N];
         for (int i = 0; i < N; i++)
@@ -1494,6 +1845,36 @@ public class PqcEssenceTest
         Assert.assertTrue("6-bit 打包/解包互逆", same(w1, unpack(6, N, pack(6, w1))));
 
         // 步骤 4：z = y + c·s1 的形状检查 —— c 是 τ-稀疏的，所以这一步是 τ 次移位加（见命题七）
+        //
+        // ┌─ 为什么签名侧必须"拒绝采样 + 重试"（本类最该讲清的一条推导）────────────────────────
+        // │ z 的定义：z = y + c·s1  （环 R_q 里的加法/乘法；c·s1 就是那 τ 次带符号移位加）
+        // │   y    —— 一次性掩码：每签一枚就重抽，系数在 [0, γ1−1] 上均匀（中心化后 ‖y‖∞ ≤ γ1−1）
+        // │   c    —— 挑战多项式：恰好 τ 个非零系数、每个是 ±1，故 ‖c‖∞ = 1、‖c‖₁ = τ
+        // │   s1   —— 私钥短多项式：‖s1‖∞ ≤ η（FIPS 204 表里 η = 2/4/2）
+        // │
+        // │ 范数上界的推导（卷积的"1-范数 × ∞-范数"不等式，负卷积同样成立）：
+        // │   ‖c·s1‖∞ ≤ ‖c‖₁·‖s1‖∞ = τ·η =：β   —— 记 β 为"挑战把私钥放大"的最大幅度
+        // │   于是若无限制：‖z‖∞ = ‖y + c·s1‖∞ ≤ (γ1−1) + β，即 z 的取值范围被 c·s1 整个平移了 β 格
+        // │   ml-dsa-44 代数字：γ1 = 2^17 = 131072，τ=39, η=2 → β = 78（65/87 档 γ1=2^19、β 更大）
+        // │
+        // │ 关键恒等式（FIPS 204 真正的验签/界检查用的是 ∞-范数，不是 ⟨z,z⟩）：
+        // │   接受 ⟺ ‖z‖∞ ≤ γ1 − β
+        // │   注意 ‖z‖∞ = maxᵢ|z[i]|（本类 allAbsAtMost() 查的就是它）；
+        // │   而 ⟨z,z⟩ = Σ z[i]² 开根号得到的是 L2 范数 ‖z‖，那是 Falcon/GPV 里"高斯采样"要控的量，
+        // │   ML-DSA 用"均匀 y + ∞-范数拒绝"绕开了高斯采样，所以这里的界写的是 γ1 − β 而不是 √⟨z,z⟩
+        // │
+        // │ 为什么这条界 = "必须拒绝"的原因（分布与私钥无关）：
+        // │   z 是 y 平移 c·s1 的结果；直接交出 z，就等于把"掩码分布"挪了一个依赖 s1 的量，
+        // │   敌人可从 z 的统计偏移反推私钥。只有当 ‖z‖∞ 落在 γ1 − β 内才保留——
+        // │   这条界把 y 的两端尾巴（离零超过 γ1−β 的那些）统一切掉，切完之后
+        // │   留下的 z 分布对每个 s1 都（几乎）一模一样 → z 不泄露任何私钥信息。
+        // │   代价就是"抽到的 y 让 z 越界就得丢掉、重抽 y 再试"——签名是概率性的、可能要重试若干轮。
+        // │   同一轮里还要顺带检查 w0/r0 的界与 hint 位数 ≤ ω（λ），超限同样整枚重来。
+        // │   hint 的 MakeHint/UseHint 与这条界配套：先固定"要交出的高位 w1"，再让 z 的分布只依赖 w1、
+        // │   不依赖私钥 —— 这正是"让签名分布与 s 无关"这同一个目标的两面。
+        // └──────────────────────────────────────────────────────────────────────────────────
+        // 签名 2420 字节的精确拆分（ml-dsa-44）：32 (c~ 挑战摘要) + 4·576 (z：l=4 份 × 18 bit/系数) + 84 (h 段 = ω + k = 80 + 4)。
+        // 下一条断言消息里写的 "c~(80)" 中的 80 其实是 hint 上限 ω 的数值（c~ 只有 32 字节；真正的挑战权重 τ=39），别读成"c~ 占 80 字节"。
         byte[] msg = "one multiply, one round, one pack".getBytes();
         byte[] sig = dsaSign(priv, msg);
         Assert.assertTrue("完整签名必须能被我们的手写验证器接受", dsaVerify(pub, msg, sig));
@@ -1505,6 +1886,13 @@ public class PqcEssenceTest
     /**
      * 对照表：把"模式"这件事显式列成一张表 —— 没有 switch，没有子类。
      * ML-DSA 六种模式 + ML-KEM 三种模式，全部只是不同的参数常量喂给同一条管线。
+     *
+     * <p>名字里的数字：44/65/87（ML-DSA）与 512/768/1024（ML-KEM）是 NIST 安全强度等级 1/3/5 的编号，
+     * ≈ 与 AES-128/192/256 的暴力同级；Grover 只把搜索强度减半，所以等级 1 用 256-bit 哈希而不是 128-bit。
+     * 本节断言的每个长度都是 FIPS 203/204 官方参数表值：pk 1312/1952/2592 = 32 + k·320，
+     * sig 2420/3309/4627 = c~ + l·z份 + (ω+k)，ct 768/1088/1568 = 32·(k·d_u + d_v)。
+     * NIST 标准随文发布的固定 seed → 期望字节串叫 KAT（known-answer test）：实现逐字节复现官方表，
+     * 才算"和参考实现等价"；本类用"长度 + 结构恒等式 + BC 裁判"覆盖同一张表的骨架。
      */
     @Test
     public void parameterSetsAreATableNotAClassHierarchy()
