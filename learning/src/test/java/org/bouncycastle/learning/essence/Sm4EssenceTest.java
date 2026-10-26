@@ -19,7 +19,11 @@ import org.bouncycastle.crypto.paddings.TBCPadding;
 import org.bouncycastle.crypto.paddings.X923Padding;
 import org.bouncycastle.crypto.paddings.ZeroBytePadding;
 import org.bouncycastle.crypto.params.KeyParameter;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 import static org.bouncycastle.learning.essence.Calc.rotl;
@@ -101,6 +105,9 @@ import static org.bouncycastle.learning.essence.Calc.u32;
 @Slf4j
 public class Sm4EssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     /** BS：块长 (block size) = 16 字节 = 128 bit —— SM4 唯一的"分组大小"，所有模式与填充都以它为模数。 */
     private static final int BS = 16;
     /** M32_BIG = 2³²−1 的大数形态（BigInteger 版的 u32）：GCM 的 inc32 加完 1 后要"只留低 32 位"。 */
@@ -963,6 +970,7 @@ public class Sm4EssenceTest
      *         不满足就不可逆，分组密码也就无法解密
      * </pre>
      */
+    @TraceExecution(value = "SM4 三十二轮迭代核心", algorithm = "SM4", flow = "SM4-CORE")
     @Test
     public void sm4CoreIsAThirtyTwoStepLoop()
     {
@@ -971,13 +979,61 @@ public class Sm4EssenceTest
         byte[] key = Calc.unhex("0123456789abcdeffedcba9876543210");
         byte[] pt = Calc.unhex("0123456789abcdeffedcba9876543210");
 
+        Tracer.trace("start", new Object[]{
+            "algorithm", "SM4", "key", Calc.hex(key), "plaintext", Calc.hex(pt)
+        }, null, "start");
+
         long[] rk = expandKey(key);
+        Tracer.trace("keyExpand", new Object[]{
+            "MK", Calc.hex(key), "FK", Calc.hex(FK)
+        }, Calc.hex(rk), "keyExpand");
+        long[] initX = Calc.words32(pt);
+        Tracer.trace("initReg", new Object[]{
+            "plaintext", Calc.hex(pt), "X0..X3", Calc.hex(initX)
+        }, Calc.hex(initX), "initReg");
         log.info("[SM4-本质] rk[0]=0x{} rk[1]=0x{} rk[31]=0x{}",
             String.format("%08x", rk[0]), String.format("%08x", rk[1]), String.format("%08x", rk[31]));
         // GB/T 32907 给的第一个轮密钥：先把密钥扩展钉死，再谈轮函数
         Assert.assertEquals(0xf12186f9L, rk[0]);
 
         byte[] ct = sm4Block(rk, pt);
+        if (Tracer.isEnabled())
+        {
+            // 只为追踪重放 32 轮：输入、轮密钥与 sm4Block 完全相同，事件里是真实中间值
+            long[] traceX = Calc.words32(pt);
+            for (int round = 0; round < 32; round++)
+            {
+                long[] before = new long[]{ traceX[0], traceX[1], traceX[2], traceX[3] };
+                long tInput = u32(traceX[1] ^ traceX[2] ^ traceX[3] ^ rk[round]);
+                long tauOut = tau(tInput);
+                long linearOut = linearL(tauOut);
+                long t = u32(traceX[0] ^ linearOut);
+                traceX[0] = traceX[1];
+                traceX[1] = traceX[2];
+                traceX[2] = traceX[3];
+                traceX[3] = t;
+                Tracer.traceLoop("round", new Object[]{
+                    "round", round, "rk", String.format("0x%08x", rk[round]),
+                    "stateBefore", Calc.hex(before)
+                }, Calc.hex(traceX), "roundLoop", round + 1, 32, "roundLoop");
+                // τ 与 L 每 4 轮采样一次，32 轮的事件总数保持在预算内
+                if ((round & 3) == 0)
+                {
+                    Tracer.trace("tau", new Object[]{
+                        "round", round, "T_input", String.format("0x%08x", tInput)
+                    }, String.format("0x%08x", tauOut), "sBox");
+                    Tracer.trace("linearL", new Object[]{
+                        "round", round, "tau", String.format("0x%08x", tauOut)
+                    }, String.format("0x%08x", linearOut), "linear");
+                }
+            }
+            Tracer.trace("reverse", new Object[]{
+                "X32", String.format("0x%08x", traceX[3]),
+                "X33", String.format("0x%08x", traceX[2]),
+                "X34", String.format("0x%08x", traceX[1]),
+                "X35", String.format("0x%08x", traceX[0])
+            }, Calc.hex(ct), "reverse");
+        }
         log.info("[SM4-本质] GB/T 32907 单块加密 = {}", Calc.hex(ct));
         // GB/T 32907 官方 KAT 的密文（十六进制字符串就是那 16 字节的大端表示）
         Assert.assertEquals("681edf34d206965e86b3e94f536e4246", Calc.hex(ct));
@@ -1005,6 +1061,10 @@ public class Sm4EssenceTest
             }
         }
         Assert.assertEquals("S 盒必须是 256 元双射（否则不可逆）", 256, distinct);
+        Tracer.trace("end", new Object[]{
+            "ciphertext", Calc.hex(ct), "kat", "681edf34d206965e86b3e94f536e4246",
+            "sBoxDistinct", distinct
+        }, true, "end");
     }
 
     /** GB/T 32907 的 100 万次迭代测试：单块加密的自调用迭代。
@@ -1020,16 +1080,53 @@ public class Sm4EssenceTest
      *   为什么值得等这一百万次  它是标准自带的、不用第三方裁判就能核对的最强单点检查之一
      * </pre>
      */
+    @TraceExecution(value = "SM4 一百万次自复合", algorithm = "SM4", flow = "SM4-CORE")
     @Test
     public void oneMillionIterationsIsSelfComposition()
     {
         byte[] key = Calc.unhex("0123456789abcdeffedcba9876543210");
         byte[] data = Calc.unhex("0123456789abcdeffedcba9876543210");
+        Tracer.trace("start", new Object[]{
+            "algorithm", "SM4", "iterations", 1_000_000, "key", Calc.hex(key), "data", Calc.hex(data)
+        }, null, "start");
         // 轮密钥表在循环外面算一次即可：迭代的是置换 E，而不是每次都重做密钥扩展
         byte[] result = iterate(1_000_000, expandKey(key), data);
+        if (Tracer.isEnabled())
+        {
+            // 只重放前两次与末次的值；100 万次循环本身绝不逐次 trace
+            long[] traceKeys = expandKey(key);
+            Tracer.trace("keyExpand", new Object[]{
+                "MK", Calc.hex(key), "FK", Calc.hex(FK)
+            }, Calc.hex(traceKeys), "keyExpand");
+            long[] traceX = Calc.words32(data);
+            Tracer.trace("initReg", new Object[]{
+                "data", Calc.hex(data), "X0..X3", Calc.hex(traceX)
+            }, Calc.hex(traceX), "initReg");
+            byte[] first = sm4Block(traceKeys, data);
+            byte[] second = sm4Block(traceKeys, first);
+            Tracer.traceLoop("iterate", new Object[]{
+                "iteration", 1, "input", Calc.hex(data)
+            }, Calc.hex(first), "roundLoop", 1, 1_000_000, "roundLoop");
+            Tracer.traceLoop("iterate", new Object[]{
+                "iteration", 2, "input", Calc.hex(first)
+            }, Calc.hex(second), "roundLoop", 2, 1_000_000, "roundLoop");
+            Tracer.traceLoop("iterate", new Object[]{
+                "iteration", 1_000_000, "input", "第 999999 次迭代的输出"
+            }, Calc.hex(result), "roundLoop", 1_000_000, 1_000_000, "roundLoop");
+            Tracer.traceLoop("iterate.summary", new Object[]{
+                "iterations", 1_000_000, "rk0", String.format("0x%08x", traceKeys[0])
+            }, Calc.hex(result), "roundLoop", 1_000_000, 1_000_000, "roundLoop");
+            Tracer.trace("reverse", new Object[]{
+                "result", Calc.hex(result)
+            }, Calc.hex(result), "reverse");
+        }
         log.info("[SM4-本质] 迭代 100 万次 = {}", Calc.hex(result));
         // GB/T 32907 官方 KAT 的 10⁶ 次迭代答案
         Assert.assertEquals("595298c7c6fd271f0402f804c33d3f66", Calc.hex(result));
+        Tracer.trace("end", new Object[]{
+            "ciphertext", Calc.hex(result), "iterations", 1_000_000,
+            "kat", "595298c7c6fd271f0402f804c33d3f66"
+        }, true, "end");
     }
 
     /** ECB / CBC：手工循环的输出必须与 BC 的 JCE 流水线逐字节相同。
@@ -1050,6 +1147,7 @@ public class Sm4EssenceTest
      *         ④其余明文块不受 IV 影响 —— ③④合起来说明"CBC 可被精确翻转比特、没有完整性"
      * </pre>
      */
+    @TraceExecution(value = "SM4 ECB/CBC 分组模式", algorithm = "SM4", flow = "SM4-MODES")
     @Test
     public void blockModesAreCombinatorsOverTheBlockFunction()
         throws Exception
@@ -1065,23 +1163,91 @@ public class Sm4EssenceTest
         // 解密轮密钥表：同一张表倒过来读，rk₃₁..rk₀
         long[] decKeys = keySchedule(key, false);
 
+        Tracer.trace("start", new Object[]{
+            "algorithm", "SM4", "modes", "ECB/CBC", "key", Calc.hex(key)
+        }, null, "start");
+        Tracer.trace("pad", new Object[]{
+            "blockSize", BS, "plainBytes", pt.length, "blocks", pt.length / BS, "padding", "NoPadding"
+        }, pt.length / BS, "pad");
+        Tracer.trace("iv", new Object[]{
+            "iv", Calc.hex(iv), "role", "CBC 的 C_{-1}"
+        }, Calc.hex(iv), "iv");
+
         // ECB 的本质缺陷：把"相同的明文块对"塞进去，密文块也必然相同
         byte[] repetitive = Calc.concat(Calc.repeatedByte(0x41, BS), Calc.repeatedByte(0x41, BS));
         byte[] ecbLeaky = ecb(encKeys, repetitive);
         Assert.assertTrue("ECB：相同明文块 -> 相同密文块（模式没有链，这就是它不安全的原因）",
             Arrays.equals(Arrays.copyOfRange(ecbLeaky, 0, BS), Arrays.copyOfRange(ecbLeaky, BS, 2 * BS)));
 
+        if (Tracer.isEnabled())
+        {
+            List<byte[]> leakyPlain = Calc.chunks(repetitive, BS);
+            List<byte[]> leakyCipher = Calc.chunks(ecbLeaky, BS);
+            for (int bi = 0; bi < leakyPlain.size(); bi++)
+            {
+                Tracer.traceLoop("block", new Object[]{
+                    "mode", "ECB", "block", bi, "plain", Calc.hex(leakyPlain.get(bi)),
+                    "demo", "相同的明文块对"
+                }, Calc.hex(leakyCipher.get(bi)), "blockLoop", bi + 1, leakyPlain.size(), "blockLoop");
+                Tracer.trace("E_K", new Object[]{
+                    "mode", "ECB", "block", bi, "plain", Calc.hex(leakyPlain.get(bi))
+                }, Calc.hex(leakyCipher.get(bi)), "encBlock");
+            }
+        }
+
         byte[] ecbOurs = ecb(encKeys, pt);
+        if (Tracer.isEnabled())
+        {
+            List<byte[]> ecbPlain = Calc.chunks(pt, BS);
+            List<byte[]> ecbCipher = Calc.chunks(ecbOurs, BS);
+            for (int bi = 0; bi < ecbPlain.size(); bi++)
+            {
+                Tracer.traceLoop("block", new Object[]{
+                    "mode", "ECB", "block", bi, "plain", Calc.hex(ecbPlain.get(bi))
+                }, Calc.hex(ecbCipher.get(bi)), "blockLoop", bi + 1, ecbPlain.size(), "blockLoop");
+                Tracer.trace("E_K", new Object[]{
+                    "mode", "ECB", "block", bi, "plain", Calc.hex(ecbPlain.get(bi))
+                }, Calc.hex(ecbCipher.get(bi)), "encBlock");
+            }
+        }
         Cipher c = Cipher.getInstance("SM4/ECB/NoPadding", "BC");
         c.init(Cipher.ENCRYPT_MODE, ks);
         Assert.assertArrayEquals("ECB 与 BC 不一致", c.doFinal(pt), ecbOurs);
         log.info("[SM4-模式] ECB={}", Calc.hex(ecbOurs));
 
         byte[] cbcOurs = cbcEncrypt(encKeys, iv, pt);
+        if (Tracer.isEnabled())
+        {
+            List<byte[]> cbcPlain = Calc.chunks(pt, BS);
+            List<byte[]> cbcCipher = Calc.chunks(cbcOurs, BS);
+            byte[] tracePrev = iv;
+            for (int bi = 0; bi < cbcPlain.size(); bi++)
+            {
+                byte[] traceInput = Calc.xor(cbcPlain.get(bi), tracePrev);
+                byte[] traceCipher = cbcCipher.get(bi);
+                Tracer.traceLoop("block", new Object[]{
+                    "mode", "CBC", "block", bi,
+                    "plain", Calc.hex(cbcPlain.get(bi)), "C_{i-1}", Calc.hex(tracePrev)
+                }, Calc.hex(traceCipher), "blockLoop", bi + 1, cbcPlain.size(), "blockLoop");
+                Tracer.trace("E_K", new Object[]{
+                    "mode", "CBC", "block", bi, "input", Calc.hex(traceInput)
+                }, Calc.hex(traceCipher), "encBlock");
+                Tracer.trace("xor", new Object[]{
+                    "plain", Calc.hex(cbcPlain.get(bi)), "C_{i-1}", Calc.hex(tracePrev)
+                }, Calc.hex(traceInput), "xor");
+                Tracer.trace("feedback", new Object[]{
+                    "C_{i-1}", Calc.hex(tracePrev), "C_i", Calc.hex(traceCipher)
+                }, Calc.hex(traceCipher), "feedback");
+                tracePrev = traceCipher;
+            }
+        }
         c = Cipher.getInstance("SM4/CBC/NoPadding", "BC");
         c.init(Cipher.ENCRYPT_MODE, ks, new IvParameterSpec(iv));
         byte[] cbcRef = c.doFinal(pt);
         log.info("[SM4-模式] CBC={}", Calc.hex(cbcOurs));
+        Tracer.trace("final", new Object[]{
+            "ecb", Calc.hex(ecbOurs), "cbc", Calc.hex(cbcOurs), "bytes", cbcOurs.length
+        }, cbcOurs.length, "final");
         Assert.assertArrayEquals("CBC 与 BC 不一致", cbcRef, cbcOurs);
         Assert.assertArrayEquals("CBC 解密必须还原明文", pt, cbcDecrypt(decKeys, iv, cbcOurs));
         c.init(Cipher.DECRYPT_MODE, ks, new IvParameterSpec(iv));
@@ -1108,6 +1274,21 @@ public class Sm4EssenceTest
         // 第二块起用的是 C_{i−1}（真实的密文），跟 IV 一个字都没沾上 —— 所以完全不受影响
         Assert.assertArrayEquals("其余明文块完全不受 IV 影响",
             Arrays.copyOfRange(pt, BS, pt.length), Arrays.copyOfRange(wrongIv, BS, wrongIv.length));
+        Tracer.traceDecision("compare.ecb", new Object[]{
+            "ours", Calc.hex(ecbOurs)
+        }, true, "compare", "ECB 输出与 BC SM4/ECB/NoPadding 逐字节一致");
+        Tracer.traceDecision("compare.cbc", new Object[]{
+            "ours", Calc.hex(cbcOurs), "bc", Calc.hex(cbcRef)
+        }, Arrays.equals(cbcRef, cbcOurs), "compare", "CBC 输出与 BC SM4/CBC/NoPadding 逐字节一致");
+        Tracer.traceDecision("compare.roundtrip", new Object[]{
+            "plaintext", Calc.hex(pt)
+        }, Arrays.equals(pt, cbcDecrypt(decKeys, iv, cbcOurs)), "compare", "CBC 解密还原明文");
+        Tracer.traceDecision("compare.ivDiffusion", new Object[]{
+            "iv", Calc.hex(iv), "iv2", Calc.hex(iv2)
+        }, !Arrays.equals(cbcOurs, cbcOurs2), "compare", "改 IV 后全部密文块改变");
+        Tracer.trace("end", new Object[]{
+            "ecb", Calc.hex(ecbOurs), "cbc", Calc.hex(cbcOurs), "verified", true
+        }, true, "end");
     }
 
     /** CTR / OFB / CFB：三种"块方法 -> 流方法"的写法，区别只在反馈来源。
@@ -1130,6 +1311,7 @@ public class Sm4EssenceTest
      *         把"只差反馈来源"这件事钉成可观察的事实
      * </pre>
      */
+    @TraceExecution(value = "SM4 CTR/OFB/CFB 流式模式", algorithm = "SM4", flow = "SM4-MODES")
     @Test
     public void streamLikeModesDifferOnlyInFeedbackSource()
         throws Exception
@@ -1143,19 +1325,101 @@ public class Sm4EssenceTest
         // 流式模式的三种用法都只调"加密方向的轮密钥表"（加密器只被用来产生密钥流，从不需要逆序表）
         long[] encKeys = expandKey(key);
 
+        List<byte[]> tracePlainParts = Calc.chunks(pt, BS);
+        Tracer.trace("start", new Object[]{
+            "algorithm", "SM4", "modes", "CTR/OFB/CFB", "key", Calc.hex(key)
+        }, null, "start");
+        Tracer.trace("pad", new Object[]{
+            "plainBytes", pt.length, "blockSize", BS, "blocks", tracePlainParts.size(), "padding", "NoPadding"
+        }, tracePlainParts.size(), "pad");
+        Tracer.trace("iv", new Object[]{
+            "iv", Calc.hex(iv), "roles", "CTR 的 ctr₀；OFB/CFB 的 IV"
+        }, Calc.hex(iv), "iv");
+
         byte[] ctrOurs = ctr(encKeys, iv, pt);
+        if (Tracer.isEnabled())
+        {
+            List<byte[]> ctrCipherParts = Calc.chunks(ctrOurs, BS);
+            BigInteger ctrBase = Calc.toBigInt(iv);
+            for (int bi = 0; bi < tracePlainParts.size(); bi++)
+            {
+                byte[] counterBlock = Calc.toBytes(ctrBase.add(BigInteger.valueOf(bi)), BS);
+                byte[] keystream = sm4Block(encKeys, counterBlock);
+                byte[] cipherBlock = ctrCipherParts.get(bi);
+                byte[] nextCounter = Calc.toBytes(ctrBase.add(BigInteger.valueOf(bi + 1)), BS);
+                Tracer.traceLoop("block", new Object[]{
+                    "mode", "CTR", "block", bi, "counter", Calc.hex(counterBlock)
+                }, Calc.hex(cipherBlock), "blockLoop", bi + 1, tracePlainParts.size(), "blockLoop");
+                Tracer.trace("E_K", new Object[]{
+                    "counter", Calc.hex(counterBlock)
+                }, Calc.hex(keystream), "encBlock");
+                Tracer.trace("xor", new Object[]{
+                    "plain", Calc.hex(tracePlainParts.get(bi)), "keystream", Calc.hex(keystream)
+                }, Calc.hex(cipherBlock), "xor");
+                Tracer.trace("feedback", new Object[]{
+                    "nextCounter", Calc.hex(nextCounter)
+                }, Calc.hex(nextCounter), "feedback");
+            }
+        }
         Cipher c = Cipher.getInstance("SM4/CTR/NoPadding", "BC");
         c.init(Cipher.ENCRYPT_MODE, ks, new IvParameterSpec(iv));
         Assert.assertArrayEquals("CTR 与 BC 不一致", c.doFinal(pt), ctrOurs);
         Assert.assertArrayEquals("CTR 的解密就是再加密一次（对称性）", pt, ctr(encKeys, iv, ctrOurs));
 
         byte[] ofbOurs = ofb(encKeys, iv, pt);
+        if (Tracer.isEnabled())
+        {
+            List<byte[]> ofbCipherParts = Calc.chunks(ofbOurs, BS);
+            byte[] ofbState = iv;
+            for (int bi = 0; bi < tracePlainParts.size(); bi++)
+            {
+                byte[] prevState = ofbState;
+                ofbState = sm4Block(encKeys, ofbState);
+                byte[] cipherBlock = ofbCipherParts.get(bi);
+                Tracer.traceLoop("block", new Object[]{
+                    "mode", "OFB", "block", bi, "s_{i-1}", Calc.hex(prevState)
+                }, Calc.hex(cipherBlock), "blockLoop", bi + 1, tracePlainParts.size(), "blockLoop");
+                Tracer.trace("E_K", new Object[]{
+                    "s_{i-1}", Calc.hex(prevState)
+                }, Calc.hex(ofbState), "encBlock");
+                Tracer.trace("xor", new Object[]{
+                    "plain", Calc.hex(tracePlainParts.get(bi)), "keystream", Calc.hex(ofbState)
+                }, Calc.hex(cipherBlock), "xor");
+                Tracer.trace("feedback", new Object[]{
+                    "s_i", Calc.hex(ofbState)
+                }, Calc.hex(ofbState), "feedback");
+            }
+        }
         c = Cipher.getInstance("SM4/OFB/NoPadding", "BC");
         c.init(Cipher.ENCRYPT_MODE, ks, new IvParameterSpec(iv));
         Assert.assertArrayEquals("OFB 与 BC 不一致", c.doFinal(pt), ofbOurs);
         Assert.assertArrayEquals("OFB 解密 == 加密（密钥流与明文无关）", pt, ofb(encKeys, iv, ofbOurs));
 
         byte[] cfbOurs = cfbEncrypt(encKeys, iv, pt);
+        if (Tracer.isEnabled())
+        {
+            List<byte[]> cfbCipherParts = Calc.chunks(cfbOurs, BS);
+            byte[] cfbPrev = iv;
+            for (int bi = 0; bi < tracePlainParts.size(); bi++)
+            {
+                byte[] keystream = sm4Block(encKeys, cfbPrev);
+                byte[] cipherBlock = cfbCipherParts.get(bi);
+                byte[] nextPrev = Arrays.copyOf(cipherBlock, BS);
+                Tracer.traceLoop("block", new Object[]{
+                    "mode", "CFB", "block", bi, "C_{i-1}", Calc.hex(cfbPrev)
+                }, Calc.hex(cipherBlock), "blockLoop", bi + 1, tracePlainParts.size(), "blockLoop");
+                Tracer.trace("E_K", new Object[]{
+                    "C_{i-1}", Calc.hex(cfbPrev)
+                }, Calc.hex(keystream), "encBlock");
+                Tracer.trace("xor", new Object[]{
+                    "plain", Calc.hex(tracePlainParts.get(bi)), "keystream", Calc.hex(keystream)
+                }, Calc.hex(cipherBlock), "xor");
+                Tracer.trace("feedback", new Object[]{
+                    "C_i", Calc.hex(nextPrev)
+                }, Calc.hex(nextPrev), "feedback");
+                cfbPrev = nextPrev;
+            }
+        }
         c = Cipher.getInstance("SM4/CFB/NoPadding", "BC");
         c.init(Cipher.ENCRYPT_MODE, ks, new IvParameterSpec(iv));
         Assert.assertArrayEquals("CFB 与 BC 不一致", c.doFinal(pt), cfbOurs);
@@ -1163,6 +1427,24 @@ public class Sm4EssenceTest
 
         Assert.assertNotEquals("OFB 与 CFB 只差在反馈来源，密文必须不同", Calc.hex(ofbOurs), Calc.hex(cfbOurs));
         log.info("[SM4-模式] CTR={} OFB={} CFB={}", Calc.hex(ctrOurs), Calc.hex(ofbOurs), Calc.hex(cfbOurs));
+        Tracer.trace("final", new Object[]{
+            "ctr", Calc.hex(ctrOurs), "ofb", Calc.hex(ofbOurs), "cfb", Calc.hex(cfbOurs)
+        }, pt.length, "final");
+        Tracer.traceDecision("compare.ctr", new Object[]{
+            "ours", Calc.hex(ctrOurs)
+        }, true, "compare", "CTR 与 BC SM4/CTR/NoPadding 一致");
+        Tracer.traceDecision("compare.ofb", new Object[]{
+            "ours", Calc.hex(ofbOurs)
+        }, true, "compare", "OFB 与 BC SM4/OFB/NoPadding 一致");
+        Tracer.traceDecision("compare.cfb", new Object[]{
+            "ours", Calc.hex(cfbOurs)
+        }, true, "compare", "CFB 与 BC SM4/CFB/NoPadding 一致");
+        Tracer.traceDecision("compare.feedback", new Object[]{
+            "ofb", Calc.hex(ofbOurs), "cfb", Calc.hex(cfbOurs)
+        }, !Calc.hex(ofbOurs).equals(Calc.hex(cfbOurs)), "compare", "仅反馈来源不同 -> 密文不同");
+        Tracer.trace("end", new Object[]{
+            "ctr", Calc.hex(ctrOurs), "ofb", Calc.hex(ofbOurs), "cfb", Calc.hex(cfbOurs), "verified", true
+        }, true, "end");
     }
 
     /** GCM：CTR 之后再接 GHASH，并验证认证性（改一字节必须失败）。
@@ -1188,6 +1470,7 @@ public class Sm4EssenceTest
      *         拿到 H 就能为任意伪造密文造出正确 tag —— GCM 的实战事故绝大多数都是这一条
      * </pre>
      */
+    @TraceExecution(value = "SM4-GCM 认证加密", algorithm = "SM4", flow = "SM4-GCM")
     @Test
     public void gcmIsCtrComposedWithGHashOverGf128()
         throws Exception
@@ -1199,6 +1482,10 @@ public class Sm4EssenceTest
         byte[] pt = "GCM gives confidentiality AND integrity at once".getBytes("UTF-8");
         // GCM 只需要加密方向的轮密钥表：CTR 与 GHASH 都只调 E_K，从不调 D_K
         long[] encKeys = expandKey(key);
+        Tracer.trace("start", new Object[]{
+            "algorithm", "SM4", "mode", "GCM", "nonce", Calc.hex(nonce),
+            "aad", Calc.hex(aad), "plainBytes", pt.length
+        }, null, "start");
 
         // GF(2^128) 的基本代数性质：GHASH 的线性性就建立在这上面
         byte[] unit = new byte[BS];
@@ -1225,7 +1512,30 @@ public class Sm4EssenceTest
         log.info("[SM4-GCM] BC   的 ct‖tag = {}", Calc.hex(ref));
         // GCM 的对外格式就是 ct ‖ tag（‖ 是拼接），密文长度 = 明文长度 + tagBits/8 字节
         Assert.assertArrayEquals("GCM 与 BC 不一致", ref, ours);
+        if (Tracer.isEnabled())
+        {
+            // 按定义重放 CTR / GHASH / tag 半段，事件里都是与 gcmEncrypt 相同的真实中间值
+            byte[] traceH = sm4Block(encKeys, new byte[BS]);
+            byte[] traceJ0 = Calc.concat(nonce, new byte[]{ 0, 0, 0, 1 });
+            byte[] traceCt = ctr(encKeys, inc32(traceJ0), pt);
+            byte[] traceS = gHash(traceH, aad, traceCt);
+            byte[] traceMask = sm4Block(encKeys, traceJ0);
+            byte[] traceTag = Calc.xor(traceS, traceMask);
+            Tracer.trace("ctr", new Object[]{
+                "nonce", Calc.hex(nonce), "J0", Calc.hex(traceJ0), "plainBytes", pt.length
+            }, Calc.hex(traceCt), "ctr");
+            Tracer.trace("ghash", new Object[]{
+                "H", Calc.hex(traceH), "aad", Calc.hex(aad), "ct", Calc.hex(traceCt)
+            }, Calc.hex(traceS), "ghash");
+            Tracer.trace("tag", new Object[]{
+                "S", Calc.hex(traceS), "E_K(J0)", Calc.hex(traceMask), "tagBits", 128
+            }, Calc.hex(Arrays.copyOf(traceTag, 16)), "tag");
+        }
         Assert.assertArrayEquals(pt, gcmDecrypt(encKeys, nonce, aad, 128, ours));
+        Tracer.traceDecision("verify.tag", new Object[]{
+            "ct", Calc.hex(Arrays.copyOf(ours, pt.length)),
+            "tag", Calc.hex(Arrays.copyOfRange(ours, ours.length - 16, ours.length))
+        }, true, "verify", "重算 tag == 收到的 tag");
 
         byte[] tampered = ours.clone();
         // 只翻 ct 的 1 个 bit：因为 tag 是 GHASH(H, AAD, C) ⊕ E_K(J₀)，C 变一点，重算的 tag 就面目全非
@@ -1238,6 +1548,9 @@ public class Sm4EssenceTest
         catch (AssertionError expected)
         {
             log.info("[SM4-GCM] 篡改 1 个 bit -> tag 校验失败（这就是认证性）");
+            Tracer.traceDecision("verify.tamper", new Object[]{
+                "tamperedByte0", tampered[0]
+            }, false, "verify", "篡改 1 bit 后 tag 校验通过");
         }
 
         c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "SM4"), new GCMParameterSpec(128, nonce));
@@ -1250,6 +1563,9 @@ public class Sm4EssenceTest
         catch (javax.crypto.AEADBadTagException ok)
         {
             log.info("[SM4-GCM] BC 抛出 AEADBadTagException，与我们的实现行为一致");
+            Tracer.traceDecision("verify.tamper.bc", new Object[]{
+                "tamperedByte0", tampered[0]
+            }, false, "verify", "BC 接受被篡改的密文");
         }
 
         // AAD 也参与认证：改 AAD 必须导致 tag 不同
@@ -1259,6 +1575,13 @@ public class Sm4EssenceTest
         Assert.assertNotEquals("AAD 不加密但被认证",
             Calc.hex(Arrays.copyOfRange(ours, ours.length - 16, ours.length)),
             Calc.hex(Arrays.copyOfRange(tagWithOtherAad, tagWithOtherAad.length - 16, tagWithOtherAad.length)));
+        Tracer.traceDecision("verify.aad", new Object[]{
+            "tag", Calc.hex(Arrays.copyOfRange(ours, ours.length - 16, ours.length)),
+            "tagWithOtherAad", Calc.hex(Arrays.copyOfRange(tagWithOtherAad, tagWithOtherAad.length - 16, tagWithOtherAad.length))
+        }, true, "verify", "换 AAD 后 tag 不同");
+        Tracer.trace("end", new Object[]{
+            "ct||tag", Calc.hex(ours), "verified", true
+        }, true, "end");
     }
 
     /** 全部填充模式：普通静态方法实现 + BC padding 原语对照 + JCE 端到端对照。
@@ -1282,6 +1605,7 @@ public class Sm4EssenceTest
      *         只能验"BC 能解出我们的密文并还原明文"与"长度字段一致"
      * </pre>
      */
+    @TraceExecution(value = "SM4 七种填充的正交性", algorithm = "SM4", flow = "SM4-PAD")
     @Test
     public void paddingsAreOrthogonalFunctionsIndependentOfMode()
         throws Exception
@@ -1293,6 +1617,10 @@ public class Sm4EssenceTest
         // 加密表 rk₀..rk₃₁ 与解密表 rk₃₁..rk₀：CBC 解密要的是逆序那张
         long[] encKeys = expandKey(key);
         long[] decKeys = keySchedule(key, false);
+        Tracer.trace("start", new Object[]{
+            "algorithm", "SM4", "paddings", "PKCS#7/ISO7816-4/X9.23/ISO10126-2/ZeroByte/TBC/NoPadding",
+            "lengths", "0,1,15,16,17,31", "key", Calc.hex(key)
+        }, null, "start");
 
         // 六个长度各跑一遍全部填充，专门扫边界：0 / 1 / 15 / 16 / 17 / 31
         for (int len : new int[]{ 0, 1, 15, 16, 17, 31 })
@@ -1301,59 +1629,168 @@ public class Sm4EssenceTest
 
             // ---- PKCS#7（JCE 的 PKCS5Padding 是它的别名）
             byte[] p7 = pkcs7Pad(BS, pt);
+            Tracer.trace("pad", new Object[]{
+                "scheme", "PKCS#7", "len", len, "n", BS - len % BS, "plain", Calc.hex(pt)
+            }, Calc.hex(p7), "pad");
             // 长度检查：补完一定是 len + n 个字节，且 n = BS − len % BS（对齐时 n = 16，多补一整块）
             Assert.assertEquals(len + (BS - len % BS), p7.length);
             byte[] ct7 = cbcEncrypt(encKeys, iv, p7);
+            Tracer.trace("encrypt", new Object[]{
+                "scheme", "PKCS#7", "len", len, "padded", Calc.hex(p7)
+            }, Calc.hex(ct7), "encrypt");
             assertMatchesJce("SM4/CBC/PKCS7Padding", ks, iv, pt, ct7);
             assertMatchesJce("SM4/CBC/PKCS5Padding", ks, iv, pt, ct7);
+            byte[] traceDec7 = cbcDecrypt(decKeys, iv, ct7);
+            byte[] traceUnpadded7 = pkcs7Unpad(traceDec7);
+            Tracer.trace("decrypt", new Object[]{
+                "scheme", "PKCS#7", "len", len, "ciphertext", Calc.hex(ct7)
+            }, Calc.hex(traceDec7), "decrypt");
+            Tracer.trace("unpad", new Object[]{
+                "scheme", "PKCS#7", "len", len, "padded", Calc.hex(traceDec7)
+            }, Calc.hex(traceUnpadded7), "unpad");
+            Tracer.traceDecision("compare", new Object[]{
+                "scheme", "PKCS#7", "len", len, "recovered", Calc.hex(traceUnpadded7)
+            }, Arrays.equals(pt, traceUnpadded7), "compare", "去填充后恢复原始明文");
             Assert.assertArrayEquals("PKCS#7 去填充应还原明文", pt,
                 pkcs7Unpad(cbcDecrypt(decKeys, iv, ct7)));
 
             // ---- ISO 7816-4
             byte[] p8 = iso7816d4Pad(BS, pt);
+            Tracer.trace("pad", new Object[]{
+                "scheme", "ISO7816-4", "len", len, "n", BS - len % BS, "plain", Calc.hex(pt)
+            }, Calc.hex(p8), "pad");
             // 这里断言的是"补完一定整块"（|p8| mod 16 = 0），与 PKCS#7 的"len + n"是同一件事的两种写法
             Assert.assertEquals("ISO 7816-4 也必须补到整块", 0, p8.length % BS);
             byte[] ct8 = cbcEncrypt(encKeys, iv, p8);
+            Tracer.trace("encrypt", new Object[]{
+                "scheme", "ISO7816-4", "len", len, "padded", Calc.hex(p8)
+            }, Calc.hex(ct8), "encrypt");
             assertMatchesJce("SM4/CBC/ISO7816-4PADDING", ks, iv, pt, ct8);
+            byte[] traceDec8 = cbcDecrypt(decKeys, iv, ct8);
+            byte[] traceUnpadded8 = iso7816d4Unpad(traceDec8);
+            Tracer.trace("decrypt", new Object[]{
+                "scheme", "ISO7816-4", "len", len, "ciphertext", Calc.hex(ct8)
+            }, Calc.hex(traceDec8), "decrypt");
+            Tracer.trace("unpad", new Object[]{
+                "scheme", "ISO7816-4", "len", len, "padded", Calc.hex(traceDec8)
+            }, Calc.hex(traceUnpadded8), "unpad");
+            Tracer.traceDecision("compare", new Object[]{
+                "scheme", "ISO7816-4", "len", len, "recovered", Calc.hex(traceUnpadded8)
+            }, Arrays.equals(pt, traceUnpadded8), "compare", "去填充后恢复原始明文");
             Assert.assertArrayEquals(pt, iso7816d4Unpad(cbcDecrypt(decKeys, iv, ct8)));
 
             // ---- ANSI X9.23：填充体是随机字节，无法逐字节对照，只做互操作校验
             // （补充：我们手写的 ansiX923Pad 把中间填成 0x00，而 JCE 的 X9.23 实现会向 padding 传
             //   SecureRandom 把中间填成随机数 —— 两种都合规，所以只能验"BC 能解出我们的密文"）
             byte[] p9 = ansiX923Pad(BS, pt);
+            Tracer.trace("pad", new Object[]{
+                "scheme", "ANSI X9.23", "len", len, "n", BS - len % BS, "plain", Calc.hex(pt)
+            }, Calc.hex(p9), "pad");
             byte[] ct9 = cbcEncrypt(encKeys, iv, p9);
+            Tracer.trace("encrypt", new Object[]{
+                "scheme", "ANSI X9.23", "len", len, "padded", Calc.hex(p9)
+            }, Calc.hex(ct9), "encrypt");
             assertJceDecrypts("SM4/CBC/X9.23PADDING", ks, iv, ct9, pt);
+            byte[] traceDec9 = cbcDecrypt(decKeys, iv, ct9);
+            byte[] traceUnpadded9 = ansiX923Unpad(traceDec9);
+            Tracer.trace("decrypt", new Object[]{
+                "scheme", "ANSI X9.23", "len", len, "ciphertext", Calc.hex(ct9)
+            }, Calc.hex(traceDec9), "decrypt");
+            Tracer.trace("unpad", new Object[]{
+                "scheme", "ANSI X9.23", "len", len, "padded", Calc.hex(traceDec9)
+            }, Calc.hex(traceUnpadded9), "unpad");
+            Tracer.traceDecision("compare", new Object[]{
+                "scheme", "ANSI X9.23", "len", len, "recovered", Calc.hex(traceUnpadded9)
+            }, Arrays.equals(pt, traceUnpadded9), "compare", "去填充后恢复原始明文");
             Assert.assertArrayEquals(pt, ansiX923Unpad(cbcDecrypt(decKeys, iv, ct9)));
 
             // ---- ZeroByte：有损填充（尾部真实 0 会被当作填充）
             byte[] p0 = zeroBytePad(BS, pt);
+            Tracer.trace("pad", new Object[]{
+                "scheme", "ZeroByte", "len", len, "n", BS - len % BS, "plain", Calc.hex(pt)
+            }, Calc.hex(p0), "pad");
             byte[] ct0 = cbcEncrypt(encKeys, iv, p0);
+            Tracer.trace("encrypt", new Object[]{
+                "scheme", "ZeroByte", "len", len, "padded", Calc.hex(p0)
+            }, Calc.hex(ct0), "encrypt");
             assertMatchesJce("SM4/CBC/ZeroBytePadding", ks, iv, pt, ct0);
             // lossless 记录"这次是否恰好无损"：pt 全填 'x'（非 0），所以这些长度上恰好都可逆；
             // 换成尾部带 0x00 的明文就会丢字节 —— 因此只打印、不断言（断言会把有损性误当成性质）
             boolean lossless = Arrays.equals(pt, zeroByteUnpad(cbcDecrypt(decKeys, iv, ct0)));
+            byte[] traceDec0 = cbcDecrypt(decKeys, iv, ct0);
+            byte[] traceUnpadded0 = zeroByteUnpad(traceDec0);
+            Tracer.trace("decrypt", new Object[]{
+                "scheme", "ZeroByte", "len", len, "ciphertext", Calc.hex(ct0)
+            }, Calc.hex(traceDec0), "decrypt");
+            Tracer.trace("unpad", new Object[]{
+                "scheme", "ZeroByte", "len", len, "padded", Calc.hex(traceDec0)
+            }, Calc.hex(traceUnpadded0), "unpad");
+            Tracer.traceDecision("compare", new Object[]{
+                "scheme", "ZeroByte", "len", len, "lossless", lossless
+            }, lossless, "compare", "ZeroByte 去填充后恢复原始明文（可能是有损的）");
             log.info("[SM4-填充] len={} ZeroByte 可逆性={}", len, lossless);
 
             // ---- ISO 10126-2：随机填充，只能验证结构与去填充结果
             byte[] pi = iso10126d2Pad(BS, pt);
+            Tracer.trace("pad", new Object[]{
+                "scheme", "ISO 10126-2", "len", len, "n", BS - len % BS, "plain", Calc.hex(pt)
+            }, Calc.hex(pi), "pad");
             // 长度自洽：末字节的值就是补的字节数 n，所以 |pi| 必等于 |pt| + n（这一条与随机体无关，可以断言）
             Assert.assertEquals(pt.length + (pi[pi.length - 1] & 0xff), pi.length);
+            byte[] traceUnpaddedI = iso10126d2Unpad(pi);
+            Tracer.trace("unpad", new Object[]{
+                "scheme", "ISO 10126-2", "len", len, "padded", Calc.hex(pi)
+            }, Calc.hex(traceUnpaddedI), "unpad");
+            Tracer.traceDecision("compare", new Object[]{
+                "scheme", "ISO 10126-2", "len", len, "recovered", Calc.hex(traceUnpaddedI)
+            }, Arrays.equals(pt, traceUnpaddedI), "compare", "去填充后恢复原始明文");
             Assert.assertArrayEquals("ISO 10126-2 去填充", pt, iso10126d2Unpad(pi));
 
             // ---- NoPadding：只是一个对齐判断
+            boolean aligned = isBlockAligned(BS, pt);
+            Tracer.trace("pad.align", new Object[]{
+                "scheme", "NoPadding", "len", len
+            }, aligned, "pad");
             // 期望值 "len mod 16 == 0" 与 isBlockAligned 的返回值必须一致（16 与 0 是对齐的两个长度）
             Assert.assertEquals(len % BS == 0, isBlockAligned(BS, pt));
+            Tracer.traceDecision("compare.align", new Object[]{
+                "scheme", "NoPadding", "len", len, "expected", len % BS == 0
+            }, len % BS == 0, "compare", "对齐判断与 len mod 16 一致");
         }
 
         // 与 BC 的填充原语逐字节对照（addPadding 从 offset 开始写，返回写入的填充字节数）
         // 这里统一用 3 字节的明文 {1,2,3}：n = 16 − 3 = 13，能一眼看出各族的"尾部结构"差别
         assertBcPaddingAgree(new PKCS7Padding(), pkcs7Pad(BS, new byte[]{ 1, 2, 3 }), 3);
+        Tracer.traceDecision("compare.bc", new Object[]{
+            "scheme", "PKCS#7", "data", "010203"
+        }, true, "compare", "与 BC PKCS7Padding 原语逐字节一致");
         assertBcPaddingAgree(new ISO7816d4Padding(), iso7816d4Pad(BS, new byte[]{ 1, 2, 3 }), 3);
+        Tracer.traceDecision("compare.bc", new Object[]{
+            "scheme", "ISO7816-4", "data", "010203"
+        }, true, "compare", "与 BC ISO7816d4Padding 原语逐字节一致");
         assertBcPaddingAgree(new X923Padding(), ansiX923Pad(BS, new byte[]{ 1, 2, 3 }), 3);
+        Tracer.traceDecision("compare.bc", new Object[]{
+            "scheme", "ANSI X9.23", "data", "010203"
+        }, true, "compare", "与 BC X923Padding 原语逐字节一致");
         assertBcPaddingAgree(new ZeroBytePadding(), zeroBytePad(BS, new byte[]{ 1, 2, 3 }), 3);
+        Tracer.traceDecision("compare.bc", new Object[]{
+            "scheme", "ZeroByte", "data", "010203"
+        }, true, "compare", "与 BC ZeroBytePadding 原语逐字节一致");
         assertBcPaddingAgree(new ISO10126d2Padding(), iso10126d2Pad(BS, new byte[]{ 1, 2, 3 }), 3);
+        Tracer.traceDecision("compare.bc", new Object[]{
+            "scheme", "ISO 10126-2", "data", "010203"
+        }, true, "compare", "与 BC ISO10126d2Padding 的尾字节与长度字段一致");
+        Tracer.trace("pad", new Object[]{
+            "scheme", "TBC", "data", "010203", "lastByte", 3
+        }, Calc.hex(tbcPad(BS, new byte[]{ 1, 2, 3 })), "pad");
         assertBcPaddingAgree(new TBCPadding(), tbcPad(BS, new byte[]{ 1, 2, 3 }), 3);
+        Tracer.traceDecision("compare.bc", new Object[]{
+            "scheme", "TBC", "data", "010203"
+        }, true, "compare", "与 BC TBCPadding 原语逐字节一致");
         log.info("[SM4-填充] 7 种填充全部与 BC 一致：PKCS#7/PKCS#5、ISO 7816-4、X9.23、ISO 10126-2、ZeroByte、TBC、NoPadding");
+        Tracer.trace("end", new Object[]{
+            "schemes", 7, "lengths", 6, "verified", true
+        }, true, "end");
     }
 
     // ---------------------------------------------------------------- 裁判辅助

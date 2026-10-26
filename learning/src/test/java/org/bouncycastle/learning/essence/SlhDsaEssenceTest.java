@@ -13,8 +13,12 @@ import org.bouncycastle.crypto.generators.SLHDSAKeyPairGenerator;
 import org.bouncycastle.crypto.params.SLHDSAPrivateKeyParameters;
 import org.bouncycastle.crypto.params.SLHDSAPublicKeyParameters;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -83,6 +87,9 @@ import org.junit.Test;
 @Slf4j
 public class SlhDsaEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(SlhDsaEssenceTest.class);
 
     @BeforeClass
@@ -107,6 +114,7 @@ public class SlhDsaEssenceTest
      *
      * <p>本测试演示 WOTS+ 的链结构与校验和计算。
      */
+    @TraceExecution(value = "SLH-DSA WOTS+ 哈希链与校验和", algorithm = "PQC", flow = "PQC-SLHDSA")
     @Test
     public void wotsPlusChainStructureAndChecksum()
     {
@@ -115,6 +123,10 @@ public class SlhDsaEssenceTest
         int len1 = (8 * n + (int) Math.ceil(Math.log(w) / Math.log(2)) - 1) / (int) Math.ceil(Math.log(w) / Math.log(2));
         int len2 = (int) Math.floor(Math.log(len1 * (w - 1)) / Math.log(w)) + 1;
         int len = len1 + len2;
+
+        Tracer.trace("start", new Object[]{
+            "n", n, "w", w, "len1", len1, "len2", len2, "len", len
+        }, "WOTS+ 链结构", "start");
 
         log.info("[WOTS+] n={}, w={}, len1={}, len2={}, len={}", n, w, len1, len2, len);
         Assert.assertEquals("len1 = 32", 32, len1);
@@ -129,6 +141,10 @@ public class SlhDsaEssenceTest
         }
         int[] msgCoeffs = baseW(M, w, len1);
         log.info("[WOTS+] 消息系数（前 8 个）= {}", Arrays.toString(Arrays.copyOf(msgCoeffs, 8)));
+        Tracer.trace("baseW", new Object[]{
+            "n", n, "w", w, "len1", len1,
+            "msgCoeffs[0..7]", Arrays.toString(Arrays.copyOf(msgCoeffs, 8))
+        }, msgCoeffs.length, "wots");
 
         // 校验和：csum = Σ (w − 1 − msgCoeffs[i])
         int csum = 0;
@@ -142,6 +158,9 @@ public class SlhDsaEssenceTest
         byte[] csumBytes = intToBytes(csum, len2);
         int[] csumCoeffs = baseW(csumBytes, w, len2);
         log.info("[WOTS+] 校验和系数 = {}", Arrays.toString(csumCoeffs));
+        Tracer.trace("checksum", new Object[]{
+            "csum", csum, "csumBits", csumBits, "len2", len2
+        }, Arrays.toString(csumCoeffs), "wots");
 
         // 完整的 len 个系数
         int[] allCoeffs = new int[len];
@@ -157,9 +176,18 @@ public class SlhDsaEssenceTest
             sum += allCoeffs[i];
         }
         int maxSum = len1 * (w - 1);
+        Tracer.trace("concatCoeffs", new Object[]{
+            "len1", len1, "len2", len2, "len", len
+        }, "coeffSum=" + sum, "wots");
+        Tracer.traceDecision("checkInvariant", new Object[]{
+            "sum", sum, "maxSum", maxSum
+        }, sum <= maxSum, "security", "Σ allCoeffs ≤ len1·(w−1)");
         Assert.assertTrue("WOTS+ 不变量：系数和 ≤ len1·(w−1) = " + maxSum + "，实际 = " + sum,
             sum <= maxSum);
         log.info("[WOTS+] 系数和 = {} ≤ len1·(w−1) = {} ✓", sum, maxSum);
+        Tracer.trace("end", new Object[]{
+            "len", len, "sum", sum, "maxSum", maxSum
+        }, "WOTS+ chain invariant verified", "end");
     }
 
     /**
@@ -211,6 +239,7 @@ public class SlhDsaEssenceTest
      *
      * <p>本测试演示 FORS 的树结构与认证路径长度。
      */
+    @TraceExecution(value = "SLH-DSA FORS 树与认证路径", algorithm = "PQC", flow = "PQC-SLHDSA")
     @Test
     public void forsTreeStructureAndAuthPath()
     {
@@ -218,6 +247,10 @@ public class SlhDsaEssenceTest
         int k = 64; // 子树个数
         int a = 12; // 每棵树的高度
         int leavesPerTree = 1 << a; // 4096
+
+        Tracer.trace("start", new Object[]{
+            "n", n, "k", k, "a", a, "leavesPerTree", leavesPerTree
+        }, "FORS 树结构", "start");
 
         log.info("[FORS] n={}, k={}, a={}, 每棵树 {} 个叶子", n, k, a, leavesPerTree);
         Assert.assertEquals("每棵树 4096 个叶子", 4096, leavesPerTree);
@@ -249,17 +282,27 @@ public class SlhDsaEssenceTest
             bitPos += bitsPerSegment;
         }
         log.info("[FORS] 消息段（前 8 个）= {}", Arrays.toString(Arrays.copyOf(segments, 8)));
+        Tracer.trace("deriveSegments", new Object[]{
+            "MD", Arrays.toString(MD), "bitsPerSegment", bitsPerSegment, "k", k
+        }, Arrays.toString(Arrays.copyOf(segments, 8)), "fors");
 
         // 每个段选一个叶子，签名 = k 个认证路径
         int authPathLenPerTree = a; // 每棵树 a 个节点
         int totalAuthPathLen = k * authPathLenPerTree; // k·a 个节点
         log.info("[FORS] 认证路径总长度 = {} × {} = {} 个节点", k, authPathLenPerTree, totalAuthPathLen);
+        Tracer.trace("authPath", new Object[]{
+            "k", k, "pathPerTree", authPathLenPerTree
+        }, totalAuthPathLen, "fors");
         Assert.assertEquals("认证路径总长度 = 768", 768, totalAuthPathLen);
 
         // FORS 公钥 = k 棵子树的根哈希（每个 n 字节）
         int forsPkLen = k * n;
         log.info("[FORS] 公钥长度 = {} × {} = {} 字节", k, n, forsPkLen);
+        Tracer.trace("publicKey", new Object[]{"k", k, "n", n}, forsPkLen, "fors");
         Assert.assertEquals("FORS 公钥 1024 字节", 1024, forsPkLen);
+        Tracer.trace("end", new Object[]{
+            "authPathLen", totalAuthPathLen, "forsPkLen", forsPkLen
+        }, "FORS structure verified", "end");
     }
 
     // =====================================================================
@@ -274,12 +317,17 @@ public class SlhDsaEssenceTest
      *
      * <p>本测试演示 XMSS 的树结构与签名长度。
      */
+    @TraceExecution(value = "SLH-DSA XMSS 树与签名长度", algorithm = "PQC", flow = "PQC-SLHDSA")
     @Test
     public void xmssTreeStructureAndSignatureLength()
     {
         int n = 16; // 安全参数
         int h = 63; // 树高（FIPS 205 表 2：SLH-DSA-128s 用 h=63）
         long leaves = 1L << h; // 2^63
+
+        Tracer.trace("start", new Object[]{
+            "n", n, "h", h, "leaves", "2^" + h
+        }, "XMSS 树结构", "start");
 
         log.info("[XMSS] n={}, h={}, 叶子数 = 2^{}", n, h, h);
         Assert.assertEquals("树高 63（FIPS 205 表 2）", 63, h);
@@ -290,6 +338,16 @@ public class SlhDsaEssenceTest
         int indexLen = 4; // 索引 4 字节
         int xmssSigLen = wotsSigLen + authPathLen + indexLen;
 
+        Tracer.trace("wotsSignature", new Object[]{
+            "chains", 35, "n", n
+        }, wotsSigLen, "xmss");
+        Tracer.trace("authPath", new Object[]{
+            "h", h, "n", n
+        }, authPathLen, "xmss");
+        Tracer.trace("signatureLength", new Object[]{
+            "wotsSigLen", wotsSigLen, "authPathLen", authPathLen, "indexLen", indexLen
+        }, xmssSigLen, "xmss");
+
         log.info("[XMSS] 签名长度 = {} (WOTS+) + {} (认证路径) + {} (索引) = {} 字节",
             wotsSigLen, authPathLen, indexLen, xmssSigLen);
         Assert.assertEquals("XMSS 签名 1572 字节", 1572, xmssSigLen);
@@ -297,7 +355,13 @@ public class SlhDsaEssenceTest
         // XMSS 公钥 = 树根（n 字节） + PK.seed（n 字节）
         int xmssPkLen = 2 * n;
         log.info("[XMSS] 公钥长度 = {} 字节", xmssPkLen);
+        Tracer.trace("publicKeyLength", new Object[]{
+            "root", n, "PK.seed", n
+        }, xmssPkLen, "xmss");
         Assert.assertEquals("XMSS 公钥 32 字节", 32, xmssPkLen);
+        Tracer.trace("end", new Object[]{
+            "xmssSigLen", xmssSigLen, "xmssPkLen", xmssPkLen
+        }, "XMSS structure verified", "end");
     }
 
     // =====================================================================
@@ -312,12 +376,17 @@ public class SlhDsaEssenceTest
      *
      * <p>本测试演示 Hypertree 的层结构与签名长度。
      */
+    @TraceExecution(value = "SLH-DSA Hypertree 层结构与签名长度", algorithm = "PQC", flow = "PQC-SLHDSA")
     @Test
     public void hypertreeLayerStructureAndSignatureLength()
     {
         int n = 16; // 安全参数
         int H = 9; // Hypertree 层数（教学示例，实际 SLH-DSA-128s 用 d=7）
         int h = 63; // 每层 XMSS 树高（FIPS 205 表 2）
+
+        Tracer.trace("start", new Object[]{
+            "n", n, "H", H, "h", h
+        }, "Hypertree 分层", "start");
 
         log.info("[Hypertree] n={}, H={}, h={}", n, H, h);
         Assert.assertEquals("Hypertree 层数 9（教学示例）", 9, H);
@@ -327,6 +396,9 @@ public class SlhDsaEssenceTest
         int hypertreeSigLen = H * xmssSigLen;
 
         log.info("[Hypertree] 签名长度 = {} × {} = {} 字节", H, xmssSigLen, hypertreeSigLen);
+        Tracer.trace("xmssSignatures", new Object[]{
+            "H", H, "xmssSigLen", xmssSigLen
+        }, hypertreeSigLen, "hypertree");
         Assert.assertEquals("Hypertree 签名 14148 字节", 14148, hypertreeSigLen);
 
         // 加上 FORS 签名（k·a·n 字节）
@@ -337,12 +409,21 @@ public class SlhDsaEssenceTest
 
         log.info("[Hypertree] 总签名长度 = {} (Hypertree) + {} (FORS) = {} 字节",
             hypertreeSigLen, forsSigLen, totalSigLen);
+        Tracer.trace("forsSignature", new Object[]{
+            "k", k, "a", a, "n", n
+        }, forsSigLen, "hypertree");
+        Tracer.trace("totalSignature", new Object[]{
+            "hypertreeSigLen", hypertreeSigLen, "forsSigLen", forsSigLen
+        }, totalSigLen, "hypertree");
         Assert.assertEquals("教学示例签名 26436 字节", 26436, totalSigLen);
 
         // 实际 SLH-DSA-SHAKE-128s 签名长度是 7856 字节（FIPS 205 表 1）
         // 实际参数：d=7, h=63, k=64, a=12, n=16
         // 实际结构更复杂：FORS 签名包含认证路径，Hypertree 每层还有额外的认证路径
         log.info("[Hypertree] 注意：实际 SLH-DSA-128s 签名 7856 字节（FIPS 205），这里是教学简化");
+        Tracer.trace("end", new Object[]{
+            "H", H, "hypertreeSigLen", hypertreeSigLen, "totalSigLen", totalSigLen
+        }, "Hypertree layers verified", "end");
     }
 
     // =====================================================================
@@ -361,9 +442,14 @@ public class SlhDsaEssenceTest
      *
      * <p>本测试对比 SLH-DSA 与格密码的量子安全性。
      */
+    @TraceExecution(value = "SLH-DSA 为什么抗量子", algorithm = "PQC", flow = "PQC-SLHDSA")
     @Test
     public void whySlhDsaResistsQuantumComputers()
     {
+        Tracer.trace("start", new Object[]{
+            "topic", "SLH-DSA vs ML-DSA vs RSA"
+        }, "量子安全性对比", "start");
+
         // 对比：SLH-DSA（哈希）vs ML-DSA（格）
         log.info("[量子对比] SLH-DSA：只用哈希原语，量子下 Grover 二次加速");
         log.info("[量子对比] ML-DSA：用格难题，量子下没有已知加速（Grover 二次）");
@@ -376,12 +462,27 @@ public class SlhDsaEssenceTest
         log.info("[SLH-DSA] SHAKE256 输出 {} bit，经典安全 {} bit，量子安全 {} bit",
             shake256OutputBits, slhDsaClassicalSecurity, slhDsaQuantumSecurity);
 
+        Tracer.trace("classicalCollision", new Object[]{
+            "outputBits", shake256OutputBits
+        }, slhDsaClassicalSecurity, "security");
+        Tracer.trace("quantumBhtCollision", new Object[]{
+            "outputBits", shake256OutputBits
+        }, slhDsaQuantumSecurity, "security");
+
         // ML-DSA 的安全性
         int mlDsaDimension = 256; // 格维数
         int mlDsaClassicalSecurity = mlDsaDimension / 2; // BKZ 2^{128}
         int mlDsaQuantumSecurity = mlDsaDimension / 2; // 量子无加速
         log.info("[ML-DSA] 格维数 {}，经典安全 {} bit，量子安全 {} bit",
             mlDsaDimension, mlDsaClassicalSecurity, mlDsaQuantumSecurity);
+
+        Tracer.trace("latticeSecurity", new Object[]{
+            "dimension", mlDsaDimension, "classical", mlDsaClassicalSecurity
+        }, mlDsaQuantumSecurity, "security");
+        Tracer.traceDecision("checkQuantum128", new Object[]{
+            "slhDsa", slhDsaQuantumSecurity, "mlDsa", mlDsaQuantumSecurity
+        }, slhDsaQuantumSecurity >= 128 && mlDsaQuantumSecurity >= 128,
+            "security", "SLH-DSA 与 ML-DSA 量子安全均 ≥ 128 bit");
 
         // RSA 的安全性（对比）
         int rsaBits = 2048;
@@ -390,12 +491,23 @@ public class SlhDsaEssenceTest
         log.info("[RSA] {} bit，经典安全 {} bit，量子安全 {} bit（Shor 崩溃）",
             rsaBits, rsaClassicalSecurity, rsaQuantumSecurity);
 
+        Tracer.trace("rsaComparison", new Object[]{
+            "rsaBits", rsaBits, "classical", rsaClassicalSecurity
+        }, rsaQuantumSecurity, "compare");
+        Tracer.traceDecision("rsaCollapse", new Object[]{
+            "rsaQuantumSecurity", rsaQuantumSecurity
+        }, rsaQuantumSecurity == 0, "compare", "RSA 量子安全 = 0（Shor 崩溃）");
+
         // 结论
         Assert.assertTrue("SLH-DSA 量子下仍 128-bit", slhDsaQuantumSecurity >= 128);
         Assert.assertTrue("ML-DSA 量子下仍 128-bit", mlDsaQuantumSecurity >= 128);
         Assert.assertEquals("RSA 量子下崩溃", 0, rsaQuantumSecurity);
 
         log.info("[总结] SLH-DSA 与 ML-DSA 都抗量子，但 SLH-DSA 更保守（只用哈希）");
+        Tracer.trace("end", new Object[]{
+            "slhDsaQuantum", slhDsaQuantumSecurity, "mlDsaQuantum", mlDsaQuantumSecurity,
+            "rsaQuantum", rsaQuantumSecurity
+        }, "SLH-DSA/ML-DSA resist, RSA broken", "end");
     }
 
     // =====================================================================
@@ -405,6 +517,7 @@ public class SlhDsaEssenceTest
     /**
      * <b>与 BC 的 SLH-DSA 实现对比</b>：验证我们的教学简化与标准参数一致。
      */
+    @TraceExecution(value = "SLH-DSA 与 BC 实现参数对比", algorithm = "PQC", flow = "PQC-SLHDSA")
     @Test
     public void compareWithBcSlhDsaImplementation()
     {
@@ -417,19 +530,29 @@ public class SlhDsaEssenceTest
         int a = 12;
         int w = 16;
 
+        Tracer.trace("start", new Object[]{
+            "scheme", "SLH-DSA-SHAKE-128s", "n", n, "H", H, "h", h, "d", d,
+            "k", k, "a", a, "w", w
+        }, "FIPS 205 参数比对", "start");
+
         log.info("[SLH-DSA-128s] n={}, H={}, h={}, d={}, k={}, a={}, w={}", n, H, h, d, k, a, w);
 
         // 签名长度（FIPS 205 表 1）
         int sigLen = 7856; // 标准值
         log.info("[SLH-DSA-128s] 签名长度 = {} 字节（FIPS 205）", sigLen);
+        Tracer.trace("signatureLength", new Object[]{
+            "n", n, "d", d, "k", k, "a", a
+        }, sigLen, "compare");
 
         // 公钥长度
         int pkLen = 32; // PK.seed + root
         log.info("[SLH-DSA-128s] 公钥长度 = {} 字节", pkLen);
+        Tracer.trace("publicKeyLength", new Object[]{"n", n}, pkLen, "compare");
 
         // 私钥长度
         int skLen = 64; // SK.seed + PK.seed + root + index
         log.info("[SLH-DSA-128s] 私钥长度 = {} 字节", skLen);
+        Tracer.trace("privateKeyLength", new Object[]{"n", n}, skLen, "compare");
 
         // 验证参数一致性
         Assert.assertEquals("n = 16", 16, n);
@@ -439,6 +562,14 @@ public class SlhDsaEssenceTest
         Assert.assertEquals("a = 12", 12, a);
         Assert.assertEquals("w = 16", 16, w);
 
+        Tracer.traceDecision("paramsMatchFips205", new Object[]{
+            "n", n, "H", H, "h", h, "k", k, "a", a, "w", w
+        }, n == 16 && H == 9 && h == 64 && k == 64 && a == 12 && w == 16,
+            "compare", "参数与 FIPS 205 表 1 一致");
+
         log.info("[总结] SLH-DSA 参数与 FIPS 205 一致");
+        Tracer.trace("end", new Object[]{
+            "sigLen", sigLen, "pkLen", pkLen, "skLen", skLen
+        }, "SLH-DSA parameters match FIPS 205", "end");
     }
 }

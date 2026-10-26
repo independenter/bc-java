@@ -11,7 +11,11 @@ import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1Sequence;
 import org.bouncycastle.asn1.DERBitString;
 import org.bouncycastle.asn1.DERSequence;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -113,6 +117,9 @@ import org.junit.Test;
 @Slf4j
 public class Sm9KeyEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     // 三个输入常量都是纯 ASCII，".getBytes()" 在任何平台默认字符集下都得到同样的字节：
     // ID_ALICE = 41 6C 69 63 65（5 字节），ID_BOB = 42 6F 62（3 字节），
     // MESSAGE = "Chinese IBS standard"（20 字节，标准样例的原文）。
@@ -172,9 +179,14 @@ public class Sm9KeyEssenceTest
      * 采出 0 的概率是 2⁻²⁵⁶，所以 "主私钥必须 &gt;= 1" 这条断言事实上永远碰不到，但它把
      * 标准写下的值域钉在了测试里。
      */
+    @TraceExecution(value = "主私钥值域随机采样", algorithm = "SM9", flow = "SM9-KEY")
     @Test
     public void generatedMasterKeysAlwaysLandInTheRangeOneToNMinusOne()
     {
+        Tracer.trace("start", new Object[]{"samples", 200, "seed", 20261022L}, null, "start");
+        Tracer.trace("setup", new Object[]{"n", Sm9Math.N, "n_bits", Sm9Math.N.bitLength()},
+            "主私钥值域 [1, n-1]", "setup");
+
         Random rnd = new Random(20261022L);
         int resampled = 0;
         for (int i = 0; i < 200; i++)
@@ -186,9 +198,19 @@ public class Sm9KeyEssenceTest
             {
                 resampled++;   // 高位被丢掉的那些，正是"定长 32 字节"与 DER 最短编码会打架的地方
             }
+            // 200 次采样只抽 6 条（0/40/80/120/160/199），足以展示值域与"有长有短"的分布
+            if (i % 40 == 0 || i == 199)
+            {
+                Tracer.traceLoop("randScalar", new Object[]{"i", i, "seed", 20261022L}, v, "keygen",
+                    i + 1, 200);
+            }
         }
         Assert.assertTrue("采出来的数应当有长有短，否则这个统计没意义", resampled > 0);
+        Tracer.traceDecision("rangeCheck", new Object[]{"samples", 200, "resampled", resampled},
+            resampled > 0, "compare", "200 个样本全部落在 [1, n-1]，且存在不足 256 bit 的值");
         log.info("200 个主私钥里 {} 个不足 256 bit", resampled);
+        Tracer.trace("end", new Object[]{"samples", 200, "resampled", resampled},
+            "range check passed", "end");
     }
 
     /**
@@ -204,10 +226,16 @@ public class Sm9KeyEssenceTest
      * 它的阶就只能等于 n。于是 n·P = O 同时验证了三件事：曲线实现没错、点真的落在那个 n 阶子群里、
      * 标量乘（twistMul / pointMul）没有把倍点公式写错。少一个常数、少一步进位，这个等式就不成立。
      */
+    @TraceExecution(value = "主公钥曲线与标准样例核对", algorithm = "SM9", flow = "SM9-KEY")
     @Test
     public void masterPublicKeysLieOnTheRightCurves()
     {
+        Tracer.trace("start", new Object[]{"ks_bits", HEX_KS.bitLength(), "kex_bits", HEX_KEX.bitLength()},
+            null, "start");
+        Tracer.trace("setup", new Object[]{"ks", HEX_KS, "kex", HEX_KEX}, "SM9 主密钥对", "setup");
+
         BigInteger[][] ppubs = Sm9Math.signMasterPublicKey(HEX_KS);
+        Tracer.trace("signMasterPublicKey", new Object[]{"ks", HEX_KS}, ppubs, "keygen");
         // 射影坐标下的曲线方程是 Y²Z = X³ + 5u·Z³（把仿射式 X = x/Z²、Y = y/Z³ 通分得到的），
         // 好处是加法全程不用求逆，Z 只在最后序列化时除掉
         Assert.assertTrue("Ppubs 必须在扭曲曲线上", Sm9Math.twistIsOnCurve(ppubs));
@@ -217,6 +245,7 @@ public class Sm9KeyEssenceTest
         Assert.assertEquals(129, Sm9Math.twistToOctets(ppubs).length);
 
         BigInteger[] ppube = Sm9Math.encMasterPublicKey(HEX_KEX);
+        Tracer.trace("encMasterPublicKey", new Object[]{"kex", HEX_KEX}, ppube, "keygen");
         // 仿射判定 y² = x³ + 5（G₁ 的 a = 0，所以式子里没有 x 项）
         Assert.assertTrue("Ppube 必须在 E(Fp) 上", Sm9Math.pointIsOnCurve(ppube));
         // 65 = 1 字节 0x04 + x(32) + y(32)
@@ -231,7 +260,22 @@ public class Sm9KeyEssenceTest
         // 换句话说，标量乘在 Z_n × ⟨P1⟩ 上是单射 —— 这也是"主公钥能公开"的根本原因。
         Assert.assertFalse(Arrays.equals(Sm9Math.pointToOctets(Sm9Math.encMasterPublicKey(HEX_KE)),
             Sm9Math.pointToOctets(ppube)));
+        Tracer.traceDecision("onCurveAndOrder", new Object[]{
+            "ppubs_on_curve", Sm9Math.twistIsOnCurve(ppubs),
+            "n_ppubs_infinity", Sm9Math.twistIsInfinity(Sm9Math.twistMul(Sm9Math.N, ppubs)),
+            "ppube_on_curve", Sm9Math.pointIsOnCurve(ppube)},
+            Sm9Math.twistIsOnCurve(ppubs) && Sm9Math.pointIsOnCurve(ppube), "compare",
+            "Ppubs ∈ G₂、Ppube ∈ G₁ 且阶均为 n");
+        Tracer.traceDecision("ppubeMatchesGmssl", new Object[]{"expected", "04" + HEX_PUBE,
+            "actual", Calc.hex(Sm9Math.pointToOctets(ppube)).toUpperCase()},
+            ("04" + HEX_PUBE).equals(Calc.hex(Sm9Math.pointToOctets(ppube)).toUpperCase()), "compare",
+            "Ppube == GmSSL hex_Ppube");
+        Tracer.traceDecision("masterKeysDistinct", new Object[]{"ke", HEX_KE, "kex", HEX_KEX},
+            !Arrays.equals(Sm9Math.pointToOctets(Sm9Math.encMasterPublicKey(HEX_KE)),
+                Sm9Math.pointToOctets(ppube)), "compare", "ke·P1 != kex·P1");
         log.info("Ppube = {}", Calc.hex(Sm9Math.pointToOctets(ppube)));
+        Tracer.trace("end", new Object[]{"ppubs", Sm9Math.twistToOctets(ppubs),
+            "ppube", Sm9Math.pointToOctets(ppube)}, "master public keys verified", "end");
     }
 
     /**
@@ -251,10 +295,13 @@ public class Sm9KeyEssenceTest
      * 结论：字节长度不可靠，<b>值</b>才可靠 —— 所以这里比的是 ksBack 与 HEX_KS 相等，
      * 再用 Calc.toBytes(ksBack, 32) 把形状补回定长。
      */
+    @TraceExecution(value = "主密钥 DER 前导零往返", algorithm = "SM9", flow = "SM9-KEY")
     @Test
     public void masterKeyDerRoundTripsEvenWithALeadingZeroByte()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"ks", HEX_KS, "kex", HEX_KEX}, null, "start");
+
         // hex_ks/hex_ke/hex_kex 首字节都是 0x00：DER 会把这个前导零省掉，编码只有 31 字节
         byte[] ksBytes = Calc.toBytes(HEX_KS, 32);
         Assert.assertEquals(0x00, ksBytes[0] & 0xff);
@@ -264,11 +311,14 @@ public class Sm9KeyEssenceTest
         vector.add(new ASN1Integer(HEX_KS));
         vector.add(new DERBitString(Sm9Math.twistToOctets(ppubs)));
         byte[] der = new DERSequence(vector).getEncoded();
+        Tracer.trace("derEncodeSignMasterKey", new Object[]{"ks", HEX_KS, "ksBytesLen", ksBytes.length,
+            "ppubsLen", Sm9Math.twistToOctets(ppubs).length}, der, "marshal");
 
         ASN1Sequence parsed = ASN1Sequence.getInstance(der);
         // SEQUENCE 的两个成员顺序不能换：0 = INTEGER(主私钥标量)，1 = BIT STRING(主公钥点)
         Assert.assertEquals(2, parsed.size());
         BigInteger ksBack = ASN1Integer.getInstance(parsed.getObjectAt(0)).getValue();
+        Tracer.trace("derDecodeSignMasterKey", new Object[]{"derLen", der.length}, ksBack, "unmarshal");
         Assert.assertEquals("INTEGER 值必须原样回到 ks", HEX_KS, ksBack);
         Assert.assertEquals(32, Calc.toBytes(ksBack, 32).length);
         Assert.assertArrayEquals(ksBytes, Calc.toBytes(ksBack, 32));
@@ -282,15 +332,36 @@ public class Sm9KeyEssenceTest
         Assert.assertEquals(129, ppubsBack.length);
         Assert.assertEquals(0x04, ppubsBack[0] & 0xff);
         Assert.assertArrayEquals(Sm9Math.twistToOctets(ppubs), ppubsBack);
+        Tracer.traceDecision("ksRoundTrip", new Object[]{"expected", HEX_KS, "actual", ksBack},
+            HEX_KS.equals(ksBack), "compare", "DER INTEGER 解出的 ks == HEX_KS");
+        Tracer.traceDecision("derLength", new Object[]{"encodedLen", ksField.getEncoded().length,
+            "expected", 2 + 31}, ksField.getEncoded().length == 2 + 31, "compare",
+            "31 字节内容 + tag/len = 33 字节");
+        Tracer.traceDecision("ppubsRoundTrip", new Object[]{"expected", Sm9Math.twistToOctets(ppubs),
+            "actual", ppubsBack}, Arrays.equals(Sm9Math.twistToOctets(ppubs), ppubsBack), "compare",
+            "BIT STRING 解出的 Ppubs 逐字节一致");
 
         // 加密主密钥同构，只是公钥点换成 65 字节的 G₁ 点
         ASN1EncodableVector encVector = new ASN1EncodableVector();
         encVector.add(new ASN1Integer(HEX_KEX));
         encVector.add(new DERBitString(Sm9Math.pointToOctets(Sm9Math.encMasterPublicKey(HEX_KEX))));
         ASN1Sequence encParsed = ASN1Sequence.getInstance(new DERSequence(encVector).getEncoded());
+        Tracer.trace("derEncodeEncMasterKey", new Object[]{"kex", HEX_KEX},
+            new DERSequence(encVector).getEncoded(), "marshal");
+        Tracer.trace("derDecodeEncMasterKey", new Object[]{"sequenceSize", encParsed.size()},
+            encParsed, "unmarshal");
         Assert.assertEquals(HEX_KEX, ASN1Integer.getInstance(encParsed.getObjectAt(0)).getValue());
         Assert.assertEquals("04" + HEX_PUBE, Calc.hex(
             ASN1BitString.getInstance(encParsed.getObjectAt(1)).getOctets()).toUpperCase());
+        Tracer.traceDecision("encKeyRoundTrip", new Object[]{"expectedKex", HEX_KEX,
+            "actualKex", ASN1Integer.getInstance(encParsed.getObjectAt(0)).getValue(),
+            "expectedPpube", "04" + HEX_PUBE,
+            "actualPpube", Calc.hex(ASN1BitString.getInstance(encParsed.getObjectAt(1)).getOctets()).toUpperCase()},
+            HEX_KEX.equals(ASN1Integer.getInstance(encParsed.getObjectAt(0)).getValue())
+                && ("04" + HEX_PUBE).equals(Calc.hex(
+                    ASN1BitString.getInstance(encParsed.getObjectAt(1)).getOctets()).toUpperCase()),
+            "compare", "加密主密钥 DER 往返一致");
+        Tracer.trace("end", new Object[]{"ks", HEX_KS, "kex", HEX_KEX}, "DER round-trip ok", "end");
     }
 
     /**
@@ -309,30 +380,58 @@ public class Sm9KeyEssenceTest
      * 断言 "ds/de 必须与标准答案一字不差" 说明这两把私钥点完全由 (主私钥, ID, hid) 决定：
      * 没有随机数、没有会话状态，所以 KAT 可以精确到字节。
      */
+    @TraceExecution(value = "用户私钥 DER 携带私钥点与主公钥", algorithm = "SM9", flow = "SM9-KEY")
     @Test
     public void userKeyDerCarriesPrivateKeyPointPlusMasterPublicKey()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"id", "Alice", "id_enc", "Bob", "hid", Sm9Math.HID_ENC},
+            null, "start");
+
         BigInteger[][] ppubs = Sm9Math.signMasterPublicKey(HEX_KS);
         byte[] ds = Sm9Math.pointToOctets(Sm9Math.signPrivateKeyExtract(HEX_KS, ID_ALICE));
+        Tracer.trace("signPrivateKeyExtract", new Object[]{"ks", HEX_KS, "id", "Alice",
+            "hid", Sm9Math.HID_SIGN}, ds, "keygen");
         ASN1EncodableVector signKey = new ASN1EncodableVector();
         signKey.add(new DERBitString(ds));
         signKey.add(new DERBitString(Sm9Math.twistToOctets(ppubs)));
+        Tracer.trace("encodeSignUserKey", new Object[]{"dsLen", ds.length,
+            "ppubsLen", Sm9Math.twistToOctets(ppubs).length},
+            new DERSequence(signKey).getEncoded(), "marshal");
         ASN1Sequence parsedSign = ASN1Sequence.getInstance(new DERSequence(signKey).getEncoded());
+        Tracer.trace("decodeSignUserKey", new Object[]{"sequenceSize", parsedSign.size()},
+            parsedSign, "unmarshal");
         Assert.assertEquals("ds 必须与标准答案一字不差", "04" + HEX_DS,
             Calc.hex(ASN1BitString.getInstance(parsedSign.getObjectAt(0)).getOctets()).toUpperCase());
         Assert.assertEquals(65, ASN1BitString.getInstance(parsedSign.getObjectAt(0)).getOctets().length);
+        Tracer.traceDecision("dsKatCheck", new Object[]{"expected", "04" + HEX_DS,
+            "actual", Calc.hex(ASN1BitString.getInstance(parsedSign.getObjectAt(0)).getOctets()).toUpperCase()},
+            ("04" + HEX_DS).equals(Calc.hex(
+                ASN1BitString.getInstance(parsedSign.getObjectAt(0)).getOctets()).toUpperCase()),
+            "compare", "ds == GmSSL hex_ds，长度 65 字节");
 
         // HID_ENC = 0x03（加密用途）。同一个 ke、同一个 Bob，把 hid 换成 0x01/0x02 就是另外两把私钥：
         // de = ke·(ke + H1(ID,hid))⁻¹·P2 里只有 H1 那一格受 hid 影响，其余完全相同。
         byte[] de = Sm9Math.twistToOctets(Sm9Math.privateKeyExtract(HEX_KE, ID_BOB, Sm9Math.HID_ENC));
+        Tracer.trace("privateKeyExtract", new Object[]{"ke", HEX_KE, "id", "Bob",
+            "hid", Sm9Math.HID_ENC}, de, "keygen");
         ASN1EncodableVector encKey = new ASN1EncodableVector();
         encKey.add(new DERBitString(de));
         encKey.add(new DERBitString(Sm9Math.pointToOctets(Sm9Math.encMasterPublicKey(HEX_KE))));
+        Tracer.trace("encodeEncUserKey", new Object[]{"deLen", de.length},
+            new DERSequence(encKey).getEncoded(), "marshal");
         ASN1Sequence parsedEnc = ASN1Sequence.getInstance(new DERSequence(encKey).getEncoded());
+        Tracer.trace("decodeEncUserKey", new Object[]{"sequenceSize", parsedEnc.size()},
+            parsedEnc, "unmarshal");
         Assert.assertEquals(129, ASN1BitString.getInstance(parsedEnc.getObjectAt(0)).getOctets().length);
         Assert.assertEquals("04" + HEX_DE,
             Calc.hex(ASN1BitString.getInstance(parsedEnc.getObjectAt(0)).getOctets()).toUpperCase());
+        Tracer.traceDecision("deKatCheck", new Object[]{"expected", "04" + HEX_DE,
+            "actual", Calc.hex(ASN1BitString.getInstance(parsedEnc.getObjectAt(0)).getOctets()).toUpperCase()},
+            ("04" + HEX_DE).equals(Calc.hex(
+                ASN1BitString.getInstance(parsedEnc.getObjectAt(0)).getOctets()).toUpperCase()),
+            "compare", "de == GmSSL hex_de，长度 129 字节");
+        Tracer.trace("end", new Object[]{"ds", ds, "de", de}, "user key DER verified", "end");
     }
 
     /**
@@ -349,25 +448,41 @@ public class Sm9KeyEssenceTest
      * 用 {@code new Random(固定种子)} 只是为了让这条测试可复现；randScalar 本身是拒绝采样，
      * 换任何种子都应当跑通 —— 双线性对任意 ks 都成立，这才是"实现正确"的强证据。
      */
+    @TraceExecution(value = "新主密钥端到端签名验签", algorithm = "SM9", flow = "SM9-KEY")
     @Test
     public void freshlyGeneratedMasterKeySignsAndVerifiesEndToEnd()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"seed", 20261021L, "message", MESSAGE}, null, "start");
+
         BigInteger ks = Sm9Math.randScalar(new Random(20261021L));
         Assert.assertTrue(ks.compareTo(BigInteger.ONE) >= 0 && ks.compareTo(Sm9Math.N) < 0);
+        Tracer.trace("setup", new Object[]{"seed", 20261021L, "ks_bits", ks.bitLength()},
+            ks, "setup");
 
         BigInteger[][] ppubs = Sm9Math.signMasterPublicKey(ks);
         BigInteger[] ds = Sm9Math.signPrivateKeyExtract(ks, ID_ALICE);
+        Tracer.trace("signMasterPublicKey", new Object[]{"ks", ks}, ppubs, "keygen");
+        Tracer.trace("signPrivateKeyExtract", new Object[]{"ks", ks, "id", "Alice"}, ds, "keygen");
         // ds 是 G₁（仿射、65 字节）的点，所以用 pointIsOnCurve 而不是 twistIsOnCurve 检查
         Assert.assertTrue(Sm9Math.pointIsOnCurve(ds));
 
         // 只把 ppubs（公钥）交给验签方：它不需要、也拿不到 ks
         // 最后一个入参是签名的临时标量 r ∈ [1, n−1]（nonce）：r 变则 w、h、S 全变，但都验得过
         byte[] signature = Sm9Math.sign(MESSAGE, ID_ALICE, ks, Sm9Math.randScalar(new Random(991L)));
+        Tracer.trace("sign", new Object[]{"message", MESSAGE, "id", "Alice", "ks", ks},
+            signature, "sign");
         Assert.assertTrue(Sm9Math.verify(MESSAGE, signature, ID_ALICE, ppubs));
         // 换成 ID_BOB 为什么必然失败：验签方算的 P′ = H1(ID,0x01)·P2 + Ppubs 里的 H1 变了，
         // 于是 u = e(S, P′) 变了、w = u·g^h 变了，最后 H2(M‖w) 与签名里那 32 字节的 h 对不上。
         // 标识密码里"把 ID 读错一个人"就是这样直接失败的，不需要任何吊销信息。
         Assert.assertFalse("换个人就验不过", Sm9Math.verify(MESSAGE, signature, ID_BOB, ppubs));
+        Tracer.traceDecision("verifyOriginal", new Object[]{"message", MESSAGE, "id", "Alice",
+            "signature", signature}, Sm9Math.verify(MESSAGE, signature, ID_ALICE, ppubs), "compare",
+            "原标识验签通过");
+        Tracer.traceDecision("verifyWrongId", new Object[]{"message", MESSAGE, "id", "Bob",
+            "signature", signature}, Sm9Math.verify(MESSAGE, signature, ID_BOB, ppubs), "compare",
+            "换标识验签失败");
+        Tracer.trace("end", new Object[]{"signature", signature, "verified", true}, null, "end");
     }
 }

@@ -4,7 +4,11 @@ import java.math.BigInteger;
 import java.util.Arrays;
 
 import lombok.extern.slf4j.Slf4j;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -114,6 +118,9 @@ import org.junit.Test;
 @Slf4j
 public class Sm9ExchangeEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     /** 发起方 A 的标识（"Alice" = 41 6C 69 63 65）；应答方 B 用<b>它</b>算 Q_A，不是用自己的。 */
     private static final byte[] ID_ALICE = "Alice".getBytes();
     /** 应答方 B 的标识（"Bob" = 42 6F 62）；发起方 A 用它算 Q_B。 */
@@ -166,10 +173,18 @@ public class Sm9ExchangeEssenceTest
      * <p>注意 de 与 Q 用的是<b>同一个</b> H1(ID,0x02)：de 里是 (ke + h1_自己)⁻¹·P2，
      * Q 里是 (ke + h1_对方)·P1 —— 一方持有的分子正好是另一方点里的分母，配对才消得掉。
      */
+    @TraceExecution(value = "SM9 交换临时点与双方私钥对齐 GmSSL", algorithm = "SM9", flow = "SM9-EXCHANGE")
     @Test
     public void ephemeralPointAndBothPrivateKeysMatchGmsslAnswers()
     {
+        Tracer.trace("start", new Object[]{"ID_A", "Alice", "ID_B", "Bob", "kex", HEX_KEX, "rA", R_A, "rB", R_B},
+            null, "start");
+        Tracer.trace("exchange.params", new Object[]{"kex", HEX_KEX, "hid", Sm9Math.HID_EXCH,
+            "Ppube", Sm9Math.encMasterPublicKey(HEX_KEX)}, Sm9Math.encMasterPublicKey(HEX_KEX), "params");
+
         BigInteger[] ra = Sm9Math.exchEphemeral(HEX_KEX, ID_BOB, R_A);
+        Tracer.trace("exchEphemeral.rA", new Object[]{"kex", HEX_KEX, "peerId", "Bob", "rA", R_A},
+            Sm9Math.pointToOctets(ra), "genR");
         // 第二个实参是"对方的标识"：发起方 A 算 RA 时传的是 ID_BOB，不是自己的 ID_ALICE
         Assert.assertEquals("04" + HEX_RA_POINT, Calc.hex(Sm9Math.pointToOctets(ra)).toUpperCase());
 
@@ -180,6 +195,8 @@ public class Sm9ExchangeEssenceTest
 
         // RB 没有现成样例，但它必须等于 rB·Q_A，而 Q_A = (H1(Alice,0x02)+ke)·P1
         BigInteger[] rb = Sm9Math.exchEphemeral(HEX_KEX, ID_ALICE, R_B);
+        Tracer.trace("exchEphemeral.rB", new Object[]{"kex", HEX_KEX, "peerId", "Alice", "rB", R_B},
+            Sm9Math.pointToOctets(rb), "genR");
         Assert.assertTrue(Sm9Math.pointIsOnCurve(rb));
         // 这里把 Q_A 直接按 (h1_A + ke)·P1 算（先合并标量），再乘 rB：与 exchEphemeral
         // "先加两个点再乘"的写法是分配律 (r·(m·P1) = (r·m mod n)·P1) 的两种实现路径。
@@ -187,16 +204,26 @@ public class Sm9ExchangeEssenceTest
             Sm9Math.modnAdd(Sm9Math.hash1(ID_ALICE, Sm9Math.HID_EXCH), HEX_KEX), Sm9Math.P1);
         Assert.assertEquals(Calc.hex(Sm9Math.pointToOctets(Sm9Math.pointMul(R_B, qA))),
             Calc.hex(Sm9Math.pointToOctets(rb)));
+        Tracer.trace("pointMul.RA", new Object[]{"rA", R_A, "Q_B", Sm9Math.pointToOctets(
+            Sm9Math.pointMul(Sm9Math.modnAdd(Sm9Math.hash1(ID_BOB, Sm9Math.HID_EXCH), HEX_KEX), Sm9Math.P1))},
+            Sm9Math.pointToOctets(ra), "pointMul");
+        Tracer.trace("pointMul.RB", new Object[]{"rB", R_B, "Q_A", Sm9Math.pointToOctets(qA)},
+            Sm9Math.pointToOctets(rb), "pointMul");
 
         // 两把交换私钥（hid = 0x02）都必须是 G₂ 上的点，且与标准答案一字不差
         BigInteger[][] deA = Sm9Math.privateKeyExtract(HEX_KEX, ID_ALICE, Sm9Math.HID_EXCH);
         BigInteger[][] deB = Sm9Math.privateKeyExtract(HEX_KEX, ID_BOB, Sm9Math.HID_EXCH);
         Assert.assertEquals("04" + HEX_DE_A, Calc.hex(Sm9Math.twistToOctets(deA)).toUpperCase());
         Assert.assertEquals("04" + HEX_DE_B, Calc.hex(Sm9Math.twistToOctets(deB)).toUpperCase());
+        Tracer.trace("privateKeyExtract.de", new Object[]{"kex", HEX_KEX, "ID_A", "Alice", "ID_B", "Bob",
+            "hid", Sm9Math.HID_EXCH}, new Object[]{"deA", Sm9Math.twistToOctets(deA), "deB", Sm9Math.twistToOctets(deB)},
+            "params");
         // 在曲线上是"能用"的最低要求；G₂ 的阶是素数 n，所以曲线上的非无穷远点自动在正确的子群里
         Assert.assertTrue(Sm9Math.twistIsOnCurve(deA));
         Assert.assertTrue(Sm9Math.twistIsOnCurve(deB));
         log.info("RA = {}", Calc.hex(Sm9Math.pointToOctets(ra)));
+        Tracer.trace("end", new Object[]{"RA", Sm9Math.pointToOctets(ra), "RB", Sm9Math.pointToOctets(rb),
+            "deA", Sm9Math.twistToOctets(deA), "deB", Sm9Math.twistToOctets(deB)}, null, "end");
     }
 
     /**
@@ -217,10 +244,14 @@ public class Sm9ExchangeEssenceTest
      *   base^{ke·rA / ke·rB / ke·rA·rB} 三格各自只依赖一个标量积 —— 指数在 Z_n 里算，mod n 先约再乘
      * </pre>
      */
+    @TraceExecution(value = "SM9 交换双方算出相同字节与会话密钥", algorithm = "SM9", flow = "SM9-EXCHANGE")
     @Test
     public void bothRolesProduceTheSameBytesAndTheSameSessionKey()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"ID_A", "Alice", "ID_B", "Bob", "rA", R_A, "rB", R_B, "klen", KLEN},
+            null, "start");
+
         BigInteger[] ra = Sm9Math.exchEphemeral(HEX_KEX, ID_BOB, R_A);
         BigInteger[] rb = Sm9Math.exchEphemeral(HEX_KEX, ID_ALICE, R_B);
 
@@ -228,10 +259,16 @@ public class Sm9ExchangeEssenceTest
         byte[][] gInitiator = new byte[3][];
         byte[][] rInitiator = new byte[2][];
         byte[] skA = Sm9Math.exchSessionKey(true, HEX_KEX, ID_ALICE, ID_BOB, R_A, ra, rb, KLEN, gInitiator, rInitiator);
+        Tracer.trace("exchSessionKey.A", new Object[]{"isInitiator", true, "kex", HEX_KEX, "ownId", "Alice",
+            "peerId", "Bob", "rA", R_A, "RA", ra, "RB", rb, "klen", KLEN},
+            new Object[]{"g", gInitiator, "skA", skA}, "derive");
 
         byte[][] gResponder = new byte[3][];
         byte[][] rResponder = new byte[2][];
         byte[] skB = Sm9Math.exchSessionKey(false, HEX_KEX, ID_BOB, ID_ALICE, R_B, rb, ra, KLEN, gResponder, rResponder);
+        Tracer.trace("exchSessionKey.B", new Object[]{"isInitiator", false, "kex", HEX_KEX, "ownId", "Bob",
+            "peerId", "Alice", "rB", R_B, "RB", rb, "RA", ra, "klen", KLEN},
+            new Object[]{"g", gResponder, "skB", skB}, "derive");
 
         // 三格 g 逐格相同，线上消息的顺序（A 的 RA 在前）也相同
         // 注意 ID 顺序也是"A 在前"：应答方传参时把 ownId=Bob 放第一个实参，但函数内部按
@@ -241,16 +278,25 @@ public class Sm9ExchangeEssenceTest
             Assert.assertEquals("g" + (i + 1) + " 两边必须同一段 384 字节",
                 Calc.hex(gInitiator[i]), Calc.hex(gResponder[i]));
             Assert.assertEquals(384, gInitiator[i].length);
+            Tracer.traceLoop("g.compare", new Object[]{"index", i + 1, "gA", gInitiator[i], "gB", gResponder[i]},
+                Arrays.equals(gInitiator[i], gResponder[i]), "derive", i + 1, 3, "gSlots");
         }
         Assert.assertArrayEquals(rInitiator[0], rResponder[0]);
         Assert.assertArrayEquals(rInitiator[1], rResponder[1]);
+        Tracer.trace("ephemeralOrder", new Object[]{"RA_A", rInitiator[0], "RA_B", rResponder[0],
+                "RB_A", rInitiator[1], "RB_B", rResponder[1]},
+            Arrays.equals(rInitiator[0], rResponder[0]) && Arrays.equals(rInitiator[1], rResponder[1]),
+            "derive");
         // 64 而不是 65：rOut 里存的是去掉 0x04 前缀的裸 x‖y，标准把裸坐标喂给 KDF 与 hash
         Assert.assertEquals(64, rInitiator[0].length);
         Assert.assertArrayEquals("会话密钥必须一致", skA, skB);
+        Tracer.traceDecision("confirm.sk", new Object[]{"skA", skA, "skB", skB}, Arrays.equals(skA, skB),
+            "confirm", "A 与 B 派生出同一会话密钥");
 
         // 双线性证明：g1 只该是 ke·rA 的函数，g2 只该是 ke·rB 的函数
         // base = pairing(P2, P1) 读作 e(P1, P2) = G（实参顺序与数学记号相反，见类头/配对文件的说明）
         BigInteger[] base = Sm9Math.pairing(Sm9Math.P2, Sm9Math.P1);
+        Tracer.trace("pairing.base", new Object[]{"P2", Sm9Math.P2, "P1", Sm9Math.P1}, base, "derive");
         // 三行合起来说的是：g1 = G^{ke·rA}、g2 = G^{ke·rB}、g3 = G^{ke·rA·rB}，
         // 也就是协议里那三格"看起来完全不同的算法"其实只是同一个指数的三种拆法。
         // 指数先用 modnMul 在 Z_n 里约好再抬幂：GT 的阶是 n，所以指数天然 mod n。
@@ -261,6 +307,8 @@ public class Sm9ExchangeEssenceTest
         Assert.assertEquals(Calc.hex(gInitiator[2]), Calc.hex(Sm9Math.fp12ToBytes(
             Sm9Math.fp12Pow(base, Sm9Math.modnMul(Sm9Math.modnMul(HEX_KEX, R_A), R_B)))));
         log.info("sk = {}", Calc.hex(skA));
+        Tracer.trace("end", new Object[]{"sk", skA, "g1", gInitiator[0], "g2", gInitiator[1], "g3", gInitiator[2]},
+            null, "end");
     }
 
     /**
@@ -279,10 +327,13 @@ public class Sm9ExchangeEssenceTest
      * "Alice‖Bob" 与 "Bob‖Alice" 是两个不同的摘要输入，所以对调后必须验不过
      * （标准规定 A-first 与角色无关，就是为了两侧不在这个字节序上分叉）。
      */
+    @TraceExecution(value = "SM9 确认标签交叉验证与篡改失败", algorithm = "SM9", flow = "SM9-EXCHANGE")
     @Test
     public void confirmTagsCrossValidateAndBreakOnTampering()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"ID_A", "Alice", "ID_B", "Bob", "rA", R_A, "rB", R_B}, null, "start");
+
         BigInteger[] ra = Sm9Math.exchEphemeral(HEX_KEX, ID_BOB, R_A);
         BigInteger[] rb = Sm9Math.exchEphemeral(HEX_KEX, ID_ALICE, R_B);
 
@@ -298,6 +349,10 @@ public class Sm9ExchangeEssenceTest
         // 线上：A 发 SA（前缀 0x83），B 发 SB（前缀 0x82）
         byte[] sa = Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_A);
         byte[] sb = Sm9Math.exchConfirmTag(gB[0], gB[1], gB[2], rB[0], rB[1], ID_ALICE, ID_BOB, PREFIX_B);
+        Tracer.trace("exchConfirmTag.SA", new Object[]{"g1", gA[0], "g2", gA[1], "g3", gA[2], "RA", rA[0],
+            "RB", rA[1], "ID_A", "Alice", "ID_B", "Bob", "prefix", PREFIX_A}, sa, "confirm");
+        Tracer.trace("exchConfirmTag.SB", new Object[]{"g1", gB[0], "g2", gB[1], "g3", gB[2], "RA", rB[0],
+            "RB", rB[1], "ID_A", "Alice", "ID_B", "Bob", "prefix", PREFIX_B}, sb, "confirm");
         Assert.assertEquals(32, sa.length);
         Assert.assertFalse("两个角色的标签必须不同（前缀就是角色标识）", Arrays.equals(sa, sb));
 
@@ -305,17 +360,44 @@ public class Sm9ExchangeEssenceTest
         // 关键细节：验对方时传<b>对方</b>的前缀，而 ID 参数仍是 (Alice, Bob) 这个 A-first 顺序。
         Assert.assertArrayEquals("B 的标签必须能被 A 复现", sb,
             Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_B));
+        Tracer.traceDecision("confirm.cross.SB", new Object[]{"expected", sb, "recomputedByA",
+                Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_B)},
+            Arrays.equals(sb, Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_B)),
+            "confirm", "A 用自己算的 g/r 复现 B 的标签");
         Assert.assertArrayEquals("A 的标签必须能被 B 复现", sa,
             Sm9Math.exchConfirmTag(gB[0], gB[1], gB[2], rB[0], rB[1], ID_ALICE, ID_BOB, PREFIX_A));
+        Tracer.traceDecision("confirm.cross.SA", new Object[]{"expected", sa, "recomputedByB",
+                Sm9Math.exchConfirmTag(gB[0], gB[1], gB[2], rB[0], rB[1], ID_ALICE, ID_BOB, PREFIX_A)},
+            Arrays.equals(sa, Sm9Math.exchConfirmTag(gB[0], gB[1], gB[2], rB[0], rB[1], ID_ALICE, ID_BOB, PREFIX_A)),
+            "confirm", "B 用自己算的 g/r 复现 A 的标签");
 
         // 每一格输入动一下，标签就变 —— 标签绑定了 g1..g3、两个标识和两枚临时点
         // 六行分别打：g1、g2、g3、RA、RB、ID 顺序（前缀那一格由上一段的互验覆盖）
         Assert.assertFalse(Arrays.equals(sa, Sm9Math.exchConfirmTag(tamper(gA[0]), gA[1], gA[2], rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_A)));
+        Tracer.traceDecision("tamper.g1", new Object[]{"g1", gA[0], "tampered", tamper(gA[0])},
+            !Arrays.equals(sa, Sm9Math.exchConfirmTag(tamper(gA[0]), gA[1], gA[2], rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_A)),
+            "tamper", "改 g1 后标签必变");
         Assert.assertFalse(Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], tamper(gA[1]), gA[2], rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_A)));
+        Tracer.traceDecision("tamper.g2", new Object[]{"g2", gA[1], "tampered", tamper(gA[1])},
+            !Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], tamper(gA[1]), gA[2], rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_A)),
+            "tamper", "改 g2 后标签必变");
         Assert.assertFalse(Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], gA[1], tamper(gA[2]), rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_A)));
+        Tracer.traceDecision("tamper.g3", new Object[]{"g3", gA[2], "tampered", tamper(gA[2])},
+            !Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], gA[1], tamper(gA[2]), rA[0], rA[1], ID_ALICE, ID_BOB, PREFIX_A)),
+            "tamper", "改 g3 后标签必变");
         Assert.assertFalse(Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], tamper(rA[0]), rA[1], ID_ALICE, ID_BOB, PREFIX_A)));
+        Tracer.traceDecision("tamper.RA", new Object[]{"RA", rA[0], "tampered", tamper(rA[0])},
+            !Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], tamper(rA[0]), rA[1], ID_ALICE, ID_BOB, PREFIX_A)),
+            "tamper", "改 RA 后标签必变");
         Assert.assertFalse(Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], rA[0], tamper(rA[1]), ID_ALICE, ID_BOB, PREFIX_A)));
+        Tracer.traceDecision("tamper.RB", new Object[]{"RB", rA[1], "tampered", tamper(rA[1])},
+            !Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], rA[0], tamper(rA[1]), ID_ALICE, ID_BOB, PREFIX_A)),
+            "tamper", "改 RB 后标签必变");
         Assert.assertFalse(Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], rA[0], rA[1], ID_BOB, ID_ALICE, PREFIX_A)));
+        Tracer.traceDecision("tamper.idOrder", new Object[]{"ID_A", "Alice", "ID_B", "Bob", "swapped", "Bob|Alice"},
+            !Arrays.equals(sa, Sm9Math.exchConfirmTag(gA[0], gA[1], gA[2], rA[0], rA[1], ID_BOB, ID_ALICE, PREFIX_A)),
+            "tamper", "对调 ID 顺序后标签必变");
+        Tracer.trace("end", new Object[]{"SA", sa, "SB", sb}, null, "end");
     }
 
     /**
@@ -337,30 +419,50 @@ public class Sm9ExchangeEssenceTest
      * 想冒充 Bob 就得自己造出一个能让 A 算出一致 g2 的点，而那需要 de_B（KGC 才发得出来）；
      * 这也是标识密码的认证根基 —— 但反过来，KGC 本身能算出任何人的 de，故它天然可以冒充任何人。
      */
+    @TraceExecution(value = "SM9 替换临时点使会话密钥分叉", algorithm = "SM9", flow = "SM9-EXCHANGE")
     @Test
     public void substitutedEphemeralPointSplitsTheSessionKey()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"ID_A", "Alice", "ID_B", "Bob", "rA", R_A, "rB", R_B,
+            "rB_other", R_B_OTHER}, null, "start");
+
         BigInteger[] ra = Sm9Math.exchEphemeral(HEX_KEX, ID_BOB, R_A);
         BigInteger[] rbHonest = Sm9Math.exchEphemeral(HEX_KEX, ID_ALICE, R_B);
         // 攻击者用自己的 rB' 造一枚"看起来一样合法"的点：它在 G₁ 上、编码也正确，
         // 所以任何只做格式检查的实现都发现不了 —— 只有密码学会发现。
         BigInteger[] rbEvil = Sm9Math.exchEphemeral(HEX_KEX, ID_ALICE, R_B_OTHER);
+        Tracer.trace("exchEphemeral.rbEvil", new Object[]{"kex", HEX_KEX, "peerId", "Alice", "rB_other", R_B_OTHER},
+            Sm9Math.pointToOctets(rbEvil), "derive");
         Assert.assertFalse(Arrays.equals(Sm9Math.pointToOctets(rbHonest), Sm9Math.pointToOctets(rbEvil)));
 
         byte[][] gHonest = new byte[3][];
         byte[][] rHonest = new byte[2][];
         byte[] skHonest = Sm9Math.exchSessionKey(true, HEX_KEX, ID_ALICE, ID_BOB, R_A, ra, rbHonest, KLEN, gHonest, rHonest);
+        Tracer.trace("exchSessionKey.honest", new Object[]{"kex", HEX_KEX, "ownId", "Alice", "peerId", "Bob",
+            "rA", R_A, "RA", ra, "RB", rbHonest, "klen", KLEN},
+            new Object[]{"g", gHonest, "sk", skHonest}, "derive");
 
         byte[][] gVictim = new byte[3][];
         byte[][] rVictim = new byte[2][];
         // 同一个 A、同一枚 RA、同一个 rA，只是收到的 RB 被换了
         byte[] skVictim = Sm9Math.exchSessionKey(true, HEX_KEX, ID_ALICE, ID_BOB, R_A, ra, rbEvil, KLEN, gVictim, rVictim);
+        Tracer.trace("exchSessionKey.victim", new Object[]{"kex", HEX_KEX, "ownId", "Alice", "peerId", "Bob",
+            "rA", R_A, "RA", ra, "RB_substituted", rbEvil, "klen", KLEN},
+            new Object[]{"g", gVictim, "sk", skVictim}, "derive");
 
         Assert.assertFalse("RB 一变，g2/g3 全变", Arrays.equals(gHonest[1], gVictim[1]));
+        Tracer.traceDecision("tamper.g2", new Object[]{"g2_honest", gHonest[1], "g2_victim", gVictim[1]},
+            !Arrays.equals(gHonest[1], gVictim[1]), "tamper", "RB 变 ⇒ g2 变");
         Assert.assertFalse("g3 也变", Arrays.equals(gHonest[2], gVictim[2]));
+        Tracer.traceDecision("tamper.g3", new Object[]{"g3_honest", gHonest[2], "g3_victim", gVictim[2]},
+            !Arrays.equals(gHonest[2], gVictim[2]), "tamper", "RB 变 ⇒ g3 变");
         Assert.assertTrue("g1 只跟 rA 有关，所以不变", Arrays.equals(gHonest[0], gVictim[0]));
+        Tracer.traceDecision("tamper.g1", new Object[]{"g1_honest", gHonest[0], "g1_victim", gVictim[0]},
+            Arrays.equals(gHonest[0], gVictim[0]), "tamper", "g1 只含 rA ⇒ 不变");
         Assert.assertFalse("会话密钥必须分叉", Arrays.equals(skHonest, skVictim));
+        Tracer.traceDecision("tamper.sk", new Object[]{"sk_honest", skHonest, "sk_victim", skVictim},
+            !Arrays.equals(skHonest, skVictim), "tamper", "替换 RB ⇒ 会话密钥分叉");
 
         // B 用自己的 RB 算出的 SB，A 用收到的（被换过的）RB 去验必然对不上
         byte[][] gB = new byte[3][];
@@ -368,7 +470,14 @@ public class Sm9ExchangeEssenceTest
         Sm9Math.exchSessionKey(false, HEX_KEX, ID_BOB, ID_ALICE, R_B, rbHonest, ra, KLEN, gB, rB);
         byte[] sb = Sm9Math.exchConfirmTag(gB[0], gB[1], gB[2], rB[0], rB[1], ID_ALICE, ID_BOB, PREFIX_B);
         byte[] sbAsSeenByA = Sm9Math.exchConfirmTag(gVictim[0], gVictim[1], gVictim[2], rVictim[0], rVictim[1], ID_ALICE, ID_BOB, PREFIX_B);
+        Tracer.trace("exchConfirmTag.SB", new Object[]{"g1", gB[0], "g2", gB[1], "g3", gB[2], "RA", rB[0],
+            "RB", rB[1], "prefix", PREFIX_B}, sb, "tamper");
+        Tracer.trace("exchConfirmTag.SBAsSeenByA", new Object[]{"g1", gVictim[0], "g2", gVictim[1],
+            "g3", gVictim[2], "RA", rVictim[0], "RB", rVictim[1], "prefix", PREFIX_B}, sbAsSeenByA, "tamper");
         Assert.assertFalse(Arrays.equals(sb, sbAsSeenByA));
+        Tracer.traceDecision("tamper.confirmTag", new Object[]{"SB", sb, "SB_asSeenByA", sbAsSeenByA},
+            !Arrays.equals(sb, sbAsSeenByA), "tamper", "替换 RB 后 B 的标签验不过");
+        Tracer.trace("end", new Object[]{"sk_honest", skHonest, "sk_victim", skVictim}, null, "end");
     }
 
     /** 改一个字节（用于"任何输入都绑进标签"的断言）。

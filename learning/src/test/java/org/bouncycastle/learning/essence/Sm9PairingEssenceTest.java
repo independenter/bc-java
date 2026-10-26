@@ -4,7 +4,11 @@ import java.math.BigInteger;
 import java.util.Random;
 
 import lombok.extern.slf4j.Slf4j;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -120,6 +124,9 @@ import org.junit.Test;
 @Slf4j
 public class Sm9PairingEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     /**
      * 标准样例里 Alice 的标识与签名主私钥 ks（GmSSL: hex_ks）。
      * ID_ALICE = "Alice" = 41 6C 69 63 65（5 字节，纯 ASCII，不做补齐）；
@@ -232,21 +239,39 @@ public class Sm9PairingEssenceTest
      * <p><b>p ≠ n 为什么值得单独断言</b>：坐标算术 mod p（域），标量算术 mod n（群阶），两套模数
      * 只差最后几个字节，抄串了不会报错却会全算错 —— 比如拿 p 去约减标量，ds 就不是标准里那个点了。
      */
+    @TraceExecution(value = "生成元曲线与阶检查", algorithm = "SM9", flow = "SM9-PAIRING")
     @Test
     public void generatorsLieOnTheirCurvesAndHaveOrderN()
     {
+        Tracer.trace("start", new Object[]{"p_bits", Sm9Math.P.bitLength(), "n_bits", Sm9Math.N.bitLength()},
+            null, "start");
+
         Assert.assertTrue("P1 必须满足 y² = x³ + 5", Sm9Math.pointIsOnCurve(Sm9Math.P1));
+        Tracer.trace("pointIsOnCurve", new Object[]{"point", Sm9Math.P1},
+            Sm9Math.pointIsOnCurve(Sm9Math.P1), "generators");
         // G₁ 的无穷远点在这个实现里就是"空数组"，所以判 O 只要看 length == 0（没有单独的 isInfinity）
         Assert.assertTrue("n·P1 必须是无穷远点（空数组）",
             Sm9Math.pointMul(Sm9Math.N, Sm9Math.P1).length == 0);
+        Tracer.trace("nTimesP1", new Object[]{"n", Sm9Math.N, "P1", Sm9Math.P1},
+            Sm9Math.pointMul(Sm9Math.N, Sm9Math.P1).length, "generators");
         Assert.assertTrue("P2 必须满足 twisted 曲线 y² = x³ + 5u", Sm9Math.twistIsOnCurve(Sm9Math.P2));
+        Tracer.trace("twistIsOnCurve", new Object[]{"P2", Sm9Math.P2},
+            Sm9Math.twistIsOnCurve(Sm9Math.P2), "generators");
         // G₂ 的无穷远点只看 Z：twistIsInfinity(pt) 就是 fp2IsZero(pt[2])
         Assert.assertTrue("n·P2 必须是无穷远点", Sm9Math.twistIsInfinity(Sm9Math.twistMul(Sm9Math.N, Sm9Math.P2)));
+        Tracer.trace("nTimesP2", new Object[]{"n", Sm9Math.N, "P2", Sm9Math.P2},
+            Sm9Math.twistIsInfinity(Sm9Math.twistMul(Sm9Math.N, Sm9Math.P2)), "generators");
         Assert.assertTrue("n 是素数", Sm9Math.N.isProbablePrime(64));
+        Tracer.traceDecision("nIsPrime", new Object[]{"n", Sm9Math.N, "rounds", 64},
+            Sm9Math.N.isProbablePrime(64), "generators", "n 通过 64 轮 Miller-Rabin");
         Assert.assertFalse("p ≠ n：素数域与标量域是两回事", Sm9Math.P.equals(Sm9Math.N));
+        Tracer.traceDecision("pNotN", new Object[]{"p", Sm9Math.P, "n", Sm9Math.N},
+            !Sm9Math.P.equals(Sm9Math.N), "generators", "p != n");
 
         log.info("[SM9-常数] p 有 {} bit，n 有 {} bit，P1/P2 都在自己的曲线上且阶为 n",
             Sm9Math.P.bitLength(), Sm9Math.N.bitLength());
+        Tracer.trace("end", new Object[]{"p1_on_curve", true, "p2_on_curve", true},
+            "generators verified", "end");
     }
 
     /**
@@ -270,20 +295,25 @@ public class Sm9PairingEssenceTest
      * 看起来像的双线性映射；<b>x·x⁻¹ = 1</b> 证明 fp12Inv 的那套"三次共轭 + 范数"没有抄错符号；
      * <b>384 字节往返</b>证明序列化与反序列化互为真逆（下标方向写反就在这里暴露）。
      */
+    @TraceExecution(value = "扩域塔三条规则与分配律", algorithm = "SM9", flow = "SM9-PAIRING")
     @Test
     public void towerRulesInverseAndDistributivity()
     {
+        Tracer.trace("start", new Object[]{"rules", "u²=-2, v²=u, w³=v", "iterations", 5}, null, "start");
+
         // u² = −2（Fp2）
         // u 本身 = 0 + 1·u，所以在 Fp2 的 {常数项, u 项} 里写作 {0, 1}；
         // "等于 −2" 的写法是"加 2 之后是不是 0"：fp2Add(u², {2, 0}) 必须是 Fp2 的零元
         BigInteger[] u = new BigInteger[]{ BigInteger.ZERO, BigInteger.ONE };
         Assert.assertTrue("u² 必须等于 −2", Sm9Math.fp2IsZero(Sm9Math.fp2Add(Sm9Math.fp2Sqr(u),
             new BigInteger[]{ BigInteger.valueOf(2), BigInteger.ZERO })));
+        Tracer.trace("fp2SquareU", new Object[]{"u", u}, Sm9Math.fp2Sqr(u), "tower");
 
         // v² = u（Fp4）：v 是"只有 v 分量、且那个 Fp2 分量等于 1"的元素
         BigInteger[] v = new BigInteger[]{ BigInteger.ZERO, BigInteger.ZERO, BigInteger.ONE, BigInteger.ZERO };
         BigInteger[] vSquaredExpect = new BigInteger[]{ BigInteger.ZERO, BigInteger.ONE, BigInteger.ZERO, BigInteger.ZERO };
         Assert.assertTrue("v² 必须等于 u", java.util.Arrays.equals(Sm9Math.fp4Sqr(v), vSquaredExpect));
+        Tracer.trace("fp4SquareV", new Object[]{"v", v}, Sm9Math.fp4Sqr(v), "tower");
 
         // w³ = v（Fp12）：w 落在下标 4，v 落在下标 2
         BigInteger[] w = new BigInteger[12];
@@ -300,6 +330,8 @@ public class Sm9PairingEssenceTest
         vIn12[2] = BigInteger.ONE;
         Assert.assertTrue("w³ 必须等于 v", Sm9Math.fp12Equals(
             Sm9Math.fp12Mul(w, Sm9Math.fp12Mul(w, w)), vIn12));
+        Tracer.trace("fp12CubeW", new Object[]{"w", w, "expected_v", vIn12},
+            Sm9Math.fp12Mul(w, Sm9Math.fp12Mul(w, w)), "tower");
 
         Random rnd = new Random(20261022L);
         for (int i = 0; i < 5; i++)
@@ -320,7 +352,10 @@ public class Sm9PairingEssenceTest
             // 序列化往返：384 字节 <-> 12 个系数，必须严格互逆
             Assert.assertTrue("字节化必须严格互逆",
                 Sm9Math.fp12Equals(x, Sm9Math.fp12FromBytes(Calc.unhex(Calc.hex(Sm9Math.fp12ToBytes(x))))));
+            Tracer.traceLoop("fp12FieldChecks", new Object[]{"x", x, "y", y, "z", zz},
+                "分配律 / 逆元 / 序列化往返全部成立", "tower", i + 1, 5);
         }
+        Tracer.trace("end", new Object[]{"iterations", 5}, "tower rules verified", "end");
     }
 
     /**
@@ -362,14 +397,20 @@ public class Sm9PairingEssenceTest
      * <p>为什么最终幂特别需要它：易算部分 f^{(p⁶−1)(p²+1)} 被写成 π₆(f)·f⁻¹ 再乘 π₂(·) ——
      * 两次 Frobenius + 两次乘法，代替了 p⁶+p² 这两个 1500 位指数的幂运算。
      */
+    @TraceExecution(value = "Frobenius 与普通幂一致性", algorithm = "SM9", flow = "SM9-PAIRING")
     @Test
     public void frobeniusMapsAgreeWithPlainExponentiation()
     {
+        Tracer.trace("start", new Object[]{"seed", 20261021L, "iterations", 3}, null, "start");
+
         BigInteger p = Sm9Math.P;
         BigInteger p2 = p.multiply(p);
         BigInteger p6 = p2.multiply(p2).multiply(p2);
+        Tracer.trace("modulusPowers", new Object[]{"p_bits", p.bitLength(), "p2_bits", p2.bitLength(),
+            "p6_bits", p6.bitLength()}, p, "frobenius");
         Random rnd = new Random(20261021L);
         BigInteger[] x = randomFp12(rnd);
+        Tracer.trace("randomFp12", new Object[]{"seed", 20261021L}, x, "frobenius");
         for (int i = 0; i < 3; i++)
         {
             // 每轮先把 x 乘成"更一般"的元素：随机系数元素有概率落在子域里（比如整个 Fp4 半边全是 0），
@@ -377,10 +418,20 @@ public class Sm9PairingEssenceTest
             x = Sm9Math.fp12Mul(x, randomFp12(rnd));
             Assert.assertTrue("x^p 的快路径必须等于普通幂",
                 Sm9Math.fp12Equals(Sm9Math.fp12Frobenius(x), Sm9Math.fp12Pow(x, p)));
+            Tracer.traceDecision("pi1EqualsPowP", new Object[]{"x", x, "p_bits", p.bitLength()},
+                Sm9Math.fp12Equals(Sm9Math.fp12Frobenius(x), Sm9Math.fp12Pow(x, p)), "frobenius",
+                "π₁(x) == x^p");
             Assert.assertTrue("x^{p²} 同理", Sm9Math.fp12Equals(Sm9Math.fp12Frobenius2(x), Sm9Math.fp12Pow(x, p2)));
+            Tracer.traceDecision("pi2EqualsPowP2", new Object[]{"x", x, "p2_bits", p2.bitLength()},
+                Sm9Math.fp12Equals(Sm9Math.fp12Frobenius2(x), Sm9Math.fp12Pow(x, p2)), "frobenius",
+                "π₂(x) == x^{p²}");
             Assert.assertTrue("x^{p⁶} 同理（最终幂的易算部分就靠它）",
                 Sm9Math.fp12Equals(Sm9Math.fp12Frobenius6(x), Sm9Math.fp12Pow(x, p6)));
+            Tracer.traceDecision("pi6EqualsPowP6", new Object[]{"x", x, "p6_bits", p6.bitLength()},
+                Sm9Math.fp12Equals(Sm9Math.fp12Frobenius6(x), Sm9Math.fp12Pow(x, p6)), "frobenius",
+                "π₆(x) == x^{p⁶}");
         }
+        Tracer.trace("end", new Object[]{"iterations", 3}, "Frobenius shortcuts verified", "end");
     }
 
     /**
@@ -405,10 +456,15 @@ public class Sm9PairingEssenceTest
      *   e(Ppube, P2)^{rB}    配完对再在 GT 里取幂：验证结果真的落在 n 阶子群里，能继续参与运算
      * </pre>
      */
+    @TraceExecution(value = "配对结果对照 GmSSL 样例", algorithm = "SM9", flow = "SM9-PAIRING")
     @Test
     public void pairingMatchesGmsslKnownAnswers()
     {
+        Tracer.trace("start", new Object[]{"cases", 3, "source", "GmSSL tests/sm9test.c"}, null, "start");
+
         BigInteger[] g = Sm9Math.pairing(Sm9Math.twistMul(HEX_KS, Sm9Math.P2), Sm9Math.P1);
+        Tracer.trace("pairingP1KsP2", new Object[]{"ks", HEX_KS, "P1", Sm9Math.P1,
+            "Q", Sm9Math.twistMul(HEX_KS, Sm9Math.P2)}, Calc.hex(Sm9Math.fp12ToBytes(g)), "pairing");
         Assert.assertEquals("e(P1, ks·P2) 必须逐字节等于标准样例",
             Calc.hex(Sm9Math.fp12ToBytes(g)), PAIRING1.toLowerCase());
 
@@ -417,6 +473,8 @@ public class Sm9PairingEssenceTest
         // 再补 Z = (1,0) 变成射影三元组，配对内部才走的是射影那套切线/割线公式
         BigInteger[] g2 = Sm9Math.pairing(Sm9Math.twistFromOctets(Calc.concat(new byte[]{ 0x04 }, Calc.unhex(DE_B))),
             Sm9Math.pointFromOctets(Calc.concat(new byte[]{ 0x04 }, Calc.unhex(RA_POINT))));
+        Tracer.trace("pairingRaDeB", new Object[]{"RA", RA_POINT, "deB", DE_B},
+            Calc.hex(Sm9Math.fp12ToBytes(g2)), "pairing");
         Assert.assertEquals("e(RA, deB) 必须逐字节等于标准样例",
             Calc.hex(Sm9Math.fp12ToBytes(g2)), PAIRING2.toLowerCase());
 
@@ -424,11 +482,27 @@ public class Sm9PairingEssenceTest
         // 因为配对输出已经在 n 阶子群 GT 中，这个幂的结果仍然在 GT 里（阶至多 n）
         BigInteger[] g3 = Sm9Math.fp12Pow(Sm9Math.pairing(Sm9Math.P2,
             Sm9Math.pointFromOctets(Calc.concat(new byte[]{ 0x04 }, Calc.unhex(PPUBE_POINT)))), RB);
+        Tracer.trace("pairingPpubeP2PowRb", new Object[]{"Ppube", PPUBE_POINT, "P2", Sm9Math.P2, "rB", RB},
+            Calc.hex(Sm9Math.fp12ToBytes(g3)), "pairing");
         Assert.assertEquals("e(Ppube, P2)^{rB} 必须逐字节等于标准样例",
             Calc.hex(Sm9Math.fp12ToBytes(g3)), PAIRING3.toLowerCase());
 
+        Tracer.traceDecision("katPairing1", new Object[]{"case", "e(P1, ks·P2)",
+            "expected", PAIRING1, "actual", Calc.hex(Sm9Math.fp12ToBytes(g))},
+            Calc.hex(Sm9Math.fp12ToBytes(g)).equals(PAIRING1.toLowerCase()), "bilinear",
+            "与 GmSSL PAIRING1 逐字节一致");
+        Tracer.traceDecision("katPairing2", new Object[]{"case", "e(RA, deB)",
+            "expected", PAIRING2, "actual", Calc.hex(Sm9Math.fp12ToBytes(g2))},
+            Calc.hex(Sm9Math.fp12ToBytes(g2)).equals(PAIRING2.toLowerCase()), "bilinear",
+            "与 GmSSL PAIRING2 逐字节一致");
+        Tracer.traceDecision("katPairing3", new Object[]{"case", "e(Ppube, P2)^{rB}",
+            "expected", PAIRING3, "actual", Calc.hex(Sm9Math.fp12ToBytes(g3))},
+            Calc.hex(Sm9Math.fp12ToBytes(g3)).equals(PAIRING3.toLowerCase()), "bilinear",
+            "与 GmSSL PAIRING3 逐字节一致");
+
         log.info("[SM9-配对] 三组 GmSSL 样例全部逐字节命中，e(P1,ks·P2) 的前 16 字节是 {}",
             Calc.hex(Sm9Math.fp12ToBytes(g)).substring(0, 32));
+        Tracer.trace("end", new Object[]{"cases", 3, "allMatched", true}, null, "end");
     }
 
     /**
@@ -461,15 +535,23 @@ public class Sm9PairingEssenceTest
      * </pre>
      * 验签方/加密方一辈子都不用知道 ks：它们只要把"分母"乘到另一个变量上，除法就在指数里消掉了。
      */
+    @TraceExecution(value = "双线性 / 非退化 / n 阶子群", algorithm = "SM9", flow = "SM9-PAIRING")
     @Test
     public void pairingIsBilinearNonDegenerateAndLandsInOrderNGroup()
     {
+        Tracer.trace("start", new Object[]{"P1", Sm9Math.P1, "P2", Sm9Math.P2}, null, "start");
+
         BigInteger a = new BigInteger("000130E78459D78545CB54C587E02CF480CE0B66340F319F348A1D5B1F2DC5F4", 16);
         BigInteger b = new BigInteger("0001EDEE3778F441F8DEA3D9FA0ACC4E07EE36C93F9A08618AF4AD85CEDE1C22", 16);
 
         BigInteger[] base = Sm9Math.pairing(Sm9Math.P2, Sm9Math.P1);
+        Tracer.trace("pairingBase", new Object[]{"P1", Sm9Math.P1, "P2", Sm9Math.P2},
+            Calc.hex(Sm9Math.fp12ToBytes(base)), "pairing");
         BigInteger[] lhs = Sm9Math.pairing(Sm9Math.twistMul(b, Sm9Math.P2), Sm9Math.pointMul(a, Sm9Math.P1));
+        Tracer.trace("pairingLhs", new Object[]{"a", a, "b", b}, Calc.hex(Sm9Math.fp12ToBytes(lhs)), "pairing");
         BigInteger[] rhs = Sm9Math.fp12Pow(Sm9Math.fp12Pow(base, a), b);
+        Tracer.trace("powRhs", new Object[]{"base", Calc.hex(Sm9Math.fp12ToBytes(base)), "a", a, "b", b},
+            Calc.hex(Sm9Math.fp12ToBytes(rhs)), "pairing");
         Assert.assertTrue("e(a·P1, b·P2) 必须等于 e(P1,P2)^{ab}", Sm9Math.fp12Equals(lhs, rhs));
 
         // 非退化 (non-degenerate)：只要 e(P1,P2) = 1，所有 e(·,·) 都恒等于 1（因为它对每个变量是同态），
@@ -485,10 +567,27 @@ public class Sm9PairingEssenceTest
         BigInteger[] ds = Sm9Math.signPrivateKeyExtract(HEX_KS, ID_ALICE);
         BigInteger h1 = Sm9Math.hash1(ID_ALICE, Sm9Math.HID_SIGN);
         BigInteger[] left = Sm9Math.pairing(Sm9Math.twistMul(Sm9Math.modnAdd(h1, HEX_KS), Sm9Math.P2), ds);
+        Tracer.trace("pairingDsH1KsP2", new Object[]{"ds", Sm9Math.pointToOctets(ds), "h1", h1,
+            "ks", HEX_KS, "Q", Sm9Math.twistMul(Sm9Math.modnAdd(h1, HEX_KS), Sm9Math.P2)},
+            Calc.hex(Sm9Math.fp12ToBytes(left)), "pairing");
         Assert.assertTrue("ds 与 (H1+ks)·P2 配对后，分母 (ks+H1) 必须被干净地抵消成 g^ks",
             Sm9Math.fp12Equals(left, Sm9Math.fp12Pow(base, HEX_KS)));
 
+        Tracer.traceDecision("bilinear", new Object[]{"lhs", Calc.hex(Sm9Math.fp12ToBytes(lhs)),
+            "rhs", Calc.hex(Sm9Math.fp12ToBytes(rhs))}, Sm9Math.fp12Equals(lhs, rhs), "bilinear",
+            "e(a·P1, b·P2) == e(P1,P2)^{ab}");
+        Tracer.traceDecision("nonDegenerate", new Object[]{"base", Calc.hex(Sm9Math.fp12ToBytes(base))},
+            !Sm9Math.fp12Equals(base, Sm9Math.fp12One()), "bilinear", "e(P1,P2) != 1");
+        Tracer.traceDecision("orderN", new Object[]{"n", Sm9Math.N},
+            Sm9Math.fp12Equals(Sm9Math.fp12Pow(base, Sm9Math.N), Sm9Math.fp12One()), "bilinear",
+            "g^n == 1（GT 是 n 阶子群）");
+        Tracer.traceDecision("dsCancellation", new Object[]{"h1", h1, "ks", HEX_KS},
+            Sm9Math.fp12Equals(left, Sm9Math.fp12Pow(base, HEX_KS)), "bilinear",
+            "e(ds, (h1+ks)·P2) == g^ks，除法被抵消");
+
         log.info("[SM9-双线性] e(aP,bQ) = e(P,Q)^ab、g^n = 1、ds 里那个除法的抵消恒等式，三者全部成立");
+        Tracer.trace("end", new Object[]{"bilinear", true, "nonDegenerate", true, "orderN", true},
+            null, "end");
     }
 
     /**
@@ -508,18 +607,31 @@ public class Sm9PairingEssenceTest
      * 读出来就是另一个点 —— 而且因为 Fp2 的两个分量都是 32 字节，<b>写反顺序不会报任何错</b>，
      * 只会安静地给出一个不在曲线上的点。这就是"最容易写反"的具体含义。
      */
+    @TraceExecution(value = "点编码往返与 GmSSL 字节序", algorithm = "SM9", flow = "SM9-PAIRING")
     @Test
     public void pointEncodingsRoundTripAndMatchGmsslOrder()
     {
+        Tracer.trace("start", new Object[]{"P1", Sm9Math.P1, "P2", Sm9Math.P2}, null, "start");
+
         byte[] p1 = Sm9Math.pointToOctets(Sm9Math.P1);
+        Tracer.trace("pointToOctetsG1", new Object[]{"P1", Sm9Math.P1}, p1, "encode");
         Assert.assertEquals("G₁ 点是 0x04 打头的 65 字节", 65, p1.length);
         Assert.assertArrayEquals("再读回来必须一模一样", Sm9Math.P1, Sm9Math.pointFromOctets(p1));
+        Tracer.traceDecision("roundTripG1", new Object[]{"length", p1.length},
+            java.util.Arrays.equals(Sm9Math.P1, Sm9Math.pointFromOctets(p1)), "encode",
+            "G1 点 65 字节严格往返");
 
         byte[] p2 = Sm9Math.twistToOctets(Sm9Math.P2);
+        Tracer.trace("twistToOctetsG2", new Object[]{"P2", Sm9Math.P2}, p2, "encode");
         Assert.assertEquals("G₂ 点是 0x04 打头的 129 字节", 129, p2.length);
         // GmSSL 的顺序：x₁(高 u 分量) ‖ x₀ ‖ y₁ ‖ y₀
         Assert.assertEquals("第 1 段必须是 x 的 u 分量",
             Calc.hex(Calc.toBytes(Sm9Math.P2[0][1], 32)).toUpperCase(), Calc.hex(java.util.Arrays.copyOfRange(p2, 1, 33)).toUpperCase());
+        Tracer.traceDecision("fp2ComponentOrder", new Object[]{"expected", Sm9Math.P2[0][1],
+            "actual", Calc.hex(java.util.Arrays.copyOfRange(p2, 1, 33))},
+            Calc.hex(Calc.toBytes(Sm9Math.P2[0][1], 32)).toUpperCase()
+                .equals(Calc.hex(java.util.Arrays.copyOfRange(p2, 1, 33)).toUpperCase()), "encode",
+            "G2 点第 1 段是 x 的 u 分量（x₁ 在前）");
         BigInteger[][] back = Sm9Math.twistFromOctets(p2);
         // 为什么要"逐坐标相减再判零"而不是直接比数组：
         // (1) Java 数组的 equals 比的是引用，assertEquals 对 BigInteger[][] 比不出"值相等"
@@ -529,12 +641,23 @@ public class Sm9PairingEssenceTest
         Assert.assertTrue("G₂ 点往返必须落回同一点",
             Sm9Math.fp2IsZero(Sm9Math.fp2Sub(back[0], Sm9Math.P2[0]))
                 && Sm9Math.fp2IsZero(Sm9Math.fp2Sub(back[1], Sm9Math.P2[1])));
+        Tracer.traceDecision("roundTripG2", new Object[]{"backX", back[0], "backY", back[1]},
+            Sm9Math.fp2IsZero(Sm9Math.fp2Sub(back[0], Sm9Math.P2[0]))
+                && Sm9Math.fp2IsZero(Sm9Math.fp2Sub(back[1], Sm9Math.P2[1])), "encode",
+            "G2 点 129 字节往返落回同一点");
 
         // 标准样例：kex·P1 就是 GmSSL 的 hex_Ppube，顺带确认交换测试那把主公钥的字节序
         byte[] ppube = Sm9Math.pointToOctets(Sm9Math.encMasterPublicKey(HEX_KEX));
+        Tracer.trace("pointToOctetsPpube", new Object[]{"kex", HEX_KEX}, ppube, "encode");
         Assert.assertEquals("kex·P1 必须等于 GmSSL 的 hex_Ppube",
             ("04" + PPUBE_POINT).toLowerCase(), Calc.hex(ppube));
+        Tracer.traceDecision("ppubeOrder", new Object[]{"expected", ("04" + PPUBE_POINT).toLowerCase(),
+            "actual", Calc.hex(ppube)},
+            ("04" + PPUBE_POINT).toLowerCase().equals(Calc.hex(ppube)), "encode",
+            "kex·P1 == GmSSL hex_Ppube");
 
         log.info("[SM9-序列化] G₁ 65 字节 / G₂ 129 字节 / Fp12 384 字节，三种编排都能严格往返");
+        Tracer.trace("end", new Object[]{"g1_bytes", p1.length, "g2_bytes", p2.length},
+            "encodings verified", "end");
     }
 }

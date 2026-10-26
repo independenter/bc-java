@@ -8,7 +8,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.bouncycastle.asn1.gm.GMNamedCurves;
 import org.bouncycastle.asn1.x9.X9ECParameters;
 import org.bouncycastle.crypto.params.ECDomainParameters;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -54,6 +58,9 @@ import org.junit.Test;
 @Slf4j
 public class MultisigEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     // =====================================================================
     // 曲线常数（SM2 的 sm2p256v1）
     // =====================================================================
@@ -80,10 +87,13 @@ public class MultisigEssenceTest
      *   <li>P_agg 是公开的，任何人都可以用它验签</li>
      * </ol>
      */
+    @TraceExecution(value = "多重签名：n 方密钥对与聚合公钥", algorithm = "MULTISIG",
+        flow = "MULTISIG-CORE")
     @Test
     public void multisigKeyGeneration()
     {
         int n = 3; // 3 个参与方
+        Tracer.trace("start", new Object[]{"n", n}, "multisig key generation", "start");
 
         // 1. 每个参与方生成密钥对
         BigInteger[] d = new BigInteger[n];
@@ -108,6 +118,7 @@ public class MultisigEssenceTest
         log.info("[聚合] P_agg = ({}..., {}...)",
             pAgg[0].toString(16).substring(0, 8),
             pAgg[1].toString(16).substring(0, 8));
+        Tracer.trace("keyAgg", new Object[]{"n", n, "P_i", pubPoints}, pAgg, "keyAgg");
 
         // 3. 验证：P_agg = (d_1 + d_2 + d_3) · G
         BigInteger dSum = BigInteger.ZERO;
@@ -118,6 +129,9 @@ public class MultisigEssenceTest
         BigInteger[] pAggCheck = ecMul(dSum, GX, GY, P);
         Assert.assertArrayEquals("P_agg = Σ d_i · G", pAgg, pAggCheck);
         log.info("[验证] P_agg = (Σ d_i) · G ✓");
+        Tracer.trace("keyAgg.check", new Object[]{"P_agg", pAgg, "sumD_G", pAggCheck},
+            "P_agg == (Σ d_i)·G", "keyAgg");
+        Tracer.trace("end", new Object[]{"P_agg", pAgg}, null, "end");
     }
 
     // =====================================================================
@@ -136,10 +150,13 @@ public class MultisigEssenceTest
      *   <li>验证：用 P_agg 验签 (r, s_agg)</li>
      * </ol>
      */
+    @TraceExecution(value = "多重签名：nonce 生成、部分签名与聚合", algorithm = "MULTISIG",
+        flow = "MULTISIG-CORE")
     @Test
     public void multisigSigningProcess()
     {
         int n = 3;
+        Tracer.trace("start", new Object[]{"n", n}, "multisig", "start");
 
         // 1. 生成密钥对
         BigInteger[] d = new BigInteger[n];
@@ -156,6 +173,7 @@ public class MultisigEssenceTest
         {
             pAgg = ecAdd(pAgg, pubPoints[i]);
         }
+        Tracer.trace("keyAgg", new Object[]{"P_agg", pAgg}, pAgg, "keyAgg");
 
         // 3. 待签消息
         byte[] message = "Multisig message".getBytes();
@@ -170,6 +188,9 @@ public class MultisigEssenceTest
             rPoint[0].toString(16).substring(0, 8),
             rPoint[1].toString(16).substring(0, 8));
         log.info("[签名] r = {}...", r.toString(16).substring(0, 8));
+        Tracer.traceLoop("nonceGen", new Object[]{"k", k, "R", rPoint}, rPoint,
+            "nonceGen", 1, 1, "nonceGen");
+        Tracer.trace("nonceAgg", new Object[]{"r", r}, r, "nonceAgg");
 
         // 5. 每个参与方计算局部签名
         // 关键：e 要被 n 方分摊，否则聚合后 e 会被加 n 次
@@ -182,7 +203,11 @@ public class MultisigEssenceTest
             sPartial[i] = kInv.multiply(eSplit.add(r.multiply(d[i]))).mod(N);
             log.info("[参与方 {}] 局部签名 s_{} = {}...", i + 1, i + 1,
                 sPartial[i].toString(16).substring(0, 8));
+            Tracer.traceLoop("partialSig", new Object[]{"participant", i + 1,
+                "d_i", d[i], "eSplit", eSplit}, sPartial[i], "partialSig",
+                i + 1, n, "partialSig");
         }
+        Tracer.trace("partialSig", new Object[]{"sPartial", sPartial}, sPartial, "partialSig");
 
         // 6. 聚合签名：s_agg = Σ s_i mod n
         BigInteger sAgg = BigInteger.ZERO;
@@ -191,11 +216,14 @@ public class MultisigEssenceTest
             sAgg = sAgg.add(sPartial[i]).mod(N);
         }
         log.info("[聚合] s_agg = {}...", sAgg.toString(16).substring(0, 8));
+        Tracer.trace("sigAgg", new Object[]{"sAgg", sAgg}, sAgg, "sigAgg");
 
         // 7. 验证：用 P_agg 验签 (r, s_agg)
         boolean valid = ecdsaVerify(pAgg, e, r, sAgg);
         log.info("[验证] 多重签名验签: {}", valid ? "通过 ✓" : "失败");
         Assert.assertTrue("多重签名验签通过", valid);
+        Tracer.traceDecision("verify", new Object[]{"r", r, "sAgg", sAgg}, valid, "verify",
+            "聚合签名对 P_agg 验签通过");
 
         // 8. 对比：聚合签名等价于用 Σ d_i 直接签名
         BigInteger dSum = BigInteger.ZERO;
@@ -207,15 +235,19 @@ public class MultisigEssenceTest
         BigInteger sDirect = kInv.multiply(e.add(r.multiply(dSum))).mod(N);
         Assert.assertEquals("聚合签名 = 直接签名", sDirect, sAgg);
         log.info("[对比] 聚合签名 ≡ 用 Σ d_i 直接签名 ✓");
+        Tracer.trace("end", new Object[]{"sAgg", sAgg, "sDirect", sDirect}, "multisig", "end");
     }
 
     /**
      * <b>多重签名的安全性</b>：必须所有 n 方都参与，少一方验签失败。
      */
+    @TraceExecution(value = "多重签名协同性：缺少一方验签失败", algorithm = "MULTISIG",
+        flow = "MULTISIG-CORE")
     @Test
     public void multisigRequiresAllParties()
     {
         int n = 3;
+        Tracer.trace("start", new Object[]{"n", n}, "multisig requires all parties", "start");
 
         // 1. 生成密钥对
         BigInteger[] d = new BigInteger[n];
@@ -232,6 +264,7 @@ public class MultisigEssenceTest
         {
             pAgg = ecAdd(pAgg, pubPoints[i]);
         }
+        Tracer.trace("keyAgg", new Object[]{"n", n, "P_i", pubPoints}, pAgg, "keyAgg");
 
         // 3. 待签消息
         byte[] message = "Test".getBytes();
@@ -242,6 +275,9 @@ public class MultisigEssenceTest
         BigInteger[] rPoint = ecMul(k, GX, GY, P);
         BigInteger r = rPoint[0].mod(N);
         BigInteger kInv = k.modInverse(N);
+        Tracer.traceLoop("nonceGen", new Object[]{"k", k, "R", rPoint}, rPoint,
+            "nonceGen", 1, 1, "nonceGen");
+        Tracer.trace("nonceAgg", new Object[]{"r", r}, r, "nonceAgg");
 
         // 5. 只有 2 方签名（< n=3）
         BigInteger sPartial = BigInteger.ZERO;
@@ -249,20 +285,29 @@ public class MultisigEssenceTest
         {
             BigInteger si = kInv.multiply(e.add(r.multiply(d[i]))).mod(N);
             sPartial = sPartial.add(si).mod(N);
+            Tracer.traceLoop("partialSig", new Object[]{"participant", i + 1, "d_i", d[i]},
+                si, "partialSig", i + 1, n, "partialSig");
         }
+        Tracer.trace("sigAgg", new Object[]{"participants", 2, "s", sPartial}, sPartial, "sigAgg");
 
         // 6. 验签：应该失败
         boolean valid = ecdsaVerify(pAgg, e, r, sPartial);
         log.info("[协同性] 2 方（< n=3）签名验签: {}", valid ? "通过（错误！）" : "失败 ✓");
         Assert.assertFalse("少于 n 方签不出合法多重签名", valid);
+        Tracer.traceDecision("verify", new Object[]{"participants", 2, "n", n,
+            "s", sPartial}, valid, "verify", "少于 n 方验签必须失败");
+        Tracer.trace("end", new Object[]{"participants", 2, "n", n, "s", sPartial}, null, "end");
     }
 
     /**
      * <b>多重签名 vs 门限签名</b>：对比两者的区别。
      */
+    @TraceExecution(value = "多重签名 vs 门限签名：参与门槛与签名长度", algorithm = "MULTISIG",
+        flow = "MULTISIG-CORE")
     @Test
     public void compareMultisigAndThreshold()
     {
+        Tracer.trace("start", new Object[]{"schemeA", "multisig", "schemeB", "threshold"}, null, "start");
         log.info("[对比] 多重签名 vs 门限签名");
         log.info("[多重签名] n-of-n：所有 n 方都必须参与，少一方不行");
         log.info("[多重签名] 聚合公钥 P_agg = Σ P_i，聚合签名 s_agg = Σ s_i");
@@ -273,6 +318,15 @@ public class MultisigEssenceTest
         log.info("[门限签名] 签名长度 = 单方签名长度（与门限值 t 无关）");
         log.info("");
         log.info("[结论] 多重签名简单但要求所有方在线；门限签名灵活但需要秘密共享");
+        Tracer.trace("keyAgg", new Object[]{"multisig", "P_agg = Σ P_i", "threshold", "公钥由密钥份额导出"},
+            "P_agg", "keyAgg");
+        Tracer.trace("partialSig", new Object[]{"multisig", "n 方全部参与", "threshold", "任意 t 方参与"},
+            "partial signature", "partialSig");
+        Tracer.trace("sigAgg", new Object[]{"multisig", "s_agg = Σ s_i", "threshold", "σ = Σ λᵢ·σᵢ"},
+            "single-size signature", "sigAgg");
+        Tracer.traceDecision("verify", new Object[]{"multisig", "P_agg", "threshold", "完整公钥"},
+            true, "verify", "两者都可用一把公钥验证单方长度的签名");
+        Tracer.trace("end", new Object[]{"schemes", 2}, null, "end");
     }
 
     // =====================================================================

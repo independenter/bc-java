@@ -8,7 +8,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.bouncycastle.asn1.gm.GMNamedCurves;
 import org.bouncycastle.asn1.x9.X9ECParameters;
 import org.bouncycastle.crypto.params.ECDomainParameters;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -70,6 +74,9 @@ import org.junit.Test;
 @Slf4j
 public class ThresholdEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     // =====================================================================
     // 曲线常数（SM2 的 sm2p256v1）
     // =====================================================================
@@ -94,11 +101,14 @@ public class ThresholdEssenceTest
      *
      * <p>本测试用 (3, 5)-门限演示：5 份里任意 3 份可恢复秘密。
      */
+    @TraceExecution(value = "Shamir 秘密共享：多项式切割与份额分发", algorithm = "THRESHOLD",
+        flow = "THRESHOLD-SHAMIR")
     @Test
     public void shamirSecretSharingSplit()
     {
         int t = 3; // 门限值
         int n = 5; // 总份额数
+        Tracer.trace("start", new Object[]{"t", t, "n", n}, "Shamir split", "start");
 
         // 秘密 s：一个 256-bit 随机数
         BigInteger secret = new BigInteger(256, new SecureRandom()).mod(P);
@@ -112,6 +122,7 @@ public class ThresholdEssenceTest
             coeffs[i] = new BigInteger(256, new SecureRandom()).mod(P);
         }
         log.info("[SSS 切割] 多项式次数 = {}（需要 {} 份恢复）", t - 1, t);
+        Tracer.trace("split", new Object[]{"t", t, "coeffs", coeffs, "modulus", P}, coeffs, "split");
 
         // 2. 在 x = 1, 2, …, n 处求值，得到 n 个份额
         BigInteger[] shares = new BigInteger[n];
@@ -124,11 +135,15 @@ public class ThresholdEssenceTest
             shares[0].toString(16).substring(0, 8),
             shares[1].toString(16).substring(0, 8),
             shares[4].toString(16).substring(0, 8));
+        Tracer.trace("distribute", new Object[]{"n", n, "shares", shares}, shares, "distribute");
 
         // 3. 验证：f(0) = s（常数项就是秘密）
         BigInteger f0 = polyEval(coeffs, BigInteger.ZERO, P);
         Assert.assertEquals("f(0) = 秘密", secret, f0);
         log.info("[SSS 切割] f(0) = {}... ✓", f0.toString(16).substring(0, 16));
+        Tracer.traceDecision("verify", new Object[]{"secret", secret, "f(0)", f0},
+            secret.equals(f0), "verify", "f(0) == s");
+        Tracer.trace("end", new Object[]{"secret", secret, "f(0)", f0}, null, "end");
     }
 
     /**
@@ -139,11 +154,14 @@ public class ThresholdEssenceTest
      *
      * <p>本测试演示：从 5 份里任选 3 份恢复，结果与原始秘密逐字节相同。
      */
+    @TraceExecution(value = "Shamir 秘密共享：拉格朗日插值恢复", algorithm = "THRESHOLD",
+        flow = "THRESHOLD-SHAMIR")
     @Test
     public void shamirSecretSharingRecover()
     {
         int t = 3;
         int n = 5;
+        Tracer.trace("start", new Object[]{"t", t, "n", n}, "Shamir recover", "start");
 
         // 1. 先切割
         BigInteger secret = new BigInteger(256, new SecureRandom()).mod(P);
@@ -153,11 +171,13 @@ public class ThresholdEssenceTest
         {
             coeffs[i] = new BigInteger(256, new SecureRandom()).mod(P);
         }
+        Tracer.trace("split", new Object[]{"t", t, "coeffs", coeffs, "modulus", P}, coeffs, "split");
         BigInteger[] shares = new BigInteger[n];
         for (int i = 0; i < n; i++)
         {
             shares[i] = polyEval(coeffs, BigInteger.valueOf(i + 1), P);
         }
+        Tracer.trace("distribute", new Object[]{"n", n, "shares", shares}, shares, "distribute");
 
         // 2. 用前 t 份恢复（x = 1, 2, 3）
         int[] indices = {0, 1, 2}; // 选第 1、2、3 份
@@ -172,6 +192,10 @@ public class ThresholdEssenceTest
         log.info("[SSS 恢复] 用份额 {} 恢复: {}...", Arrays.toString(indices),
             recovered.toString(16).substring(0, 16));
         Assert.assertEquals("恢复的秘密 = 原始秘密", secret, recovered);
+        Tracer.trace("recover", new Object[]{"indices", Arrays.toString(indices), "shares", selectedShares},
+            recovered, "recover");
+        Tracer.traceDecision("verify", new Object[]{"secret", secret, "recovered", recovered},
+            secret.equals(recovered), "verify", "t 份恢复 == 原始秘密");
 
         // 3. 用另外 t 份恢复（x = 2, 4, 5）
         int[] indices2 = {1, 3, 4};
@@ -186,6 +210,10 @@ public class ThresholdEssenceTest
         log.info("[SSS 恢复] 用份额 {} 恢复: {}...", Arrays.toString(indices2),
             recovered2.toString(16).substring(0, 16));
         Assert.assertEquals("任意 t 份都能恢复", secret, recovered2);
+        Tracer.trace("recover", new Object[]{"indices", Arrays.toString(indices2), "shares", selectedShares2},
+            recovered2, "recover");
+        Tracer.traceDecision("verify", new Object[]{"secret", secret, "recovered", recovered2},
+            secret.equals(recovered2), "verify", "任意 t 份恢复 == 原始秘密");
 
         // 4. 用 t−1 份恢复：结果不等于秘密（信息论安全）
         int[] indices3 = {0, 1}; // 只有 2 份 < t = 3
@@ -200,6 +228,12 @@ public class ThresholdEssenceTest
         log.info("[SSS 恢复] 用 {} 份（< t）恢复: {}... ≠ 秘密",
             2, wrongRecovered.toString(16).substring(0, 16));
         Assert.assertFalse("少于 t 份恢复不出秘密", secret.equals(wrongRecovered));
+        Tracer.trace("recover", new Object[]{"indices", Arrays.toString(indices3), "shares", selectedShares3},
+            wrongRecovered, "recover");
+        Tracer.traceDecision("verify", new Object[]{"secret", secret, "recovered", wrongRecovered},
+            secret.equals(wrongRecovered), "verify", "t−1 份恢复 != 原始秘密");
+        Tracer.trace("security", new Object[]{"threshold", t, "parts", 2}, "insufficient shares", "security");
+        Tracer.trace("end", new Object[]{"secret", secret, "wrongRecovered", wrongRecovered}, null, "end");
     }
 
     /**
@@ -210,17 +244,21 @@ public class ThresholdEssenceTest
      *
      * <p>本测试用统计方法验证：固定 t−1 份，枚举所有可能的第 t 份，恢复出的秘密均匀分布。
      */
+    @TraceExecution(value = "Shamir 秘密共享：t−1 份信息论安全", algorithm = "THRESHOLD",
+        flow = "THRESHOLD-SHAMIR")
     @Test
     public void shamirIsInformationTheoreticallySecure()
     {
         int t = 2; // 简化：2-of-n 门限
         int n = 3;
+        Tracer.trace("start", new Object[]{"t", t, "n", n}, "information-theoretic security", "start");
 
         // 固定秘密和多项式
         BigInteger secret = BigInteger.valueOf(42);
         BigInteger[] coeffs = new BigInteger[t];
         coeffs[0] = secret;
         coeffs[1] = BigInteger.valueOf(7); // f(x) = 42 + 7x (mod p)
+        Tracer.trace("split", new Object[]{"t", t, "coeffs", coeffs, "modulus", P}, coeffs, "split");
 
         // 计算份额
         BigInteger[] shares = new BigInteger[n];
@@ -228,6 +266,7 @@ public class ThresholdEssenceTest
         {
             shares[i] = polyEval(coeffs, BigInteger.valueOf(i + 1), P);
         }
+        Tracer.trace("distribute", new Object[]{"n", n, "shares", shares}, shares, "distribute");
 
         // 只拿第 1 份（x=1, y=f(1)=49），尝试用不同的"第 2 份"恢复
         BigInteger x1 = BigInteger.ONE;
@@ -248,6 +287,8 @@ public class ThresholdEssenceTest
         log.info("[信息论安全] 用不同'第 2 份'恢复的秘密: {}, {}, {}, {}, {}",
             recoveredSecrets[0], recoveredSecrets[1], recoveredSecrets[2],
             recoveredSecrets[3], recoveredSecrets[4]);
+        Tracer.trace("recover", new Object[]{"knownShare", shares[0], "trials", recoveredSecrets.length},
+            recoveredSecrets, "recover");
 
         // 验证：恢复出的秘密各不相同（说明 1 份对秘密没有约束力）
         boolean allDifferent = true;
@@ -261,6 +302,11 @@ public class ThresholdEssenceTest
         }
         Assert.assertTrue("1 份（< t=2）恢复出的秘密各不相同", allDifferent);
         log.info("[信息论安全] 结论：少于 t 份 ⇒ 秘密完全不确定 ⇒ 信息论安全 ✓");
+        Tracer.traceDecision("verify", new Object[]{"knownShares", 1, "threshold", t},
+            allDifferent, "verify", "t−1 份恢复出的秘密各不相同");
+        Tracer.trace("security", new Object[]{"threshold", t, "knownShares", 1},
+            allDifferent, "security");
+        Tracer.trace("end", new Object[]{"threshold", t, "recoveredSecrets", recoveredSecrets}, null, "end");
     }
 
     // =====================================================================
@@ -277,11 +323,14 @@ public class ThresholdEssenceTest
      *
      * <p>本测试演示 (2, 3)-门限 ECDSA：3 方里任意 2 方协同可签名。
      */
+    @TraceExecution(value = "门限 ECDSA 签名：局部签名与拉格朗日合成", algorithm = "THRESHOLD",
+        flow = "THRESHOLD-ECDSA")
     @Test
     public void thresholdEcdsaSignature()
     {
         int t = 2; // 门限值
         int n = 3; // 总参与方数
+        Tracer.trace("start", new Object[]{"t", t, "n", n}, "threshold ECDSA", "start");
 
         // 1. 密钥生成：随机私钥 d，公钥 P = d·G
         BigInteger d = new BigInteger(256, new SecureRandom()).mod(N);
@@ -290,6 +339,7 @@ public class ThresholdEssenceTest
         log.info("[门限签名] 公钥 P = ({}..., {}...)",
             pubPoint[0].toString(16).substring(0, 8),
             pubPoint[1].toString(16).substring(0, 8));
+        Tracer.trace("setup", new Object[]{"d", d, "P", pubPoint}, pubPoint, "setup");
 
         // 2. 用 SSS 把 d 切成 n 份（mod n，不是 mod p！因为签名运算在 Z/nZ 里）
         BigInteger[] dShares = new BigInteger[n];
@@ -307,6 +357,7 @@ public class ThresholdEssenceTest
             dShares[0].toString(16).substring(0, 8),
             dShares[1].toString(16).substring(0, 8),
             dShares[2].toString(16).substring(0, 8));
+        Tracer.trace("keyDist", new Object[]{"dShares", dShares}, dShares, "keyDist");
 
         // 3. 签名：选 t=2 个参与方（第 1 方和第 3 方）
         int[] signers = {0, 2}; // 参与方索引
@@ -335,7 +386,11 @@ public class ThresholdEssenceTest
             partialSigs[idx] = lagrangeCoeffs[idx].multiply(kInv).multiply(e_plus_rd).mod(N);
             log.info("[门限签名] 参与方 {} 的局部签名 s_{} = {}...",
                 i + 1, i + 1, partialSigs[idx].toString(16).substring(0, 8));
+            Tracer.traceLoop("partialSign", new Object[]{"participant", i + 1,
+                "share", dShares[i], "lambda", lagrangeCoeffs[idx]},
+                partialSigs[idx], "partialSign", idx + 1, signers.length, "partialSign");
         }
+        Tracer.trace("partialSign", new Object[]{"partialSigs", partialSigs}, partialSigs, "partialSign");
 
         // 3c. 合成完整签名：s = Σ s_i mod n
         BigInteger s = BigInteger.ZERO;
@@ -344,16 +399,19 @@ public class ThresholdEssenceTest
             s = s.add(ps).mod(N);
         }
         log.info("[门限签名] 合成签名 s = {}...", s.toString(16).substring(0, 8));
+        Tracer.trace("combine", new Object[]{"s", s}, s, "combine");
 
         // 4. 验证：用公钥 P 验签 (r, s)
         boolean valid = ecdsaVerify(pubPoint, message, r, s);
         log.info("[门限签名] 验签结果: {}", valid ? "通过" : "失败");
         Assert.assertTrue("门限签名验签通过", valid);
+        Tracer.traceDecision("verify", new Object[]{"r", r, "s", s}, valid, "verify", "门限签名验签通过");
 
         // 5. 对比：用完整私钥 d 直接签名，结果应该相同
         BigInteger sDirect = kInv.multiply(message.add(r.multiply(d))).mod(N);
         log.info("[对比] 直接签名 s = {}...", sDirect.toString(16).substring(0, 8));
         Assert.assertEquals("门限签名 = 直接签名", sDirect, s);
+        Tracer.trace("end", new Object[]{"s", s, "sDirect", sDirect}, "threshold ECDSA", "end");
     }
 
     /**
@@ -365,11 +423,14 @@ public class ThresholdEssenceTest
      *
      * <p>本测试验证这个关键等式。
      */
+    @TraceExecution(value = "门限签名安全归约：Σ λᵢ·dᵢ = d", algorithm = "THRESHOLD",
+        flow = "THRESHOLD-ECDSA")
     @Test
     public void thresholdSignatureSecurityReduction()
     {
         int t = 3;
         int n = 5;
+        Tracer.trace("start", new Object[]{"t", t, "n", n}, "threshold security reduction", "start");
 
         // 1. 生成私钥和份额
         BigInteger d = new BigInteger(256, new SecureRandom()).mod(N);
@@ -384,6 +445,8 @@ public class ThresholdEssenceTest
         {
             dShares[i] = polyEval(coeffs, BigInteger.valueOf(i + 1), N);
         }
+        Tracer.trace("setup", new Object[]{"d", d, "coeffs", coeffs}, d, "setup");
+        Tracer.trace("keyDist", new Object[]{"n", n, "dShares", dShares}, dShares, "keyDist");
 
         // 2. 选 t 个参与方，计算拉格朗日系数
         int[] signers = {0, 2, 4}; // 第 1、3、5 方
@@ -395,13 +458,20 @@ public class ThresholdEssenceTest
         {
             int i = signers[idx];
             reconstructed = reconstructed.add(lambdas[idx].multiply(dShares[i])).mod(N);
+            Tracer.traceLoop("lagrangeTerm", new Object[]{"participant", i + 1,
+                "share", dShares[i], "lambda", lambdas[idx]},
+                lambdas[idx].multiply(dShares[i]).mod(N), "partialSign",
+                idx + 1, signers.length, "partialSign");
         }
         log.info("[安全归约] Σ λ_i · d_i = {}...", reconstructed.toString(16).substring(0, 16));
         log.info("[安全归约] d = {}...", d.toString(16).substring(0, 16));
         Assert.assertEquals("拉格朗日合成恢复私钥", d, reconstructed);
+        Tracer.trace("combine", new Object[]{"d", d, "reconstructed", reconstructed},
+            reconstructed, "combine");
 
         // 4. 结论：门限签名的安全性归约到 ECDSA —— 如果 ECDSA 安全，门限 ECDSA 也安全
         log.info("[安全归约] 结论：门限签名 ≡ 完整签名 ⇒ 安全性归约到 ECDSA ✓");
+        Tracer.trace("end", new Object[]{"d", d, "reconstructed", reconstructed}, null, "end");
     }
 
     /**
@@ -409,11 +479,14 @@ public class ThresholdEssenceTest
      *
      * <p>本测试演示：2 方（< t=3）尝试签名，验签失败。
      */
+    @TraceExecution(value = "门限签名协同性：少于 t 方签不出合法签名", algorithm = "THRESHOLD",
+        flow = "THRESHOLD-ECDSA")
     @Test
     public void thresholdSignatureRequiresTParties()
     {
         int t = 3;
         int n = 5;
+        Tracer.trace("start", new Object[]{"t", t, "n", n}, "threshold requires t parties", "start");
 
         // 1. 生成私钥和份额
         BigInteger d = new BigInteger(256, new SecureRandom()).mod(N);
@@ -429,6 +502,8 @@ public class ThresholdEssenceTest
         {
             dShares[i] = polyEval(coeffs, BigInteger.valueOf(i + 1), N);
         }
+        Tracer.trace("setup", new Object[]{"d", d, "P", pubPoint}, pubPoint, "setup");
+        Tracer.trace("keyDist", new Object[]{"n", n, "dShares", dShares}, dShares, "keyDist");
 
         // 2. 只有 2 方尝试签名（< t=3）
         int[] insufficientSigners = {0, 1};
@@ -446,13 +521,20 @@ public class ThresholdEssenceTest
             BigInteger e_plus_rd = message.add(r.multiply(dShares[i])).mod(N);
             BigInteger partialSig = lambdas[idx].multiply(kInv).multiply(e_plus_rd).mod(N);
             sPartial = sPartial.add(partialSig).mod(N);
+            Tracer.traceLoop("partialSign", new Object[]{"participant", i + 1,
+                "share", dShares[i], "lambda", lambdas[idx]},
+                partialSig, "partialSign", idx + 1, t, "partialSign");
         }
+        Tracer.trace("combine", new Object[]{"signers", insufficientSigners.length, "s", sPartial},
+            sPartial, "combine");
 
         // 3. 验签：应该失败
         boolean valid = ecdsaVerify(pubPoint, message, r, sPartial);
         log.info("[协同性] {} 方（< t={}）签名验签: {}",
             insufficientSigners.length, t, valid ? "通过（错误！）" : "失败 ✓");
         Assert.assertFalse("少于 t 方签不出合法签名", valid);
+        Tracer.traceDecision("verify", new Object[]{"signers", insufficientSigners.length,
+            "threshold", t, "s", sPartial}, valid, "verify", "少于 t 方验签必须失败");
 
         // 4. 对比：3 方（= t）签名，验签通过
         int[] sufficientSigners = {0, 1, 2};
@@ -464,11 +546,19 @@ public class ThresholdEssenceTest
             BigInteger e_plus_rd = message.add(r.multiply(dShares[i])).mod(N);
             BigInteger partialSig = lambdasFull[idx].multiply(kInv).multiply(e_plus_rd).mod(N);
             sFull = sFull.add(partialSig).mod(N);
+            Tracer.traceLoop("partialSign", new Object[]{"participant", i + 1,
+                "share", dShares[i], "lambda", lambdasFull[idx]},
+                partialSig, "partialSign", idx + 1, sufficientSigners.length, "partialSign");
         }
+        Tracer.trace("combine", new Object[]{"signers", sufficientSigners.length, "s", sFull},
+            sFull, "combine");
         boolean validFull = ecdsaVerify(pubPoint, message, r, sFull);
         log.info("[协同性] {} 方（= t）签名验签: {}",
             sufficientSigners.length, validFull ? "通过 ✓" : "失败（错误！）");
         Assert.assertTrue("t 方协同可签出合法签名", validFull);
+        Tracer.traceDecision("verify", new Object[]{"signers", sufficientSigners.length,
+            "threshold", t, "s", sFull}, validFull, "verify", "t 方协同验签必须通过");
+        Tracer.trace("end", new Object[]{"sPartial", sPartial, "sFull", sFull}, null, "end");
     }
 
     // =====================================================================

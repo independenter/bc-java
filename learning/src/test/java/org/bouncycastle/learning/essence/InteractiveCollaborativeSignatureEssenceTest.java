@@ -9,7 +9,11 @@ import org.bouncycastle.asn1.gm.GMNamedCurves;
 import org.bouncycastle.asn1.x9.X9ECParameters;
 import org.bouncycastle.crypto.digests.SM3Digest;
 import org.bouncycastle.crypto.params.ECDomainParameters;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -76,6 +80,9 @@ import org.junit.Test;
 @Slf4j
 public class InteractiveCollaborativeSignatureEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     // =====================================================================
     // 曲线常数（SM2 的 sm2p256v1）
     // =====================================================================
@@ -104,10 +111,13 @@ public class InteractiveCollaborativeSignatureEssenceTest
      *
      * <p>关键点：私钥 d_i 永远不离开本地（不像门限签名需要切割和重构）。
      */
+    @TraceExecution(value = "协同签名：本地密钥对与聚合公钥", algorithm = "INTERACTIVE",
+        flow = "INTERACTIVE-CORE")
     @Test
     public void collaborativeKeyGeneration()
     {
         int n = 2; // 2 个参与方
+        Tracer.trace("start", new Object[]{"n", n}, "collaborative key generation", "start");
 
         // 1. 每个参与方生成密钥对
         BigInteger[] d = new BigInteger[n];
@@ -132,6 +142,8 @@ public class InteractiveCollaborativeSignatureEssenceTest
         log.info("[聚合] P_agg = ({}..., {}...)",
             pAgg[0].toString(16).substring(0, 8),
             pAgg[1].toString(16).substring(0, 8));
+        Tracer.trace("setup.keygen", new Object[]{"n", n, "P_i", pubPoints}, pubPoints, "setup");
+        Tracer.trace("setup.keyAgg", new Object[]{"P_i", pubPoints}, pAgg, "setup");
 
         // 3. 验证：P_agg = (d_1 + d_2) · G
         BigInteger dSum = d[0].add(d[1]).mod(N);
@@ -139,6 +151,9 @@ public class InteractiveCollaborativeSignatureEssenceTest
         Assert.assertArrayEquals("P_agg = (d_1 + d_2) · G", pAgg, pAggCheck);
         log.info("[验证] P_agg = (Σ d_i) · G ✓");
         log.info("[安全] 私钥 d_i 永远不离开本地，只有公钥 P_i 被广播");
+        Tracer.trace("setup.check", new Object[]{"P_agg", pAgg, "sumD_G", pAggCheck},
+            "P_agg == (Σ d_i)·G", "setup");
+        Tracer.trace("end", new Object[]{"P_agg", pAgg}, null, "end");
     }
 
     // =====================================================================
@@ -170,10 +185,13 @@ public class InteractiveCollaborativeSignatureEssenceTest
      *   <li>承诺 R_i 必须先广播，再计算挑战 e（防止 k_i 被操控）</li>
      * </ul>
      */
+    @TraceExecution(value = "交互式协同签名：承诺、挑战、响应与合成", algorithm = "INTERACTIVE",
+        flow = "INTERACTIVE-CORE")
     @Test
     public void interactiveCollaborativeSigning()
     {
         int n = 2;
+        Tracer.trace("start", new Object[]{"n", n}, "interactive collaborative", "start");
 
         // 0. 准备密钥对
         BigInteger[] d = new BigInteger[n];
@@ -188,6 +206,7 @@ public class InteractiveCollaborativeSignatureEssenceTest
         {
             pAgg = ecAdd(pAgg, pubPoints[i]);
         }
+        Tracer.trace("setup", new Object[]{"P_agg", pAgg}, pAgg, "setup");
 
         // 待签消息
         byte[] message = "Collaborative signature".getBytes();
@@ -222,6 +241,7 @@ public class InteractiveCollaborativeSignatureEssenceTest
         log.info("[聚合] R = ({}..., {}...)",
             R[0].toString(16).substring(0, 8),
             R[1].toString(16).substring(0, 8));
+        Tracer.trace("round1", new Object[]{"R", R, "rPoints", rPoints}, R, "round1");
 
         // =================================================================
         // 第 2 轮：响应（Response）
@@ -232,6 +252,7 @@ public class InteractiveCollaborativeSignatureEssenceTest
         // 所有方计算挑战 e = SM3(R ‖ P_agg ‖ m)
         BigInteger e = computeChallenge(R, pAgg, message);
         log.info("[挑战] e = SM3(R ‖ P_agg ‖ m) = {}...", e.toString(16).substring(0, 16));
+        Tracer.trace("round2", new Object[]{"R", R, "P_agg", pAgg, "message", message}, e, "round2");
 
         // 每个参与方计算响应 s_i = k_i + e · d_i mod n（私钥 d_i 本地使用）
         BigInteger[] sPartial = new BigInteger[n];
@@ -242,6 +263,7 @@ public class InteractiveCollaborativeSignatureEssenceTest
                 i + 1, i + 1, sPartial[i].toString(16).substring(0, 8));
             log.info("[参与方 {}] 私钥 d_{} 始终在本地，未广播 ✓", i + 1, i + 1);
         }
+        Tracer.trace("round3", new Object[]{"e", e, "sPartial", sPartial}, sPartial, "round3");
 
         // 聚合签名值：s = s_1 + s_2 mod n
         BigInteger s = BigInteger.ZERO;
@@ -250,6 +272,7 @@ public class InteractiveCollaborativeSignatureEssenceTest
             s = s.add(sPartial[i]).mod(N);
         }
         log.info("[聚合] s = s_1 + s_2 = {}...", s.toString(16).substring(0, 8));
+        Tracer.trace("combine", new Object[]{"s", s}, s, "combine");
 
         // =================================================================
         // 验证：s · G == R + e · P_agg
@@ -260,10 +283,13 @@ public class InteractiveCollaborativeSignatureEssenceTest
         boolean valid = schnorrVerify(pAgg, message, R, s);
         log.info("[验证] s · G == R + e · P_agg: {}", valid ? "通过 ✓" : "失败");
         Assert.assertTrue("协同签名验签通过", valid);
+        Tracer.traceDecision("verify", new Object[]{"R", R, "s", s}, valid, "verify",
+            "s·G == R + e·P_agg");
 
         // 签名 = (R, s)，与单方 Schnorr 签名格式完全一致
         log.info("[签名] 协同签名 = (R, s)，长度与单方签名相同");
         log.info("[安全] 整个过程中私钥 d_i 永远不离开本地");
+        Tracer.trace("end", new Object[]{"R", R, "s", s}, "interactive collaborative", "end");
     }
 
     // =====================================================================
@@ -273,10 +299,13 @@ public class InteractiveCollaborativeSignatureEssenceTest
     /**
      * <b>协同签名的安全性</b>：缺少任意一方的承诺或响应，验签失败。
      */
+    @TraceExecution(value = "协同签名协同性：缺少一方承诺或响应验签失败", algorithm = "INTERACTIVE",
+        flow = "INTERACTIVE-CORE")
     @Test
     public void collaborativeSignatureRequiresAllParties()
     {
         int n = 2;
+        Tracer.trace("start", new Object[]{"n", n}, "collaborative requires all parties", "start");
 
         // 0. 准备密钥对
         BigInteger[] d = new BigInteger[n];
@@ -291,31 +320,43 @@ public class InteractiveCollaborativeSignatureEssenceTest
         {
             pAgg = ecAdd(pAgg, pubPoints[i]);
         }
+        Tracer.trace("setup", new Object[]{"n", n, "P_i", pubPoints}, pAgg, "setup");
 
         byte[] message = "Test".getBytes();
 
         // 1. 只有第 1 方生成承诺（缺少第 2 方）
         BigInteger k1 = new BigInteger(256, new SecureRandom()).mod(N);
         BigInteger[] R1 = ecMul(k1, GX, GY, P);
+        Tracer.trace("round1", new Object[]{"participant", 1, "k_1", k1, "R_1", R1},
+            R1, "round1");
 
         // 2. 用 R1 代替 R（没有聚合第 2 方的承诺）
         BigInteger e = computeChallenge(R1, pAgg, message);
+        Tracer.trace("round2", new Object[]{"R", R1, "P_agg", pAgg, "message", message}, e, "round2");
 
         // 3. 只有第 1 方计算响应
         BigInteger s1 = k1.add(e.multiply(d[0])).mod(N);
+        Tracer.trace("round3", new Object[]{"participant", 1, "e", e, "s_1", s1}, s1, "round3");
+        Tracer.trace("combine", new Object[]{"participants", 1, "s", s1}, s1, "combine");
 
         // 4. 验签：应该失败（因为 R ≠ R1 + R2）
         boolean valid = schnorrVerify(pAgg, message, R1, s1);
         log.info("[协同性] 只有 1 方（< n=2）参与，验签: {}", valid ? "通过（错误！）" : "失败 ✓");
         Assert.assertFalse("少于 n 方签不出合法协同签名", valid);
+        Tracer.traceDecision("verify", new Object[]{"participants", 1, "n", n, "R", R1, "s", s1},
+            valid, "verify", "缺少一方承诺或响应时验签必须失败");
+        Tracer.trace("end", new Object[]{"participants", 1, "n", n}, null, "end");
     }
 
     /**
      * <b>三种"多方签名"方案对比</b>：门限签名 vs 多重签名 vs 交互式协同签名。
      */
+    @TraceExecution(value = "门限 / 多重 / 交互式协同签名对比", algorithm = "INTERACTIVE",
+        flow = "INTERACTIVE-CORE")
     @Test
     public void compareThreeSchemes()
     {
+        Tracer.trace("start", new Object[]{"schemes", "threshold,multisig,interactive"}, null, "start");
         log.info("[对比] 门限签名 vs 多重签名 vs 交互式协同签名");
         log.info("");
         log.info("[门限签名 (t, n)]");
@@ -340,6 +381,20 @@ public class InteractiveCollaborativeSignatureEssenceTest
         log.info("  - 灵活性：门限签名 > 多重签名 = 交互式协同签名");
         log.info("  - 安全性：交互式协同签名 > 门限签名 > 多重签名");
         log.info("  - 通信轮数：门限签名(1轮) < 多重签名(1轮) < 交互式协同签名(2轮)");
+        Tracer.trace("setup", new Object[]{"threshold", "Shamir 秘密共享 n 份",
+            "multisig", "各自密钥对 + P_agg", "interactive", "本地密钥对 + P_agg"},
+            "key material", "setup");
+        Tracer.trace("round1", new Object[]{"threshold", "无承诺轮", "multisig", "共用 k，无独立承诺",
+            "interactive", "各自承诺 R_i"}, "commitment", "round1");
+        Tracer.trace("round2", new Object[]{"threshold", "无挑战轮", "multisig", "无挑战轮",
+            "interactive", "e = SM3(R‖P_agg‖m)"}, "challenge", "round2");
+        Tracer.trace("round3", new Object[]{"threshold", "局部签名 σ_i", "multisig", "局部签名 s_i",
+            "interactive", "响应 s_i = k_i + e·d_i"}, "response", "round3");
+        Tracer.trace("combine", new Object[]{"threshold", "σ = Σ λ_i·σ_i", "multisig", "s_agg = Σ s_i",
+            "interactive", "s = Σ s_i"}, "signature", "combine");
+        Tracer.traceDecision("verify", new Object[]{"threshold", "完整公钥", "multisig", "P_agg",
+            "interactive", "P_agg"}, true, "verify", "三种方案都产出单方签名长度的签名");
+        Tracer.trace("end", new Object[]{"schemes", 3}, null, "end");
     }
 
     // =====================================================================

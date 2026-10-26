@@ -1,8 +1,10 @@
 package org.bouncycastle.learning.essence;
 
 import java.math.BigInteger;
+import java.security.KeyFactory;
 import java.security.KeyPair;
-import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.security.Signature;
 import java.util.Arrays;
@@ -23,9 +25,17 @@ import org.bouncycastle.crypto.params.ECPrivateKeyParameters;
 import org.bouncycastle.crypto.params.ECPublicKeyParameters;
 import org.bouncycastle.crypto.params.ParametersWithRandom;
 import org.bouncycastle.jcajce.spec.SM2ParameterSpec;
+import org.bouncycastle.jce.ECNamedCurveTable;
 import org.bouncycastle.jce.interfaces.ECPrivateKey;
 import org.bouncycastle.jce.interfaces.ECPublicKey;
+import org.bouncycastle.jce.spec.ECNamedCurveParameterSpec;
+import org.bouncycastle.jce.spec.ECPrivateKeySpec;
+import org.bouncycastle.jce.spec.ECPublicKeySpec;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -114,6 +124,9 @@ import org.junit.Test;
 @Slf4j
 public class Sm2EssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     /**
      * 曲线常数（GM/T 0003.5 的 sm2p256v1）；下面有一个测试专门拿 BC 的官方常数核对。
      *
@@ -147,6 +160,42 @@ public class Sm2EssenceTest
     private static final byte[] DEFAULT_ID = "1234567812345678".getBytes();
     /** 一个 256 位域元素序列化后的字节数（坐标、标量都是 32 字节大端），拼接类公式全靠它对齐。 */
     private static final int KEY_BYTES = 32;
+
+    /**
+     * 单个标量乘循环最多记录多少条 traceLoop 事件。
+     *
+     * <p>SM2-CORE 的验签会调用 sm2Verify 多次，每次又有两个 256 位标量乘；
+     * 若逐位记录，一个测试方法的事件数会远超 250 条。这里按固定步长抽样，
+     * 但始终保留第一位与最后一位，循环进度仍能走到 total。
+     */
+    private static final int MAX_LOOP_TRACES = 24;
+
+    /**
+     * 辅助方法内部的 trace 开关（按线程隔离）。
+     *
+     * <p>KREUSE 主题流程图只有 start/collect/solve/recover/verify/exploit/end 七个节点，
+     * 但攻击过程会复用 sm2KeyPair/za/eValue/sm2Sign 等 SM2-CORE 辅助方法。
+     * 这些辅助方法若照常发事件，group 会落到 KREUSE 流程图之外；
+     * 因此 KREUSE 测试先把开关关掉，只手工记录攻击流程的高层事件。
+     */
+    private static final ThreadLocal<Boolean> HELPER_TRACE = new ThreadLocal<Boolean>()
+    {
+        @Override
+        protected Boolean initialValue()
+        {
+            return Boolean.TRUE;
+        }
+    };
+
+    private static boolean helperTraceEnabled()
+    {
+        return HELPER_TRACE.get().booleanValue();
+    }
+
+    private static void setHelperTrace(boolean enabled)
+    {
+        HELPER_TRACE.set(Boolean.valueOf(enabled));
+    }
 
     /** 无穷远点（单位元）= 空数组。点从此只是数据。 */
     private static final BigInteger[] INFINITY = new BigInteger[0];
@@ -317,10 +366,32 @@ public class Sm2EssenceTest
      */
     private static BigInteger[] mul(BigInteger k, BigInteger[] point)
     {
-        BigInteger[] acc = INFINITY;                       // 局部变量当累加器，一目了然
-        for (int j = 0; j < k.bitLength(); j++)
+        return mul(k, point, null);
+    }
+
+    private static BigInteger[] mul(BigInteger k, BigInteger[] point, String loopName)
+    {
+        return mul(k, point, loopName, loopName);
+    }
+
+    /**
+     * @param loopId 循环实例的唯一 id（事件 metadata.loopName，用于绑定进度条）
+     * @param group  事件分组（可带阶段前缀，如 "verify1:mul_sG"），用于流程图定位
+     */
+    private static BigInteger[] mul(BigInteger k, BigInteger[] point, String loopId, String group)
+    {
+        boolean tracing = loopId != null && helperTraceEnabled() && Tracer.isEnabled();
+        int total = k.bitLength();
+        // 抽样步长：最多 MAX_LOOP_TRACES 条事件，同时保证最后一位一定被记录
+        int stride = Math.max(1, (total + MAX_LOOP_TRACES - 1) / MAX_LOOP_TRACES);
+        if (tracing)
         {
-            int bit = k.bitLength() - 1 - j;               // 从最高位开始
+            Tracer.pushLoop(group);
+        }
+        BigInteger[] acc = INFINITY;                       // 局部变量当累加器，一目了然
+        for (int j = 0; j < total; j++)
+        {
+            int bit = total - 1 - j;               // 从最高位开始
             BigInteger[] doubled = doublePoint(acc);
             // k 的第 bit 位是 1 就在倍增后的结果上再补一个 P；是 0 就直接沿用 doubled
             if (k.testBit(bit))
@@ -331,6 +402,16 @@ public class Sm2EssenceTest
             {
                 acc = doubled;
             }
+            if (tracing && (j % stride == 0 || j == total - 1))
+            {
+                Tracer.traceLoop("mulStep", new Object[]{
+                    "j", j, "bit", bit, "bitVal", k.testBit(bit) ? 1 : 0, "acc", acc
+                }, acc, group, j + 1, total, loopId);
+            }
+        }
+        if (tracing)
+        {
+            Tracer.popLoop();
         }
         return acc;
     }
@@ -359,11 +440,20 @@ public class Sm2EssenceTest
      */
     private static byte[] za(byte[] userId, BigInteger[] pub)
     {
+        long startNanos = System.nanoTime();
         byte[] entl = Calc.toBytes(BigInteger.valueOf(8L * userId.length), 2);
-        return sm3(Calc.concat(entl, userId,
+        byte[] result = sm3(Calc.concat(entl, userId,
             Calc.toBytes(A, KEY_BYTES), Calc.toBytes(B, KEY_BYTES),
             Calc.toBytes(GX, KEY_BYTES), Calc.toBytes(GY, KEY_BYTES),
             Calc.toBytes(pub[0], KEY_BYTES), Calc.toBytes(pub[1], KEY_BYTES)));
+        long duration = System.nanoTime() - startNanos;
+        if (helperTraceEnabled())
+        {
+            Tracer.trace("computeZA", new Object[]{
+                "userId", new String(userId), "Px", pub[0], "Py", pub[1]
+            }, result, "computeZA", duration);
+        }
+        return result;
     }
 
     /**
@@ -377,7 +467,23 @@ public class Sm2EssenceTest
      */
     private static BigInteger eValue(byte[] za, byte[] message)
     {
-        return Calc.toBigInt(sm3(Calc.concat(za, message)));
+        return eValue(za, message, "computeE");
+    }
+
+    /**
+     * 带 group 的版本：多次计算 e 的测试（如验签③ 的篡改消息）要落到自己的流程节点上，
+     * 否则光标会跳回主流程开头的 computeE。
+     */
+    private static BigInteger eValue(byte[] za, byte[] message, String group)
+    {
+        long startNanos = System.nanoTime();
+        BigInteger result = Calc.toBigInt(sm3(Calc.concat(za, message)));
+        long duration = System.nanoTime() - startNanos;
+        if (helperTraceEnabled())
+        {
+            Tracer.trace("computeE", new Object[]{"za", za, "msgLen", message.length}, result, group, duration);
+        }
+        return result;
     }
 
     /**
@@ -409,14 +515,39 @@ public class Sm2EssenceTest
      */
     private static BigInteger[] sm2Sign(BigInteger d, BigInteger e, BigInteger k)
     {
-        BigInteger x1 = mul(k, G)[0];                       // (x₁,y₁) = kG，只需要 x₁
+        long startNanos = System.nanoTime();
+        boolean tracing = helperTraceEnabled();
+        if (tracing)
+        {
+            Tracer.trace("sm2Sign.enter", new Object[]{"d", d, "e", e, "k", k}, null, "sm2Sign");
+        }
+
+        BigInteger[] kG = mul(k, G, "mul_kG");
+        BigInteger x1 = kG[0];                       // (x₁,y₁) = kG，只需要 x₁
         // r = (e + x₁) mod n
         BigInteger r = modN(e.add(x1));
+        long rNanos = System.nanoTime();
+        if (tracing)
+        {
+            Tracer.trace("computeR", new Object[]{"e", e, "x1", x1}, r, "computeR", rNanos - startNanos);
+            Tracer.traceDecision("checkR", new Object[]{"r", r}, r.signum() != 0, "checkR", "r == 0");
+        }
         Assert.assertTrue("r 不能为 0（k 需重试）", r.signum() != 0);
         // s = (k − r·d) · (1 + d)⁻¹ mod n：注意这里的 modInverse 的模数是 n（标量域），不是 p
         BigInteger s = modN(k.subtract(r.multiply(d)).multiply(BigInteger.ONE.add(d).modInverse(N)));
+        long sNanos = System.nanoTime();
+        if (tracing)
+        {
+            Tracer.trace("computeS", new Object[]{"k", k, "r", r, "d", d}, s, "computeS", sNanos - rNanos);
+            Tracer.traceDecision("checkRK", new Object[]{"r+k", modN(r.add(k))},
+                modN(r.add(k)).signum() != 0, "checkRK", "r + k ≡ 0 (mod n)");
+        }
         // r + k ≡ 0 (mod n) 会让 t = r + s 归零、验签必失败 ⇒ 标准规定重试
         Assert.assertTrue("r + k 不能等于 n（k 需重试）", modN(r.add(k)).signum() != 0);
+        if (tracing)
+        {
+            Tracer.trace("returnRS", new Object[]{"r", r, "s", s}, new BigInteger[]{r, s}, "returnRS");
+        }
         return new BigInteger[]{ r, s };
     }
 
@@ -449,27 +580,100 @@ public class Sm2EssenceTest
      */
     private static boolean sm2Verify(BigInteger[] pub, BigInteger e, BigInteger[] rs)
     {
+        return sm2Verify(pub, e, rs, null);
+    }
+
+    /**
+     * 带轮次前缀的验签：一次测试里验签多次时，每次用唯一 phase（如 "verify1"），
+     * 事件 group 变成 "verify1:checkFormat" 等，流程图才能把三次验签分开高亮。
+     * phase 为 null 时保持原来的扁平 group（供只验一次的测试使用）。
+     */
+    private static boolean sm2Verify(BigInteger[] pub, BigInteger e, BigInteger[] rs, String phase)
+    {
+        long startNanos = System.nanoTime();
+        boolean tracing = helperTraceEnabled();
+        if (tracing)
+        {
+            Tracer.trace("sm2Verify.enter", new Object[]{"pub", pub, "e", e, "rs", rs}, null,
+                phaseGroup(phase, "sm2Verify"));
+        }
+
         BigInteger r = rs[0];
         BigInteger s = rs[1];
         // 第一关：格式合法 —— r、s 都必须是 [1, n−1] 里的标量（≤0 或 ≥n 一律拒绝）
         if (r.signum() <= 0 || s.signum() <= 0 || r.compareTo(N) >= 0 || s.compareTo(N) >= 0)
         {
+            if (tracing)
+            {
+                Tracer.traceDecision("checkFormat", new Object[]{"r", r, "s", s}, false,
+                    phaseGroup(phase, "checkFormat"), "r,s ∈ [1,n-1]");
+            }
             return false;
+        }
+        if (tracing)
+        {
+            Tracer.traceDecision("checkFormat", new Object[]{"r", r, "s", s}, true,
+                phaseGroup(phase, "checkFormat"), "r,s ∈ [1,n-1]");
         }
         // t = (r + s) mod n，它就是推导里 d 的系数；t = 0 时 [t]P = O，等式失去信息 ⇒ 拒绝
         BigInteger t = modN(r.add(s));
+        if (tracing)
+        {
+            Tracer.trace("computeT", new Object[]{"r", r, "s", s}, t, phaseGroup(phase, "computeT"));
+        }
         if (t.signum() == 0)
         {
+            if (tracing)
+            {
+                Tracer.traceDecision("checkT", new Object[]{"t", t}, false,
+                    phaseGroup(phase, "checkT"), "t == 0");
+            }
             return false;
+        }
+        if (tracing)
+        {
+            Tracer.traceDecision("checkT", new Object[]{"t", t}, true,
+                phaseGroup(phase, "checkT"), "t == 0");
         }
         // (x₁, y₁) = s·G + t·P；合法签名下它就是签名时的 kG
-        BigInteger[] point = add(mul(s, G), mul(t, pub));
+        String sLoopId = phase == null ? "mul_sG" : phase + "_mul_sG";
+        String tLoopId = phase == null ? "mul_tP" : phase + "_mul_tP";
+        BigInteger[] sG = mul(s, G, sLoopId, phaseGroup(phase, "mul_sG"));
+        BigInteger[] tP = mul(t, pub, tLoopId, phaseGroup(phase, "mul_tP"));
+        BigInteger[] point = add(sG, tP);
+        if (tracing)
+        {
+            Tracer.trace("ecOp", new Object[]{"sG", sG, "tP", tP}, point, phaseGroup(phase, "ecOp"));
+        }
         if (point.length == 0)
         {
+            if (tracing)
+            {
+                Tracer.traceDecision("checkPoint", new Object[]{"point", "O"}, false,
+                    phaseGroup(phase, "checkPoint"), "point == O");
+            }
             return false;
         }
+        if (tracing)
+        {
+            Tracer.traceDecision("checkPoint", new Object[]{"point", point}, true,
+                phaseGroup(phase, "checkPoint"), "point == O");
+        }
         // 核对：(e + x₁) mod n 必须等于 r（签名式子里 r 就是这么定义的）
-        return modN(e.add(point[0])).equals(r);
+        boolean result = modN(e.add(point[0])).equals(r);
+        long duration = System.nanoTime() - startNanos;
+        if (tracing)
+        {
+            Tracer.trace("finalCheck", new Object[]{"e", e, "x1", point[0], "r", r}, result,
+                phaseGroup(phase, "finalCheck"), duration);
+        }
+        return result;
+    }
+
+    /** 验签轮次前缀：phase 为空时就是普通 group 名。 */
+    private static String phaseGroup(String phase, String name)
+    {
+        return phase == null ? name : phase + ":" + name;
     }
 
     /** mod n 归约：把标量压回 [0, n)。n 是基点的阶 ⇒ [a]G = [a mod n]G，所以 d/k/r/s/t 都只在 Z/nZ 里有意义。 */
@@ -551,10 +755,28 @@ public class Sm2EssenceTest
         byte[] y2 = Calc.toBytes(shared[1], KEY_BYTES);
         // C1 = 0x04 ‖ x₁ ‖ y₁（65 字节未压缩临时公钥点）
         byte[] c1 = Calc.concat(new byte[]{ 0x04 }, Calc.toBytes(c1Point[0], KEY_BYTES), Calc.toBytes(c1Point[1], KEY_BYTES));
+        boolean tracing = helperTraceEnabled();
+        if (tracing)
+        {
+            Tracer.trace("c1", new Object[]{"k", k, "C1Point", c1Point}, c1, "c1");
+        }
         // C2 = M ⊕ KDF(x₂‖y₂, klen=明文长度)：逐字节掩码，长度 = 明文长度
-        byte[] c2 = Calc.xor(plaintext, kdfSm3(Calc.concat(x2, y2), plaintext.length));
+        byte[] stream = kdfSm3(Calc.concat(x2, y2), plaintext.length);
+        if (tracing)
+        {
+            Tracer.trace("kdf", new Object[]{"x2", x2, "y2", y2, "klen", plaintext.length}, stream, "kdf");
+        }
+        byte[] c2 = Calc.xor(plaintext, stream);
+        if (tracing)
+        {
+            Tracer.trace("c2", new Object[]{"M", plaintext, "stream", stream}, c2, "c2");
+        }
         // C3 = SM3(x₂ ‖ M ‖ y₂)：32 字节认证标签，注意它哈希的是<b>明文</b>而不是密文
         byte[] c3 = sm3(Calc.concat(x2, plaintext, y2));
+        if (tracing)
+        {
+            Tracer.trace("c3", new Object[]{"x2", x2, "M", plaintext, "y2", y2}, c3, "c3");
+        }
         // 唯一的"模式"差异：两段可选内容的先后顺序
         return c1c3c2 ? Calc.concat(c1, c3, c2) : Calc.concat(c1, c2, c3);
     }
@@ -601,18 +823,78 @@ public class Sm2EssenceTest
         byte[] x2 = Calc.toBytes(shared[0], KEY_BYTES);
         byte[] y2 = Calc.toBytes(shared[1], KEY_BYTES);
         // M′ = C2 ⊕ KDF(x₂‖y₂, len(C2))：异或自反 (M⊕流)⊕流 = M，所以解密密钥流和加密时必须是同一段
-        byte[] plaintext = Calc.xor(c2, kdfSm3(Calc.concat(x2, y2), c2.length));
+        byte[] stream = kdfSm3(Calc.concat(x2, y2), c2.length);
+        byte[] plaintext = Calc.xor(c2, stream);
+        boolean tracing = helperTraceEnabled();
+        if (tracing)
+        {
+            Tracer.trace("decrypt", new Object[]{"d", d, "C1", c1Point, "C2", c2, "stream", stream},
+                plaintext, "decrypt");
+        }
         // 认证检查：用解出来的明文重算标签，和密文里带来的 C3 逐字节比对 —— SM2 密文的防篡改就靠这一行
-        Assert.assertArrayEquals("C3 校验失败：密文被篡改", c3, sm3(Calc.concat(x2, plaintext, y2)));
+        byte[] expectedC3 = sm3(Calc.concat(x2, plaintext, y2));
+        if (tracing)
+        {
+            Tracer.traceDecision("compare", new Object[]{"C3", c3, "C3'", expectedC3},
+                Arrays.equals(c3, expectedC3), "compare", "C3 == SM3(x₂‖M'‖y₂)");
+        }
+        Assert.assertArrayEquals("C3 校验失败：密文被篡改", c3, expectedC3);
         return plaintext;
     }
 
     // ---------------------------------------------------------------- 测试
 
     /**
-     * 曲线常数必须等于国家标准的 sm2p256v1；顺便验证 G 在曲线上、n 是它的阶。
+     * 密钥对生成 = 两步：私钥 d 均匀随机取自 [1, n−1]，公钥 P = d·G（X9.62 §5.2.1）。
      *
-     * <p>三条断言各证一件事（把符号表里的定义真的跑一遍，而不是只信文档）：
+     * <p>生成过程完全手写（参照 BC 的 ECKeyPairGenerator，见 {@link #sm2KeyPair}）：
+     * <pre>
+     *   selectD     new BigInteger(n.bitLength(), random) 生成 n 位宽随机整数，越界（d&lt;1 或 d≥n）整枚重抽；
+     *               d=0 会让 P=O（无信息），d≥n 会被 n·G=O 的周期性折回 —— 所以标量只在 Z/nZ 里有意义
+     *   mul(d, G)   公钥不是"存的"，是"算"出来的：密钥生成里唯一的密码学运算就是这一次标量乘
+     *   信封        (d, P) 经 BC 的 KeyFactory 装回 JCE KeyPair —— 只是编码层，不参与生成
+     *   裁判        从信封读回 d 与 (Px, Py)，用自己的 mul 重算 dG 必须逐坐标一致；
+     *               d 必须落在 [1, n−1]，P 必须在曲线上
+     * </pre>
+     */
+    @TraceExecution(value = "SM2 密钥对生成", algorithm = "SM2", flow = "SM2-CURVE")
+    @Test
+    public void sm2KeyPairGenerationIsScalarMultiplication()
+        throws Exception
+    {
+        setHelperTrace(true);
+        Calc.useBc();
+        Tracer.trace("start", new Object[]{"curve", "sm2p256v1"}, null, "start");
+
+        // 生成密钥对：手写两步 —— d ∈ [1,n−1] 均匀随机，P = dG（参照 BC 的 ECKeyPairGenerator）
+        KeyPair kp = sm2KeyPair();
+        BigInteger d = ((ECPrivateKey) kp.getPrivate()).getD();
+        BigInteger[] pub = publicKeyOf(kp);
+
+        Tracer.traceDecision("onCurve", new Object[]{"point", pub}, onCurve(pub),
+            "onCurve", "y² ≡ x³ + ax + b (mod p)");
+
+        // 用自己的 mul 重算 P = dG，必须与 BC 给出的公钥一致
+        BigInteger[] recomputed = mul(d, G, "scalarMul");
+        Assert.assertEquals("dG 的 x 坐标必须与 BC 公钥一致", modP(pub[0]), recomputed[0]);
+        Assert.assertEquals("dG 的 y 坐标必须与 BC 公钥一致", modP(pub[1]), recomputed[1]);
+
+        // 验证公钥在曲线上
+        Assert.assertTrue("公钥必须在曲线上", onCurve(pub));
+
+        // 验证 d 在合法范围内
+        Assert.assertTrue("d 必须 > 0", d.signum() > 0);
+        Assert.assertTrue("d 必须 < n", d.compareTo(N) < 0);
+
+        log.info("[SM2-密钥生成] d={}, P=({},{})", d.toString(16).substring(0, 16) + "...",
+            pub[0].toString(16).substring(0, 16) + "...", pub[1].toString(16).substring(0, 16) + "...");
+        Tracer.trace("serialize", new Object[]{"Px", pub[0], "Py", pub[1], "recomputed", recomputed},
+            new Object[]{"Px", recomputed[0], "Py", recomputed[1]}, "serialize");
+        Tracer.trace("end", new Object[]{"d_bits", d.bitLength(), "pub_on_curve", true}, null, "end");
+    }
+
+    /**
+     * 曲线常数与标准的一致性检验。
      * <pre>
      *   常数比对      p/a/b/n/Gx/Gy 与 BC 从 GMNamedCurves 读出的官方值一字不差
      *                 （BC 的 getA()/getB() 返回的是域元素，先 toBigInteger 取出整数、再 modP 归一到
@@ -623,20 +905,32 @@ public class Sm2EssenceTest
      *                 也是所有 mod n 归约的由来
      * </pre>
      */
+    @TraceExecution(value = "SM2 标准曲线常数", algorithm = "SM2", flow = "SM2-CURVE")
     @Test
     public void curveConstantsAreTheStandardCurve()
     {
+        setHelperTrace(true);
+        Tracer.trace("start", new Object[]{"curve", "sm2p256v1"}, null, "start");
+
         X9ECParameters std = GMNamedCurves.getByName("sm2p256v1");
+        Tracer.trace("params", new Object[]{
+            "p", P, "a", A, "b", B, "n", N, "Gx", GX, "Gy", GY
+        }, new Object[]{"curve", std.getCurve(), "G", std.getG()}, "params");
         Assert.assertEquals("p 必须与标准一致", std.getCurve().getField().getCharacteristic(), P);
         Assert.assertEquals("a 必须与标准一致", modP(std.getCurve().getA().toBigInteger()), A);
         Assert.assertEquals("b 必须与标准一致", modP(std.getCurve().getB().toBigInteger()), B);
         Assert.assertEquals("n 必须与标准一致", std.getN(), N);
         Assert.assertEquals("Gx 必须与标准一致", std.getG().getAffineXCoord().toBigInteger(), GX);
         Assert.assertEquals("Gy 必须与标准一致", std.getG().getAffineYCoord().toBigInteger(), GY);
-        Assert.assertTrue("生成元必须在曲线上", onCurve(G));
+        boolean gOnCurve = onCurve(G);
+        Tracer.traceDecision("onCurve", new Object[]{"point", G}, gOnCurve,
+            "onCurve", "y² ≡ x³ + ax + b (mod p)");
+        Assert.assertTrue("生成元必须在曲线上", gOnCurve);
         Assert.assertEquals("n 必须是 G 的阶：nG = 无穷远点", 0, mul(N, G).length);
         Assert.assertArrayEquals("(n+1)G = G", G, mul(N.add(BigInteger.ONE), G));
         log.info("[SM2-曲线] p={} a={} n 阶检验通过", P.toString(16).substring(0, 8) + "…");
+        Tracer.trace("end", new Object[]{"p", P, "n", N, "nG_is_O", true, "(n+1)G_is_G", true},
+            "standard curve verified", "end");
     }
 
     /**
@@ -655,11 +949,21 @@ public class Sm2EssenceTest
      * 倍点 = 自加（doublePoint(G) == add(G, G)）这条尤其重要：它是"λ 用切线还是弦"的分界点，
      * 也是 add() 里 x 相同分支必须转去调 doublePoint() 的原因。
      */
+    @TraceExecution(value = "SM2 群律", algorithm = "SM2", flow = "SM2-CURVE")
     @Test
     public void ecPointArithmeticFormsAnAbelianGroup()
     {
+        setHelperTrace(true);
+        Tracer.trace("start", new Object[]{"curve", "sm2p256v1"}, null, "start");
+
         BigInteger k1 = new BigInteger("1234567890123456789012345678901234567890");
         BigInteger k2 = new BigInteger("9876543210987654321098765432109876543210");
+        BigInteger[] k1G = mul(k1, G);
+        BigInteger[] k2G = mul(k2, G);
+        Tracer.trace("ecAdd", new Object[]{"P", k1G, "Q", k2G}, add(k1G, k2G), "ecAdd");
+        Tracer.trace("ecDouble", new Object[]{"P", G}, doublePoint(G), "ecDouble");
+        Tracer.traceDecision("onCurve", new Object[]{"point", k2G}, onCurve(k2G),
+            "onCurve", "y² ≡ x³ + ax + b (mod p)");
 
         Assert.assertArrayEquals("加法交换律", add(mul(k1, G), mul(k2, G)), add(mul(k2, G), mul(k1, G)));
         Assert.assertArrayEquals("倍点 == 自加", doublePoint(G), add(G, G));
@@ -669,30 +973,43 @@ public class Sm2EssenceTest
         Assert.assertArrayEquals("单位元是恒等", mul(k1, G), add(INFINITY, mul(k1, G)));
         Assert.assertTrue("任意标量乘的结果仍在曲线上", onCurve(mul(k2, G)));
         log.info("[SM2-群律] 6 条群公理全部由普通静态方法验证通过");
+        Tracer.trace("end", new Object[]{"k1G", k1G, "k2G", k2G, "k1G_plus_k2G", add(k1G, k2G)},
+            "abelian group axioms verified", "end");
     }
 
     /**
-     * 用 BC 生成的私钥 d，我们手写的过程版标量乘必须算出同一个公钥点。
+     * 密钥由我们手写的生成器产生（d 随机 + P=dG，见 {@link #sm2KeyPair}），经 BC 的 KeyFactory 装回
+     * JCE 信封；本测试证明：信封打开后（getD/getQ）(d, Q) 与我们算出的逐位一致，我们的倍加循环
+     * 也能从 d 重建 Q —— 编码层没有偷改任何一个数。
      *
      * <p>符号与要点：d = ECPrivateKey.getD() 就是那个 mod n 意义下的私钥标量；
-     * q = BC 内部算出的公钥点，它用的是<b>射影/雅可比坐标</b> (X:Y:Z)，
+     * q = BC 从编码里解码出的公钥点，它内部用<b>射影/雅可比坐标</b> (X:Y:Z)，
      * 所以要比坐标必须先 getAffineXCoord()/getAffineYCoord() 还原成<b>仿射坐标</b> x = X/Z²、y = Y/Z³
      * （这一步内部也做一次 mod p 求逆，正是我们在 mul() 里全程手动做的那种"贵"运算）。
      * 两边逐坐标相等 ⇒ 我们的 for 循环倍加与 BC 的工业实现走的是同一套群运算，没有"抄它的结果"。
      */
+    @TraceExecution(value = "SM2 纯标量乘重建公钥", algorithm = "SM2", flow = "SM2-CURVE")
     @Test
     public void ourPureScalarMulRebuildsBcPublicKey()
         throws Exception
     {
+        setHelperTrace(true);
         Calc.useBc();
+        Tracer.trace("start", new Object[]{"curve", "sm2p256v1"}, null, "start");
+
         KeyPair kp = sm2KeyPair();
         BigInteger d = ((ECPrivateKey) kp.getPrivate()).getD();
         org.bouncycastle.math.ec.ECPoint q = ((ECPublicKey) kp.getPublic()).getQ();
-        BigInteger[] ours = mul(d, G);
+        BigInteger[] ours = mul(d, G, "scalarMul");
 
         Assert.assertEquals("我们的 x₁ == BC 的仿射 x", modP(q.getAffineXCoord().toBigInteger()), ours[0]);
         Assert.assertEquals("我们的 y₁ == BC 的仿射 y", modP(q.getAffineYCoord().toBigInteger()), ours[1]);
         log.info("[SM2-本质] dG 由 for 循环的倍加算法独立算出，与 BC 完全一致：x={}", Calc.hex(Calc.toBytes(ours[0], 32)));
+        Tracer.trace("serialize", new Object[]{
+            "BC_Px", q.getAffineXCoord().toBigInteger(), "BC_Py", q.getAffineYCoord().toBigInteger(),
+            "our_Px", ours[0], "our_Py", ours[1]
+        }, ours, "serialize");
+        Tracer.trace("end", new Object[]{"equal", true, "Px", ours[0]}, true, "end");
     }
 
     /**
@@ -711,12 +1028,15 @@ public class Sm2EssenceTest
      *       换消息 ⇒ e 变，同样的 x₁ 加上新 e 得到另一个 r —— 这两条就是"不可伪造 + 不可改内容"的直接体现
      * </pre>
      */
+    @TraceExecution(value = "SM2 签名验签完整流程（三次验签）", algorithm = "SM2", flow = "SM2-SIGNVERIFY")
     @Test
     public void sm2SignAndVerifyAreTwoLinesOfModularArithmetic()
         throws Exception
     {
+        setHelperTrace(true);
         Calc.useBc();
         byte[] msg = "SM2 signature essence".getBytes("UTF-8");
+        Tracer.trace("start", new Object[]{"curve", "sm2p256v1", "msgLen", msg.length}, null, "start");
         KeyPair kp = sm2KeyPair();
         BigInteger d = ((ECPrivateKey) kp.getPrivate()).getD();
         BigInteger[] pub = publicKeyOf(kp);
@@ -729,29 +1049,51 @@ public class Sm2EssenceTest
         Signature v = Signature.getInstance("SM3withSM2", "BC");
         v.initVerify(kp.getPublic());
         v.update(msg);
-        Assert.assertTrue("我们生成的 SM2 签名必须被 BC 接受", v.verify(der));
+        boolean bcAccepted = v.verify(der);
+        Tracer.trace("bcVerify", new Object[]{"algorithm", "SM3withSM2", "der", der}, bcAccepted,
+            "bcVerify");
+        Assert.assertTrue("我们生成的 SM2 签名必须被 BC 接受", bcAccepted);
 
-        // (2) BC 签，我们验
+        // (2) BC 签，我们验：同一枚合法签名，验签①
         Signature s = Signature.getInstance("SM3withSM2", "BC");
         s.initSign(kp.getPrivate());
         s.update(msg);
         byte[] bcSig = s.sign();
+        Tracer.trace("bcSign", new Object[]{"algorithm", "SM3withSM2", "msgLen", msg.length}, bcSig,
+            "bcSign");
         ASN1Sequence seq = ASN1Sequence.getInstance(bcSig);
         BigInteger[] rs = new BigInteger[]{
             ASN1Integer.getInstance(seq.getObjectAt(0)).getValue(),
             ASN1Integer.getInstance(seq.getObjectAt(1)).getValue() };
-        Assert.assertEquals("我们的静态方法必须验过 BC 的签名", Boolean.TRUE,
-            sm2Verify(pub, e, rs));
 
-        // (3) 篡改检测：改 r、改消息，都必须失败
+        // 验签①：合法签名（BC 签 → 我们验），应通过
+        Tracer.trace("verifyCase", new Object[]{
+            "purpose", "验签① 合法签名（BC 签 → 我们验）", "e", e, "r", rs[0], "s", rs[1]
+        }, "期望: 通过", "verify1");
+        Assert.assertEquals("我们的静态方法必须验过 BC 的签名", Boolean.TRUE,
+            sm2Verify(pub, e, rs, "verify1"));
+
+        // 验签②：篡改 r（r + 1），必须失败
+        BigInteger[] tamperedR = new BigInteger[]{ rs[0].add(BigInteger.ONE), rs[1] };
+        Tracer.trace("verifyCase", new Object[]{
+            "purpose", "验签② 篡改 r（r ← r+1）", "e", e, "r", tamperedR[0], "s", tamperedR[1]
+        }, "期望: 失败", "verify2");
         Assert.assertEquals("r 被改动必须失败", Boolean.FALSE,
-            sm2Verify(pub, e, new BigInteger[]{ rs[0].add(BigInteger.ONE), rs[1] }));
-        BigInteger eOther = eValue(za, "other message".getBytes("UTF-8"));
+            sm2Verify(pub, e, tamperedR, "verify2"));
+
+        // 验签③：篡改消息（e 变了），必须失败
+        BigInteger eOther = eValue(za, "other message".getBytes("UTF-8"), "verify3:hashM");
+        Tracer.trace("verifyCase", new Object[]{
+            "purpose", "验签③ 篡改消息（e ← SM3(ZA‖M′)）", "e", eOther, "r", rs[0], "s", rs[1]
+        }, "期望: 失败", "verify3");
         Assert.assertEquals("消息被改动（e 变了）必须失败", Boolean.FALSE,
-            sm2Verify(pub, eOther, rs));
+            sm2Verify(pub, eOther, rs, "verify3"));
 
         log.info("[SM2-签名] e={}, r={}, s={}", e.toString(16).substring(0, 12) + "…",
             rs[0].toString(16).substring(0, 12) + "…", rs[1].toString(16).substring(0, 12) + "…");
+        Tracer.trace("end", new Object[]{"e", e, "r", rs[0], "s", rs[1],
+            "verify1", true, "verify2", false, "verify3", false},
+            Boolean.TRUE, "end");
     }
 
     /**
@@ -765,13 +1107,17 @@ public class Sm2EssenceTest
      * 否则它按默认 ID 算出另一个 e，一枚完全合法的签名也会被拒绝 —— 这正是 ZA 存在的意义：
      * 公钥不再"匿名"，签名与身份焊在一起，攻击者递上自己的公钥也冒充不了别人的身份。
      */
+    @TraceExecution(value = "SM2 ZA 身份绑定", algorithm = "SM2", flow = "SM2-CORE")
     @Test
     public void zaBindsTheIdentityIntoTheHash()
         throws Exception
     {
+        setHelperTrace(true);
         Calc.useBc();
         byte[] id = "alice@example.cn".getBytes("UTF-8");
         byte[] msg = "identity is part of the digest".getBytes("UTF-8");
+        Tracer.trace("start", new Object[]{"curve", "sm2p256v1", "id", new String(id), "msgLen", msg.length},
+            null, "start");
         KeyPair kp = sm2KeyPair();
         BigInteger d = ((ECPrivateKey) kp.getPrivate()).getD();
         BigInteger[] pub = publicKeyOf(kp);
@@ -798,6 +1144,8 @@ public class Sm2EssenceTest
         Assert.assertEquals("我们的静态方法用 Alice 的 e 能验过", Boolean.TRUE,
             sm2Verify(pub, eAlice, sig));
         log.info("[SM2-ZA] ZA(Alice)={} ZA(default)={}", Calc.hex(zaAlice), Calc.hex(zaDefault));
+        Tracer.trace("end", new Object[]{"ZA_Alice", zaAlice, "ZA_default", zaDefault,
+            "different", !Arrays.equals(zaAlice, zaDefault)}, Boolean.TRUE, "end");
     }
 
     /**
@@ -817,12 +1165,16 @@ public class Sm2EssenceTest
      * 最后 tampered[70] ^= 1：第 65~(65+len(M)−1) 字节是 C2，所以第 70 个字节落在 C2 里，
      * 改它会让解出的明文变，从而重算的 C3 与带来的 C3 不符 ⇒ 断言失败，这就是"密文自带认证性"。
      */
+    @TraceExecution(value = "SM2 密文模式", algorithm = "SM2", flow = "SM2-CIPHER")
     @Test
     public void sm2CipherModesDifferOnlyInSegmentOrder()
         throws Exception
     {
+        setHelperTrace(true);
         Calc.useBc();
         byte[] pt = "SM2 encryption is ECIES with SM3-based KDF".getBytes("UTF-8");
+        Tracer.trace("start", new Object[]{"modes", new String[]{"C1C2C3", "C1C3C2"}, "msgLen", pt.length},
+            null, "start");
         KeyPair kp = sm2KeyPair();
         BigInteger d = ((ECPrivateKey) kp.getPrivate()).getD();
         BigInteger[] pub = publicKeyOf(kp);
@@ -877,6 +1229,8 @@ public class Sm2EssenceTest
         {
             log.info("[SM2-加密模式] 篡改密文 -> C3 校验失败（SM2 密文自带认证性）");
         }
+        Tracer.trace("end", new Object[]{"modes", 2, "c1Same", true, "tamperRejected", true},
+            Boolean.TRUE, "end");
     }
 
     /**
@@ -901,11 +1255,15 @@ public class Sm2EssenceTest
      * 拿到 d 后连公钥都不用再看 —— 下面 assertArrayEquals 用 recovered·G == pub 复核这一点。
      * 另外注意：只要"部分比特重复/低熵"就足够，不必完全相同；本文件后三个测试分别处理这三种形态。
      */
+    @TraceExecution(value = "SM2 k 复用攻击", algorithm = "SM2", flow = "SM2-KREUSE")
     @Test
     public void reusingKLeaksThePrivateKey()
         throws Exception
     {
+        setHelperTrace(false);
         Calc.useBc();
+        Tracer.trace("start", new Object[]{"attack", "k reuse", "curve", "sm2p256v1"}, null, "start");
+
         KeyPair kp = sm2KeyPair();
         BigInteger d = ((ECPrivateKey) kp.getPrivate()).getD();
         BigInteger[] pub = publicKeyOf(kp);
@@ -917,14 +1275,30 @@ public class Sm2EssenceTest
         BigInteger[] sig1 = sm2Sign(d, e1, k);
         BigInteger[] sig2 = sm2Sign(d, e2, k);
 
+        Tracer.trace("collect", new Object[]{
+            "e1", e1, "e2", e2, "sig1", sig1, "sig2", sig2, "sameR", sig1[0].equals(sig2[0])
+        }, new BigInteger[]{ sig1[0], sig2[0] }, "collect");
+
         // s = (1+d)⁻¹(k - r d)  =>  s₁-s₂ = (1+d)⁻¹(-(e₁-e₂)d)  =>  d = -s₁-s₂ / (s₁-s₂+e₁-e₂)
         BigInteger ds = sig1[1].subtract(sig2[1]);
         BigInteger de = e1.subtract(e2);
+        Tracer.trace("solve", new Object[]{"s1-s2", ds, "e1-e2", de, "coefficient", ds.add(de)},
+            ds.add(de), "solve");
         BigInteger recovered = ds.negate().multiply(ds.add(de).modInverse(N)).mod(N);
+        Tracer.trace("recover", new Object[]{"r", sig1[0], "s1", sig1[1], "s2", sig2[1]},
+            recovered, "recover");
 
         Assert.assertEquals("两条 k 复用的签名足以反推出私钥 d", d, recovered);
-        Assert.assertArrayEquals("反推出的 d 必须能重算出同一个公钥", pub, mul(recovered, G));
+        BigInteger[] recoveredPub = mul(recovered, G);
+        Assert.assertArrayEquals("反推出的 d 必须能重算出同一个公钥", pub, recoveredPub);
+        Tracer.traceDecision("verify", new Object[]{"recovered", recovered, "pub", pub,
+            "recoveredPub", recoveredPub}, Arrays.equals(pub, recoveredPub),
+            "verify", "recovered·G == P");
+        Tracer.trace("exploit", new Object[]{"recoveredD", recovered, "kReused", k,
+            "pubMatch", Arrays.equals(pub, recoveredPub)}, recovered, "exploit");
         log.info("[SM2-k 复用] 从两枚签名反解出 d = {}（与真实私钥一致）", recovered.toString(16).substring(0, 16) + "…");
+        Tracer.trace("end", new Object[]{"recoveredD", recovered, "pubMatch", true}, Boolean.TRUE, "end");
+        setHelperTrace(true);
     }
 
     // ====================================================================
@@ -1163,11 +1537,16 @@ public class Sm2EssenceTest
      * 而真随机的 k 有 2²⁵⁵ 量级个候选且<b>无结构</b>，同样的枚举思路完全使不上劲。
      * 注意攻击里唯一的核对手段就是比横坐标 —— 全程没用到私钥，也没用到公钥。
      */
+    @TraceExecution(value = "SM2 可预测种子攻击", algorithm = "SM2", flow = "SM2-KREUSE")
     @Test
     public void predictablePrngSeedEnumerationLeaksThePrivateKey()
         throws Exception
     {
+        setHelperTrace(false);
         Calc.useBc();
+        Tracer.trace("start", new Object[]{"attack", "predictable PRNG seed", "seedSpace", SEED_SPACE},
+            null, "start");
+
         KeyPair kp = sm2KeyPair();
         BigInteger d = ((ECPrivateKey) kp.getPrivate()).getD();
         BigInteger[] pub = publicKeyOf(kp);
@@ -1177,6 +1556,7 @@ public class Sm2EssenceTest
 
         long deviceSeed = 90L;                                    // 设备内部那个"保密"的种子
         BigInteger[] sig = sm2Sign(d, e, lcgK(deviceSeed));
+        Tracer.trace("collect", new Object[]{"r", sig[0], "s", sig[1], "e", e}, sig, "collect");
 
         // 攻击者的免费线索：x₁ = (r - e) mod n，纯公开量（对比时统一取 mod n，因为 p 略大于 n）
         BigInteger x1Target = modN(sig[0].subtract(e));
@@ -1195,18 +1575,31 @@ public class Sm2EssenceTest
                 break;
             }
         }
+        Tracer.trace("solve", new Object[]{"x1Target", x1Target, "seedSpace", SEED_SPACE,
+            "hitSeed", hitSeed, "probes", probes}, hitK, "solve");
 
         Assert.assertTrue("枚举 " + SEED_SPACE + " 个种子必须命中真实的 k", hitK != null);
         Assert.assertEquals("命中的种子就是设备那个", deviceSeed, hitSeed);
 
         BigInteger recovered = privateKeyFromKnownK(hitK, sig[0], sig[1]);
+        Tracer.trace("recover", new Object[]{"hitK", hitK, "r", sig[0], "s", sig[1]},
+            recovered, "recover");
         Assert.assertEquals("重放 PRNG 得到 k 后，一次模逆就该还原私钥", d, recovered);
-        Assert.assertArrayEquals("另一条核对路线 [d_cand]G == P 也必须成立", pub, mul(recovered, G));
+        BigInteger[] recoveredPub = mul(recovered, G);
+        Assert.assertArrayEquals("另一条核对路线 [d_cand]G == P 也必须成立", pub, recoveredPub);
+        Tracer.traceDecision("verify", new Object[]{"recovered", recovered, "pub", pub,
+            "recoveredPub", recoveredPub}, Arrays.equals(pub, recoveredPub),
+            "verify", "recovered·G == P");
         assertRecoveredKeyCanForge(kp, recovered, za);
+        Tracer.trace("exploit", new Object[]{"hitSeed", hitSeed, "hitK", hitK,
+            "probes", probes, "recoveredD", recovered}, recovered, "exploit");
 
         // 对照组：真随机 k 的空间是 2^255 量级，而枚举成本是线性的 —— 没有可预测性就没有落脚点
         log.info("[SM2-可预测k] 枚举 {} 个种子命中 k={}，一次模逆得到 d；真随机时 k 的空间有 2^{} 量级",
             probes, hitK.toString(16), N.bitLength());
+        Tracer.trace("end", new Object[]{"hitSeed", hitSeed, "probes", probes, "forged", true},
+            Boolean.TRUE, "end");
+        setHelperTrace(true);
     }
 
     /**
@@ -1230,11 +1623,15 @@ public class Sm2EssenceTest
      * ① 公式②直接解出 d；② 用 d 回推 k₁ = s₁(1+d) + r₁d，必须等于设备真用的 k₁；
      * ③ 再用公式①（已知 k₁）解一次 d，必须与①同值。最后用 BC 验签器做第三方裁判。
      */
+    @TraceExecution(value = "SM2 等差 k 攻击", algorithm = "SM2", flow = "SM2-KREUSE")
     @Test
     public void sequentialKIsSolvedByLinearEquationsWithoutAnySearch()
         throws Exception
     {
+        setHelperTrace(false);
         Calc.useBc();
+        Tracer.trace("start", new Object[]{"attack", "sequential k", "curve", "sm2p256v1"}, null, "start");
+
         KeyPair kp = sm2KeyPair();
         BigInteger d = ((ECPrivateKey) kp.getPrivate()).getD();
         BigInteger[] pub = publicKeyOf(kp);
@@ -1249,34 +1646,53 @@ public class Sm2EssenceTest
         BigInteger e2 = eValue(za, "second message".getBytes("UTF-8"));
         BigInteger[] sig1 = sm2Sign(d, e1, k1);
         BigInteger[] sig2 = sm2Sign(d, e2, k2);
+        Tracer.trace("collect", new Object[]{"e1", e1, "e2", e2, "sig1", sig1, "sig2", sig2,
+            "delta", delta}, new BigInteger[]{ sig1[0], sig2[0] }, "collect");
 
         // 攻击者只知道"k 是等差的"，不知道 k 本身
         BigInteger recovered = privateKeyFromKnownDelta(delta, sig1[0], sig1[1], sig2[0], sig2[1]);
+        Tracer.trace("solve", new Object[]{"delta", delta, "r1", sig1[0], "s1", sig1[1],
+            "r2", sig2[0], "s2", sig2[1]}, recovered, "solve");
         Assert.assertEquals("公差 + 两枚公开签名即可解出 d", d, recovered);
 
         // 两条独立公式互相印证：先解出 d，再回推 k₁，必须与设备用的那个 k₁ 相同
-        Assert.assertEquals("由 d 回推的 k₁ = s₁(1+d) + r₁d 必须与真实值一致", k1,
-            kFromPrivateKey(recovered, sig1[0], sig1[1]));
-        Assert.assertEquals("再由 k₁ 走攻击公式①也得到同一个 d", recovered,
-            privateKeyFromKnownK(k1, sig1[0], sig1[1]));
-        Assert.assertArrayEquals("公钥核对", pub, mul(recovered, G));
+        BigInteger k1Back = kFromPrivateKey(recovered, sig1[0], sig1[1]);
+        Tracer.trace("recover", new Object[]{"d", recovered, "r1", sig1[0], "s1", sig1[1]},
+            k1Back, "recover");
+        Assert.assertEquals("由 d 回推的 k₁ = s₁(1+d) + r₁d 必须与真实值一致", k1, k1Back);
+        BigInteger recoveredAgain = privateKeyFromKnownK(k1, sig1[0], sig1[1]);
+        Assert.assertEquals("再由 k₁ 走攻击公式①也得到同一个 d", recovered, recoveredAgain);
+        BigInteger[] recoveredPub = mul(recovered, G);
+        Assert.assertArrayEquals("公钥核对", pub, recoveredPub);
+        Tracer.traceDecision("verify", new Object[]{"k1", k1, "k1Back", k1Back,
+            "recoveredAgain", recoveredAgain, "pub", pub}, k1.equals(k1Back)
+            && recovered.equals(recoveredAgain) && Arrays.equals(pub, recoveredPub),
+            "verify", "k1Back == k1 且 [d]G == P");
         assertRecoveredKeyCanForge(kp, recovered, za);
 
         // Δ = 0 是本公式的特例（k 复用）：与 reusingKLeaksThePrivateKey 同一条式子
         byte[] other = "another message".getBytes("UTF-8");
         BigInteger[] reuseA = sm2Sign(d, e1, k1);
         BigInteger[] reuseB = sm2Sign(d, eValue(za, other), k1);
-        Assert.assertEquals("公差为 0（k 完全复用）也必须解出 d", d,
-            privateKeyFromKnownDelta(BigInteger.ZERO, reuseA[0], reuseA[1], reuseB[0], reuseB[1]));
+        BigInteger reuseRecovered = privateKeyFromKnownDelta(BigInteger.ZERO,
+            reuseA[0], reuseA[1], reuseB[0], reuseB[1]);
+        Assert.assertEquals("公差为 0（k 完全复用）也必须解出 d", d, reuseRecovered);
 
         // 对照：真随机（Δ 未知）时这条零搜索攻击立刻失效 —— 公差本身进不了方程
         BigInteger[] safeA = sm2Sign(d, e1, randomK());
         BigInteger[] safeB = sm2Sign(d, eValue(za, other), randomK());
+        BigInteger safeRecovered = privateKeyFromKnownDelta(BigInteger.ONE,
+            safeA[0], safeA[1], safeB[0], safeB[1]);
         Assert.assertFalse("k 之间没有关系时，随便猜的公差不可能给出真实私钥",
-            d.equals(privateKeyFromKnownDelta(BigInteger.ONE, safeA[0], safeA[1], safeB[0], safeB[1])));
+            d.equals(safeRecovered));
 
+        Tracer.trace("exploit", new Object[]{"recovered", recovered, "delta0Recovered", reuseRecovered,
+            "deltaGuess", BigInteger.ONE, "safeRecovered", safeRecovered}, reuseRecovered, "exploit");
         log.info("[SM2-规律k] 已知公差 {} 时，4 个公开量 + 1 次模逆得到 d = {}…", delta,
             recovered.toString(16).substring(0, 16));
+        Tracer.trace("end", new Object[]{"recoveredD", recovered, "reuseD", reuseRecovered,
+            "forged", true}, Boolean.TRUE, "end");
+        setHelperTrace(true);
     }
 
     /**
@@ -1310,11 +1726,16 @@ public class Sm2EssenceTest
      * 而 k 一到手就退回公式①，一次模逆得到 d。若泄露更隐蔽（k 只有部分比特偏斜、或高低位有已知值），
      * 同一族信息会变成一组带小系数的同余式，那正是格/LLL 类方法（lattice attack）的用武之地。
      */
+    @TraceExecution(value = "SM2 低熵 k 攻击", algorithm = "SM2", flow = "SM2-KREUSE")
     @Test
     public void biasedKDistributionIsMeasuredAndThenExploited()
         throws Exception
     {
+        setHelperTrace(false);
         Calc.useBc();
+        Tracer.trace("start", new Object[]{"attack", "biased k distribution", "pool", K_POOL},
+            null, "start");
+
         KeyPair kp = sm2KeyPair();
         BigInteger d = ((ECPrivateKey) kp.getPrivate()).getD();
         BigInteger[] pub = publicKeyOf(kp);
@@ -1355,6 +1776,8 @@ public class Sm2EssenceTest
         Assert.assertTrue("有效位长只有 " + maxBitLength + " bit，远低于 255", maxBitLength <= 16);
         Assert.assertTrue("桶分布摊不开，观测熵只有 " + entropyBits + " bit，远小于 k 需要的 ~255 bit",
             entropyBits < 8.0);
+        Tracer.trace("collect", new Object[]{"samples", samples, "duplicates", duplicates,
+            "entropyBits", entropyBits, "maxBitLength", maxBitLength}, histogram, "collect");
 
         // ---- 攻击(a)：值域可枚举。逐格往前走一格 = 一次点加，比重新做标量乘便宜三个数量级
         // firstTarget = x₁ 的期望值 = (r₀ − e₀) mod n，纯由公开签名和消息算出（免费 oracle）
@@ -1376,10 +1799,16 @@ public class Sm2EssenceTest
                 break;
             }
         }
+        Tracer.trace("solve", new Object[]{"pool", K_POOL, "firstTarget", firstTarget, "adds", adds},
+            enumeratedK, "solve");
         Assert.assertNotNull("枚举 2^10 个候选必须命中第一枚签名的 k", enumeratedK);
         Assert.assertEquals("命中值应与弱池实际用的 k 相同", ks[0], enumeratedK);
-        Assert.assertEquals("枚举到 k 之后仍然是一次模逆还原私钥", d,
-            privateKeyFromKnownK(enumeratedK, sigs[0][0], sigs[0][1]));
+        BigInteger recoveredFromEnum = privateKeyFromKnownK(enumeratedK, sigs[0][0], sigs[0][1]);
+        Tracer.trace("recover", new Object[]{"k", enumeratedK, "r", sigs[0][0], "s", sigs[0][1]},
+            recoveredFromEnum, "recover");
+        Assert.assertEquals("枚举到 k 之后仍然是一次模逆还原私钥", d, recoveredFromEnum);
+        Tracer.traceDecision("verify", new Object[]{"d", d, "recoveredFromEnum", recoveredFromEnum},
+            d.equals(recoveredFromEnum), "verify", "recovered == d");
         log.info("[SM2-低熵k] 值域 {} 个候选、{} 次点加就枚举到 k；真随机时空间是 2^{} 且无规律可用",
             K_POOL, adds, N.bitLength());
 
@@ -1402,8 +1831,12 @@ public class Sm2EssenceTest
         BigInteger viaCollision = privateKeyFromKnownDelta(BigInteger.ZERO,
             sigs[collisionA][0], sigs[collisionA][1], sigs[collisionB][0], sigs[collisionB][1]);
         Assert.assertEquals("撞车的那两枚签名直接给出 d", d, viaCollision);
-        Assert.assertArrayEquals("公钥核对", pub, mul(viaCollision, G));
+        BigInteger[] collisionPub = mul(viaCollision, G);
+        Assert.assertArrayEquals("公钥核对", pub, collisionPub);
         assertRecoveredKeyCanForge(kp, viaCollision, za);
+        Tracer.trace("exploit", new Object[]{"collisionA", collisionA, "collisionB", collisionB,
+            "duplicates", duplicates, "viaCollision", viaCollision, "pubMatch", Arrays.equals(pub, collisionPub)},
+            viaCollision, "exploit");
         log.info("[SM2-频率分布] {} 枚签名里 {} 次重复，第 {} / {} 枚撞车 -> 套 Δ=0 公式得到 d",
             samples, duplicates, collisionA, collisionB);
 
@@ -1434,25 +1867,72 @@ public class Sm2EssenceTest
             secureMinBits >= 200);
         log.info("[SM2-真随机对照] {} 枚签名的 k 两两不同，位长全部 ≥ {} bit；弱池只有 {} 个格子（约 2^{} bit），"
             + "所以值域枚举与撞车两条攻击都失效", samples, secureMinBits, K_POOL, 10);
+        Tracer.trace("end", new Object[]{"recoveredD", viaCollision, "duplicates", duplicates,
+            "secureDuplicates", secureDuplicates, "secureMinBits", secureMinBits}, Boolean.TRUE, "end");
+        setHelperTrace(true);
     }
 
     // ---------------------------------------------------------------- 辅助
 
     /**
-     * BC 的 "SM2" KeyPairGenerator 若不显式 initialize，默认曲线并不是 sm2p256v1，
-     * 而本类所有静态方法都只用 GB/T 32918 的曲线常量，所以必须显式指定命名曲线，
-     * 否则"我们的 dG"和"BC 的公钥"根本不在同一条曲线上。
-     *
-     * <p>术语：命名曲线 (named curve) 就是"给一组 (p, a, b, n, Gx, Gy) 起一个登记过的名字"，
-     * 这里叫 sm2p256v1；双方只交换这个名字就交换了全部曲线常数，也就没有"参数被偷偷改掉"的余地
-     * —— 这与 ZA 把 a/b/Gx/Gy 写进哈希是同一个防篡改思路的两个层面。
+     * 手写密钥生成 —— SM2 密钥对的全部内容就两步（X9.62 §5.2.1，BC 的 ECKeyPairGenerator 同款）：
+     * <pre>
+     *   ① 私钥 d   均匀随机取自 [1, n−1]：new BigInteger(n.bitLength(), random) 生成 n 位宽的随机整数，
+     *              落在 [1, n) 之外（d = 0 或 d ≥ n）就整枚重抽 —— 与 BC 源码里
+     *              isOutOfRangeD(d, n) 的拒绝循环一字不差
+     *   ② 公钥 P   = d·G：密钥生成里唯一的密码学运算就是这一次标量乘（我们自己的倍加循环），
+     *              公钥不是"存的"，是"算"出来的
+     * </pre>
+     * BC 在这两步之外还多一道加固：NAF 权重太低（&lt; n.bitLength()/4）的"瘦标量"也重抽
+     * （WNafUtil.getNafWeight，防侧信道），那是工程加固、不属于"密钥怎么生成"的本质，这里从简不仿。
+     * 算出的 (d, P) 经 {@link #toJceKeyPair} 装回 JCE 信封，BC 的 Signature/Cipher 才吃得下。
      */
     private static KeyPair sm2KeyPair()
         throws Exception
     {
-        KeyPairGenerator kpg = KeyPairGenerator.getInstance("SM2", "BC");
-        kpg.initialize(new org.bouncycastle.jce.spec.ECNamedCurveGenParameterSpec("sm2p256v1"));
-        return kpg.generateKeyPair();
+        long startNanos = System.nanoTime();
+        SecureRandom random = new SecureRandom();
+
+        // ① 私钥：均匀随机 ∈ [1, n−1]，越界整枚重抽（d=0 会让 P=O 无信息；d≥n 会被 n·G=O 的周期性折回）
+        BigInteger d;
+        do
+        {
+            d = new BigInteger(N.bitLength(), random);
+        }
+        while (d.signum() < 1 || d.compareTo(N) >= 0);
+
+        // ② 公钥：P = d·G
+        BigInteger[] pub = mul(d, G);
+
+        long duration = System.nanoTime() - startNanos;
+        KeyPair kp = toJceKeyPair(d, pub);
+
+        if (helperTraceEnabled())
+        {
+            Tracer.trace("keygen", new Object[]{
+                "d", d, "Px", pub[0], "Py", pub[1],
+                "来源", "手写：d∈[1,n-1] 随机 → P=dG"
+            }, kp, "keygen", duration);
+        }
+        return kp;
+    }
+
+    /**
+     * 把手写生成的 (d, P) 装回 JCE 的 KeyPair"信封" —— 这一步只是<b>编码</b>，不参与密钥生成：
+     * ECNamedCurveTable.getParameterSpec("sm2p256v1") 给出命名曲线参数，BC 的 KeyFactory 据此把
+     * 公钥编进带曲线 OID 的 SubjectPublicKeyInfo、私钥编进 PKCS#8，BC 的 Signature/Cipher 才认得
+     * 这对钥匙；信封打开后（getD / getQ）d 与 (Px, Py) 和我们算出的逐位一致（见
+     * {@link #sm2KeyPairGenerationIsScalarMultiplication} 与 {@link #ourPureScalarMulRebuildsBcPublicKey}）。
+     */
+    private static KeyPair toJceKeyPair(BigInteger d, BigInteger[] pub)
+        throws Exception
+    {
+        ECNamedCurveParameterSpec spec = ECNamedCurveTable.getParameterSpec("sm2p256v1");
+        KeyFactory kf = KeyFactory.getInstance("EC", "BC");
+        PublicKey publicKey = kf.generatePublic(
+            new ECPublicKeySpec(spec.getCurve().createPoint(pub[0], pub[1]), spec));
+        PrivateKey privateKey = kf.generatePrivate(new ECPrivateKeySpec(d, spec));
+        return new KeyPair(publicKey, privateKey);
     }
 
     /**

@@ -12,7 +12,11 @@ import org.bouncycastle.asn1.ASN1Sequence;
 import org.bouncycastle.asn1.DERBitString;
 import org.bouncycastle.asn1.DEROctetString;
 import org.bouncycastle.asn1.DERSequence;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -105,6 +109,9 @@ import org.junit.Test;
 @Slf4j
 public class Sm9EncryptEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     /** GmSSL tests/sm9test.c 的加密样例：ID = "Bob"，消息 20 字节。 */
     private static final byte[] ID_BOB = "Bob".getBytes();
     /** 只出现在"拿错收件人私钥"的对照里：标识是公钥的一部分，换 ID 就等于换收件人。 */
@@ -137,10 +144,15 @@ public class Sm9EncryptEssenceTest
      * <p>三条断言分别检查：与标准答案逐字符相同 / 在扭曲曲线 E'(Fp2): y² = x³ + 5u 上 /
      * 阶整除 n（n·de 落到无穷远点）。第二、三条合起来才说明"它在 de 该在的那个子群里"。
      */
+    @TraceExecution(value = "SM9 加密私钥提取对齐 GmSSL", algorithm = "SM9", flow = "SM9-ENCRYPT")
     @Test
     public void encryptionPrivateKeyMatchesGmsslAnswer()
     {
+        Tracer.trace("start", new Object[]{"id", "Bob", "ke_bits", HEX_KE.bitLength(), "hid", Sm9Math.HID_ENC}, null, "start");
+
         BigInteger[][] de = Sm9Math.privateKeyExtract(HEX_KE, ID_BOB, Sm9Math.HID_ENC);
+        Tracer.trace("privateKeyExtract", new Object[]{"ke", HEX_KE, "id", "Bob", "hid", Sm9Math.HID_ENC},
+            Sm9Math.twistToOctets(de), "keygen");
 
         // HEX_DE 只有 128 个 hex 字符（x₁x₀y₁y₀ = 4×32 字节），补上未压缩点前缀才与
         // twistToOctets 的 129 字节输出对齐；toUpperCase 只是排版差异。
@@ -148,15 +160,34 @@ public class Sm9EncryptEssenceTest
         Assert.assertTrue("de 必须在 E'(Fp2): y² = x³ + 5u 上", Sm9Math.twistIsOnCurve(de));
         // G₂ 的阶是素数 n，非无穷远点的倍数只有 0 与 n ⇒ 这条断言确认 de ∈ G₂（不是更大群里的杂点）
         Assert.assertTrue("n·de 必须是无穷远点", Sm9Math.twistIsInfinity(Sm9Math.twistMul(Sm9Math.N, de)));
+        Tracer.traceDecision("checkDe", new Object[]{"de", Sm9Math.twistToOctets(de), "onCurve", Sm9Math.twistIsOnCurve(de),
+                "n_de_isInfinity", Sm9Math.twistIsInfinity(Sm9Math.twistMul(Sm9Math.N, de))},
+            Sm9Math.twistIsOnCurve(de) && Sm9Math.twistIsInfinity(Sm9Math.twistMul(Sm9Math.N, de)),
+            "keygen", "de ∈ G₂ 且 n·de = O");
 
         // 同一个 ke、同一个 Bob，换个 hid 就是另一把私钥：加密私钥绝不能拿来签名或交换
         // （公式只差 H1 的第二个字节：0x03 vs 0x01 ⇒ 分母不同 ⇒ G₂ 里完全不同的点）
         Assert.assertFalse(Arrays.equals(Sm9Math.twistToOctets(de),
             Sm9Math.twistToOctets(Sm9Math.privateKeyExtract(HEX_KE, ID_BOB, Sm9Math.HID_SIGN))));
+        Tracer.traceDecision("compare.answer", new Object[]{"actual", Sm9Math.twistToOctets(de),
+                "expected", "04" + HEX_DE},
+            ("04" + HEX_DE).equalsIgnoreCase(Calc.hex(Sm9Math.twistToOctets(de))),
+            "compare", "de == GmSSL hex_de");
+        Tracer.traceDecision("compare.hidIsolation", new Object[]{"de_enc", Sm9Math.twistToOctets(de),
+                "de_sign", Sm9Math.twistToOctets(Sm9Math.privateKeyExtract(HEX_KE, ID_BOB, Sm9Math.HID_SIGN))},
+            !Arrays.equals(Sm9Math.twistToOctets(de),
+                Sm9Math.twistToOctets(Sm9Math.privateKeyExtract(HEX_KE, ID_BOB, Sm9Math.HID_SIGN))),
+            "compare", "hid 0x03 与 0x01 导出不同私钥");
         // 换个标识就是另一把私钥 —— 这就是"标识即公钥"
         Assert.assertFalse(Arrays.equals(Sm9Math.twistToOctets(de),
             Sm9Math.twistToOctets(Sm9Math.privateKeyExtract(HEX_KE, ID_ALICE, Sm9Math.HID_ENC))));
+        Tracer.traceDecision("compare.idIsolation", new Object[]{"de_bob", Sm9Math.twistToOctets(de),
+                "de_alice", Sm9Math.twistToOctets(Sm9Math.privateKeyExtract(HEX_KE, ID_ALICE, Sm9Math.HID_ENC))},
+            !Arrays.equals(Sm9Math.twistToOctets(de),
+                Sm9Math.twistToOctets(Sm9Math.privateKeyExtract(HEX_KE, ID_ALICE, Sm9Math.HID_ENC))),
+            "compare", "Bob 与 Alice 的加密私钥不同");
         log.info("de = {}", Calc.hex(Sm9Math.twistToOctets(de)));
+        Tracer.trace("end", new Object[]{"de", Sm9Math.twistToOctets(de)}, null, "end");
     }
 
     /**
@@ -171,11 +202,15 @@ public class Sm9EncryptEssenceTest
      *   KDF 是前缀流             取 52 字节的前 16 字节 == 直接取 16 字节（见下面那段说明）
      * </pre>
      */
+    @TraceExecution(value = "SM9 KEM 两条路线因配对消去分母而一致", algorithm = "SM9", flow = "SM9-ENCRYPT")
     @Test
     public void kemRoutesAgreeBecausePairingCancelsTheDenominator()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"id", "Bob", "klen", KLEN, "r", R}, null, "start");
+
         byte[] out = Sm9Math.kemEncrypt(HEX_KE, ID_BOB, KLEN, R);
+        Tracer.trace("kemEncrypt", new Object[]{"ke", HEX_KE, "id", "Bob", "klen", KLEN, "r", R}, out, "genR");
         Assert.assertEquals(65 + KLEN, out.length);
         // 前 65 字节 = C1 的 0x04‖x‖y（含未压缩点前缀），后面才是 KEM 吐出的 klen 字节密钥
         byte[] c1 = Arrays.copyOfRange(out, 0, 65);
@@ -190,6 +225,8 @@ public class Sm9EncryptEssenceTest
 
         // C1 = r·Q = r·(H1+ke)·P1 —— 两条路线同一个点
         BigInteger[] q = Sm9Math.kemQ(HEX_KE, ID_BOB);
+        Tracer.trace("pointMul.C1", new Object[]{"r", R, "Q", Sm9Math.pointToOctets(q)},
+            Sm9Math.pointToOctets(Sm9Math.pointMul(R, q)), "pointMul");
         Assert.assertEquals(Calc.hex(Sm9Math.pointToOctets(Sm9Math.pointMul(R, q))), Calc.hex(c1));
         // 第二个写法是"先把标量算齐 (H1+ke)·r mod n，再对 P1 乘一次"：
         // 群的结合律/分配律断言 r·(m·P1) = (r·m mod n)·P1。n 是 P1 的阶，所以标量可以mod n 化简。
@@ -204,6 +241,13 @@ public class Sm9EncryptEssenceTest
             Sm9Math.privateKeyExtract(HEX_KE, ID_BOB, Sm9Math.HID_ENC), Sm9Math.pointFromOctets(c1));
         BigInteger[] wEncrypt = Sm9Math.fp12Pow(
             Sm9Math.pairing(Sm9Math.P2, Sm9Math.encMasterPublicKey(HEX_KE)), R);
+        Tracer.trace("w.decrypt", new Object[]{"de", Sm9Math.twistToOctets(
+            Sm9Math.privateKeyExtract(HEX_KE, ID_BOB, Sm9Math.HID_ENC)), "C1", c1},
+            Sm9Math.fp12ToBytes(wDecrypt), "w");
+        Tracer.trace("w.encrypt", new Object[]{"Ppube", Sm9Math.encMasterPublicKey(HEX_KE), "r", R},
+            Sm9Math.fp12ToBytes(wEncrypt), "w");
+        Tracer.trace("kemDecrypt.K", new Object[]{"ke", HEX_KE, "id", "Bob", "klen", KLEN, "C1", c1},
+            kDecrypt, "kdf");
         // 两次 fp12ToBytes 之后再比字符串：384 个字节全等才算"同一个 GT 元素"，
         // 而不是"数值上大概是同一个"（GT 元素的表示在塔域里是唯一的，没有等价写法可容忍）。
         Assert.assertEquals(Calc.hex(Sm9Math.fp12ToBytes(wEncrypt)), Calc.hex(Sm9Math.fp12ToBytes(wDecrypt)));
@@ -214,7 +258,18 @@ public class Sm9EncryptEssenceTest
         // 之所以能这么"截"：SM3 计数器流的第 i 段只依赖 Z 和 i，与总共要几段无关。
         byte[] longK = Sm9Math.kemDecrypt(HEX_KE, ID_BOB, MESSAGE.length + 32, c1);
         Assert.assertArrayEquals(kDecrypt, Arrays.copyOfRange(longK, 0, KLEN));
+        Tracer.trace("kdf.prefix", new Object[]{"klen", KLEN, "longKlen", MESSAGE.length + 32},
+            Arrays.copyOfRange(longK, 0, KLEN), "kdf");
+        Tracer.traceDecision("compare.K", new Object[]{"kEncrypt", kEncrypt, "kDecrypt", kDecrypt},
+            Arrays.equals(kEncrypt, kDecrypt), "compare", "加密侧 K == 解密侧 K");
+        Tracer.traceDecision("compare.w", new Object[]{"wEncrypt", Sm9Math.fp12ToBytes(wEncrypt),
+                "wDecrypt", Sm9Math.fp12ToBytes(wDecrypt)},
+            Arrays.equals(Sm9Math.fp12ToBytes(wEncrypt), Sm9Math.fp12ToBytes(wDecrypt)),
+            "compare", "e(Ppube,P2)^r == e(C1,de)");
+        Tracer.traceDecision("compare.kdfPrefix", new Object[]{"shortK", kDecrypt, "longK_prefix", Arrays.copyOfRange(longK, 0, KLEN)},
+            Arrays.equals(kDecrypt, Arrays.copyOfRange(longK, 0, KLEN)), "compare", "KDF 是前缀流");
         log.info("C1 = {} K = {}", Calc.hex(c1), Calc.hex(kDecrypt));
+        Tracer.trace("end", new Object[]{"C1", c1, "K", kDecrypt}, null, "end");
     }
 
     /**
@@ -244,10 +299,13 @@ public class Sm9EncryptEssenceTest
      * 真实实现还要把这些拒绝的<b>错误信息与耗时统一</b>，否则"抛哪种异常"本身又是一个 oracle
      * （本测试的 decryptThrows 只看"有没有抛"，把消息文本丢了，就是为了不把这点差异当成安全证明）。
      */
+    @TraceExecution(value = "SM9 密文就是异或加 K 尾部的 HMAC", algorithm = "SM9", flow = "SM9-ENCRYPT")
     @Test
     public void ciphertextIsJustXorPlusHmacOverTheTailOfK()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"id", "Bob", "message", MESSAGE, "r", R}, null, "start");
+
         byte[] ct = Sm9Math.encrypt(HEX_KE, ID_BOB, MESSAGE, R);
         // 布局：C1 定长 65（含 0x04 前缀）、C3 定长 32（HMAC-SM3 的输出）、C2 与明文等长
         Assert.assertEquals(65 + 32 + MESSAGE.length, ct.length);
@@ -257,13 +315,22 @@ public class Sm9EncryptEssenceTest
 
         // 解密侧独立复算 K（长度 = 明文 + 32）
         byte[] k = Sm9Math.kemDecrypt(HEX_KE, ID_BOB, MESSAGE.length + 32, c1);
+        Tracer.trace("kemDecrypt.K", new Object[]{"ke", HEX_KE, "id", "Bob", "klen", MESSAGE.length + 32, "C1", c1},
+            k, "kdf");
         Assert.assertArrayEquals("C2 = M ⊕ K[0..len)",
             Calc.xor(Arrays.copyOfRange(k, 0, MESSAGE.length), MESSAGE), c2);
+        Tracer.trace("xor.C2", new Object[]{"K_mask", Arrays.copyOfRange(k, 0, MESSAGE.length), "M", MESSAGE}, c2, "c2");
         Assert.assertArrayEquals("C3 = HMAC-SM3(K[len..len+32], C2)",
             Sm9Math.hmacSm3(Arrays.copyOfRange(k, MESSAGE.length, k.length), c2), c3);
+        Tracer.trace("hmacSm3.C3", new Object[]{"K_mac", Arrays.copyOfRange(k, MESSAGE.length, k.length), "C2", c2},
+            c3, "c3");
 
         // 正常路径
         Assert.assertArrayEquals(MESSAGE, Sm9Math.decrypt(HEX_KE, ID_BOB, c1, c2, c3));
+        Tracer.traceDecision("compare.roundtrip", new Object[]{"M", MESSAGE, "decrypted",
+                Sm9Math.decrypt(HEX_KE, ID_BOB, c1, c2, c3)},
+            Arrays.equals(MESSAGE, Sm9Math.decrypt(HEX_KE, ID_BOB, c1, c2, c3)),
+            "compare", "decrypt(encrypt(M)) == M");
 
         // 改 C2 的一个字节：异或会跟着翻一位（M' = M ⊕ 0x01），但 HMAC 先拦下它
         // 这一条就是"没有 MAC 的 SM9 加密 = 完全可延展 (malleable)"的反面教材：
@@ -271,15 +338,21 @@ public class Sm9EncryptEssenceTest
         byte[] tamperedC2 = c2.clone();
         tamperedC2[0] ^= 0x01;
         Assert.assertTrue("C2 被改必须抛异常", decryptThrows(HEX_KE, ID_BOB, c1, tamperedC2, c3));
+        Tracer.traceDecision("compare.rejectC2", new Object[]{"tamperedC2", tamperedC2, "C3", c3},
+            decryptThrows(HEX_KE, ID_BOB, c1, tamperedC2, c3), "compare", "改 C2 必须被 C3 拦下");
 
         // 改 C3：MAC 直接对不上
         byte[] tamperedC3 = c3.clone();
         tamperedC3[31] ^= 0x01;
         Assert.assertTrue("C3 被改必须抛异常", decryptThrows(HEX_KE, ID_BOB, c1, c2, tamperedC3));
+        Tracer.traceDecision("compare.rejectC3", new Object[]{"C2", c2, "tamperedC3", tamperedC3},
+            decryptThrows(HEX_KE, ID_BOB, c1, c2, tamperedC3), "compare", "改 C3 必须被拒绝");
 
         // 换收件人：标识是公钥的一部分，拿 Alice 的私钥解 Bob 的密文只会 MAC 失败
         // （注意 KDF 的种子末尾也拼了 ID，所以"ID 用错"在两处同时改变 K：de 与 Z。）
         Assert.assertTrue("标识不符必须拒绝", decryptThrows(HEX_KE, ID_ALICE, c1, c2, c3));
+        Tracer.traceDecision("compare.rejectId", new Object[]{"id", "Alice", "C1", c1, "C2", c2, "C3", c3},
+            decryptThrows(HEX_KE, ID_ALICE, c1, c2, c3), "compare", "换收件人标识必须被拒绝");
 
         // C1 不在曲线上（比如被人塞了个乱点）也要被拒绝：这是 GmSSL B1 步的群成员检查
         byte[] bogusC1 = Sm9Math.pointToOctets(Sm9Math.pointAdd(Sm9Math.pointFromOctets(c1), Sm9Math.P1));
@@ -287,7 +360,10 @@ public class Sm9EncryptEssenceTest
         // 下标 40 落在 y 区间（C1 = 0x04 ‖ x[1..33) ‖ y[33..65)），改它不影响 x，
         // 于是这个"点"能顺利通过 pointFromOctets 的长度/前缀检查，只被 pointIsOnCurve 挡下。
         Assert.assertTrue("C1 不在 G₁ 上必须拒绝", decryptThrows(HEX_KE, ID_BOB, bogusC1, c2, c3));
+        Tracer.traceDecision("compare.rejectC1", new Object[]{"bogusC1", bogusC1, "onCurve", Sm9Math.pointIsOnCurve(Sm9Math.pointFromOctets(bogusC1))},
+            decryptThrows(HEX_KE, ID_BOB, bogusC1, c2, c3), "compare", "C1 不在 G₁ 上必须被拒绝");
         log.info("密文 {} 字节 = C1(65) ‖ C3(32) ‖ C2({})", ct.length, MESSAGE.length);
+        Tracer.trace("end", new Object[]{"ciphertext", ct, "len", ct.length}, null, "end");
     }
 
     /**
@@ -316,15 +392,19 @@ public class Sm9EncryptEssenceTest
      * 明文一旦长到让内层总长度 ≥ 128，Length 就要改成"0x81 + 1 字节"的两字节形式（DER 的
      * 长长度标记），整包字节数会比上面多 1 —— 这也是为什么 log 里那行数字值得看一眼。
      */
+    @TraceExecution(value = "SM9 密文 DER：type=0、C1、C3、C2", algorithm = "SM9", flow = "SM9-ENCRYPT")
     @Test
     public void ciphertextDerKeepsTypeZeroC1C3ThenC2()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"id", "Bob", "message", MESSAGE, "r", R}, null, "start");
+
         byte[] ct = Sm9Math.encrypt(HEX_KE, ID_BOB, MESSAGE, R);
         // 先按"扁平布局"切出三段（C1 65 ‖ C3 32 ‖ C2 余下），再重新装进 ASN.1 结构
         byte[] c1 = Arrays.copyOfRange(ct, 0, 65);
         byte[] c3 = Arrays.copyOfRange(ct, 65, 97);
         byte[] c2 = Arrays.copyOfRange(ct, 97, ct.length);
+        Tracer.trace("encrypt.split", new Object[]{"ciphertext", ct}, new Object[]{"C1", c1, "C3", c3, "C2", c2}, "c2");
 
         ASN1EncodableVector vector = new ASN1EncodableVector();
         vector.add(new ASN1Integer(0));
@@ -332,20 +412,37 @@ public class Sm9EncryptEssenceTest
         vector.add(new DEROctetString(c3));
         vector.add(new DEROctetString(c2));
         byte[] der = new DERSequence(vector).getEncoded();
+        Tracer.trace("DERSequence.encode", new Object[]{"type", 0, "C1", c1, "C3", c3, "C2", c2}, der, "c3");
 
         ASN1Sequence parsed = ASN1Sequence.getInstance(der);
         Assert.assertEquals(4, parsed.size());
+        Tracer.traceDecision("compare.fieldCount", new Object[]{"size", parsed.size()}, parsed.size() == 4,
+            "compare", "SEQUENCE 含 4 个元素");
         // type 段：只检查"值是 0"（signum()==0），因为 INTEGER 的字节宽度属于编码细节
         Assert.assertEquals(0, ASN1Integer.getInstance(parsed.getObjectAt(0)).getValue().signum());
+        Tracer.traceDecision("compare.type", new Object[]{"type", ASN1Integer.getInstance(parsed.getObjectAt(0)).getValue()},
+            ASN1Integer.getInstance(parsed.getObjectAt(0)).getValue().signum() == 0,
+            "compare", "type == 0（XOR 模式）");
         byte[] parsedC1 = ASN1BitString.getInstance(parsed.getObjectAt(1)).getOctets();
         Assert.assertArrayEquals(c1, parsedC1);
         Assert.assertEquals(65, parsedC1.length);
         // 0x04 未压缩点前缀必须活着：BIT STRING 不做"去掉前导零"这类数值化约，
         // 所以取回来还是原样 65 字节，交给 pointFromOctets 时第一关就是认这个前缀。
         Assert.assertEquals(0x04, parsedC1[0] & 0xff);
+        Tracer.traceDecision("compare.c1", new Object[]{"parsedC1", parsedC1, "C1", c1, "len", parsedC1.length,
+                "prefix", parsedC1[0] & 0xff},
+            Arrays.equals(c1, parsedC1) && parsedC1.length == 65 && (parsedC1[0] & 0xff) == 0x04,
+            "compare", "BIT STRING C1 一致且保留 0x04 前缀");
         Assert.assertArrayEquals(c3, ASN1OctetString.getInstance(parsed.getObjectAt(2)).getOctets());
+        Tracer.traceDecision("compare.c3", new Object[]{"parsedC3", ASN1OctetString.getInstance(parsed.getObjectAt(2)).getOctets(),
+                "C3", c3}, Arrays.equals(c3, ASN1OctetString.getInstance(parsed.getObjectAt(2)).getOctets()),
+            "compare", "OCTET STRING C3 一致");
         Assert.assertArrayEquals(c2, ASN1OctetString.getInstance(parsed.getObjectAt(3)).getOctets());
+        Tracer.traceDecision("compare.c2", new Object[]{"parsedC2", ASN1OctetString.getInstance(parsed.getObjectAt(3)).getOctets(),
+                "C2", c2}, Arrays.equals(c2, ASN1OctetString.getInstance(parsed.getObjectAt(3)).getOctets()),
+            "compare", "OCTET STRING C2 一致");
         log.info("SM9 密文 DER {} 字节", der.length);
+        Tracer.trace("end", new Object[]{"der", der, "derLen", der.length}, null, "end");
     }
 
     /** 全零判定（GmSSL 用 mem_is_zero 挡下 KDF 退化）。
