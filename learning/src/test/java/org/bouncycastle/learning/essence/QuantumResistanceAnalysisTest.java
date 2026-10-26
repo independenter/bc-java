@@ -6,8 +6,12 @@ import java.util.Arrays;
 
 import lombok.extern.slf4j.Slf4j;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -60,6 +64,9 @@ import org.junit.Test;
 @Slf4j
 public class QuantumResistanceAnalysisTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(QuantumResistanceAnalysisTest.class);
 
     @BeforeClass
@@ -87,24 +94,33 @@ public class QuantumResistanceAnalysisTest
      * <p><b>为什么这能分解 N</b>：若 r 是偶数且 a^{r/2} ≢ −1 (mod N)，则
      * gcd(a^{r/2} − 1, N) 与 gcd(a^{r/2} + 1, N) 都是 N 的非平凡因子。
      */
+    @TraceExecution(value = "Shor 算法破解分解与离散对数", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void shorAlgorithmBreaksFactoringAndDiscreteLog()
     {
         // 演示：N = 15, a = 2, 周期 r = 4（因为 2^4 = 16 ≡ 1 mod 15）
         int N = 15;
         int a = 2;
+        Tracer.trace("start", new Object[]{"N", N, "a", a}, "周期查找→分解", "start");
         int r = findPeriod(a, N);
         Assert.assertEquals("2 的周期 mod 15 是 4", 4, r);
+        Tracer.trace("findPeriod", new Object[]{"a", a, "N", N}, r, "shor");
 
         // 用周期分解 N
         if (r % 2 == 0)
         {
             int half = modPow(a, r / 2, N);
+            Tracer.trace("modPow", new Object[]{
+                "a", a, "exp", r / 2, "N", N
+            }, half, "shor");
             if (half != N - 1)
             {
                 int factor1 = gcd(half - 1, N);
                 int factor2 = gcd(half + 1, N);
                 log.info("[Shor-分解] N={} = {} × {}", N, factor1, factor2);
+                Tracer.trace("factorViaGcd", new Object[]{
+                    "half-1", half - 1, "half+1", half + 1
+                }, factor1 + " × " + factor2, "shor");
                 Assert.assertTrue("因子非平凡", factor1 > 1 && factor1 < N);
                 Assert.assertTrue("因子非平凡", factor2 > 1 && factor2 < N);
                 Assert.assertEquals("因子乘积等于 N", N, factor1 * factor2);
@@ -116,14 +132,21 @@ public class QuantumResistanceAnalysisTest
         a = 2;
         r = findPeriod(a, N);
         Assert.assertEquals("2 的周期 mod 21 是 6", 6, r);
+        Tracer.trace("findPeriod", new Object[]{"a", a, "N", N}, r, "shor");
         int half = modPow(a, r / 2, N);
         int f1 = gcd(half - 1, N);
         int f2 = gcd(half + 1, N);
         log.info("[Shor-分解] N={} = {} × {}", N, f1, f2);
+        Tracer.trace("factorViaGcd", new Object[]{
+            "half", half, "N", N
+        }, f1 + " × " + f2, "shor");
         Assert.assertEquals("21 = 3 × 7", 21, f1 * f2);
 
         // 结论：Shor 把分解化成求周期，QFT 在量子机上 poly(n) 时间完成
         log.info("[Shor-结论] RSA/ECC/DH 的数学结构（周期/离散对数）能被量子傅里叶变换高效破解");
+        Tracer.trace("end", new Object[]{
+            "N1", 15, "N2", 21
+        }, "3×5 与 3×7 均由周期分解得到", "end");
     }
 
     /**
@@ -189,33 +212,50 @@ public class QuantumResistanceAnalysisTest
      *
      * <p>本测试演示 LLL 算法的经典复杂度，并说明为何量子无法复制 Shor 的成功。
      */
+    @TraceExecution(value = "格难题无已知量子加速", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void latticeProblemsHaveNoKnownQuantumSpeedup()
     {
         // 演示：2 维格的 LLL 规约
         // 基向量 b1 = (1, 1), b2 = (1, -1)，已是最短基
         int[][] basis = { { 1, 1 }, { 1, -1 } };
+        Tracer.trace("start", new Object[]{
+            "dim", 2, "basis", Arrays.deepToString(basis)
+        }, "LLL 格基规约", "start");
         int[][] reduced = lllReduce(basis);
         log.info("[LLL-规约] 输入基 = {}, 规约后 = {}", Arrays.deepToString(basis), Arrays.deepToString(reduced));
+        Tracer.trace("lllReduce", new Object[]{
+            "basis", Arrays.deepToString(basis)
+        }, Arrays.deepToString(reduced), "lattice");
 
         // 3 维格的例子
         basis = new int[][] { { 1, 0, 0 }, { 0, 1, 0 }, { 1, 1, 2 } };
         reduced = lllReduce(basis);
         log.info("[LLL-规约] 3 维格规约完成，最短向量长度 ≈ {}", vectorNorm(reduced[0]));
+        Tracer.trace("lllReduce3d", new Object[]{
+            "basis", Arrays.deepToString(basis)
+        }, "shortestNorm=" + vectorNorm(reduced[0]), "lattice");
 
         // LLL 复杂度：O(n⁶) 其中 n 是维数。对 n=256，约 2^{48} 次操作，远不够破解
         int n = 256;
         long lllOps = (long) Math.pow(n, 6);
         log.info("[LLL-复杂度] n={} 维格的 LLL 规约约需 {} 次操作（O(n⁶)）", n, lllOps);
+        Tracer.trace("lllComplexity", new Object[]{"n", n}, lllOps, "lattice");
 
         // BKZ 更强：块大小 k 越大越精确，但复杂度 2^{O(k)}
         // 对 k=256，复杂度约 2^{128}，经典与量子都一样（Grover 只给二次加速）
         int k = 256;
         double bkzOps = Math.pow(2, k / 2.0); // Grover 加速后
         log.info("[BKZ-复杂度] 块大小 k={} 的 BKZ 规约约需 2^{:.1f} 次操作（量子 Grover 加速后）", k, Math.log(bkzOps) / Math.log(2));
+        Tracer.trace("bkzComplexity", new Object[]{
+            "k", k, "quantum", "Grover"
+        }, bkzOps, "lattice");
 
         // 结论：格难题没有 Shor 那样的量子多项式算法，只有 Grover 的二次加速
         log.info("[格-结论] SVP/LWE 在量子下仍需 2^{Ω(n)} 时间，ML-KEM/ML-DSA 因此抗量子");
+        Tracer.trace("end", new Object[]{
+            "lllOps", lllOps, "bkzLog2", Math.log(bkzOps) / Math.log(2)
+        }, "Lattice problems keep exponential quantum cost", "end");
     }
 
     /**
@@ -285,6 +325,7 @@ public class QuantumResistanceAnalysisTest
      *
      * <p>本测试演示 Grover 的二次加速本质，并对比 Shor 的指数级加速。
      */
+    @TraceExecution(value = "Grover 对哈希只减半安全性", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void groverOnlyHalvesSecurityForHashes()
         throws Exception
@@ -293,13 +334,19 @@ public class QuantumResistanceAnalysisTest
         int N = 1 << 20;
         int target = 123456;
 
+        Tracer.trace("start", new Object[]{
+            "N", N, "target", target
+        }, "Grover 二次加速", "start");
+
         // 经典暴力：平均需 N/2 = 2^19 次查询
         int classicalQueries = N / 2;
         log.info("[Grover-经典] 在 N=2^{} 个元素里找目标需约 2^{} 次查询", 20, 19);
+        Tracer.trace("classicalSearch", new Object[]{"N", N}, classicalQueries, "grover");
 
         // 量子 Grover：需 √N = 2^10 次查询
         int quantumQueries = (int) Math.sqrt(N);
         log.info("[Grover-量子] Grover 搜索只需 2^{} 次查询（二次加速）", 10);
+        Tracer.trace("groverSearch", new Object[]{"N", N}, quantumQueries, "grover");
 
         Assert.assertEquals("Grover 查询次数 = √N", quantumQueries, (int) Math.sqrt(N));
 
@@ -309,20 +356,33 @@ public class QuantumResistanceAnalysisTest
         double classicalFactoring = Math.pow(2, 112); // GNFS 近似
         double quantumFactoring = Math.pow(2, 64);    // Shor 近似
         log.info("[Shor-对比] 分解 {}-bit RSA：经典 2^112，量子 2^64（指数级加速）", rsaBits);
+        Tracer.trace("shorCompare", new Object[]{
+            "rsaBits", rsaBits, "classical", "2^112", "quantum", "2^64"
+        }, "指数级加速", "grover");
 
         // 哈希安全性对比
         int sha256Bits = 256;
         int sha256ClassicalSecurity = 128; // 碰撞攻击 2^{128}
         int sha256QuantumSecurity = 85;    // Grover + BHT 加速后
         log.info("[哈希-安全性] SHA-256：经典 {}-bit，量子 {}-bit（只减半）", sha256ClassicalSecurity, sha256QuantumSecurity);
+        Tracer.trace("hashSecurity", new Object[]{
+            "sha256Bits", sha256Bits, "classical", sha256ClassicalSecurity
+        }, sha256QuantumSecurity, "grover");
 
         // SLH-DSA 的应对：用 SHAKE256（输出 256 字节），量子下仍有 128-bit 安全性
         int shake256OutputBits = 256 * 8;
         int shake256QuantumSecurity = shake256OutputBits / 2 - 20; // Grover 加速后，减去常数因子
         log.info("[SLH-DSA] SHAKE256 输出 {} bit，量子下仍有约 {}-bit 安全性", shake256OutputBits, shake256QuantumSecurity);
+        Tracer.trace("shake256Security", new Object[]{
+            "outputBits", shake256OutputBits
+        }, shake256QuantumSecurity, "grover");
 
         // 结论：Grover 只给二次加速，哈希签名通过翻倍长度就能扛住
         log.info("[Grover-结论] SLH-DSA 只用哈希原语，量子下安全性只减半（非崩溃），因此抗量子");
+        Tracer.trace("end", new Object[]{
+            "classicalQueries", classicalQueries, "quantumQueries", quantumQueries,
+            "shake256QuantumSecurity", shake256QuantumSecurity
+        }, "Grover halves security only", "end");
     }
 
     // =====================================================================
@@ -342,29 +402,46 @@ public class QuantumResistanceAnalysisTest
      *
      * <p>本测试用可执行代码验证这张表的每一行。
      */
+    @TraceExecution(value = "后量子方案安全假设对比", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void compareSecurityAssumptionsAcrossPqSchemes()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{
+            "schemes", "RSA/ECC/ML-KEM/SLH-DSA"
+        }, "安全假设对比", "start");
+
         // RSA：经典 GNFS 复杂度 exp(O(n^{1/3} (log n)^{2/3}))
         int rsaBits = 2048;
         double rsaClassicalOps = Math.exp(Math.pow(rsaBits, 1.0 / 3) * Math.pow(Math.log(rsaBits), 2.0 / 3));
         log.info("[RSA] {}-bit 经典分解复杂度 ≈ 2^{:.1f}", rsaBits, Math.log(rsaClassicalOps) / Math.log(2));
+        Tracer.trace("rsaClassical", new Object[]{
+            "bits", rsaBits
+        }, "log2Ops=" + Math.log(rsaClassicalOps) / Math.log(2), "compare");
 
         // ECC：经典 Pollard rho 复杂度 exp(O(√n))
         int eccBits = 256;
         double eccClassicalOps = Math.exp(Math.sqrt(eccBits));
         log.info("[ECC] {}-bit 经典离散对数复杂度 ≈ 2^{:.1f}", eccBits, Math.log(eccClassicalOps) / Math.log(2));
+        Tracer.trace("eccClassical", new Object[]{
+            "bits", eccBits
+        }, "log2Ops=" + Math.log(eccClassicalOps) / Math.log(2), "compare");
 
         // ML-KEM：格基规约 BKZ 复杂度 2^{O(k)}，k ≈ n/2
         int mlKemDimension = 256;
         double mlKemOps = Math.pow(2, mlKemDimension / 2.0);
         log.info("[ML-KEM] {} 维格经典复杂度 ≈ 2^{:.1f}", mlKemDimension, Math.log(mlKemOps) / Math.log(2));
+        Tracer.trace("mlKemClassical", new Object[]{
+            "dimension", mlKemDimension
+        }, "log2Ops=" + Math.log(mlKemOps) / Math.log(2), "compare");
 
         // SLH-DSA：哈希碰撞生日攻击 2^{n/2}
         int sha256Bits = 256;
         double slhDsaOps = Math.pow(2, sha256Bits / 2.0);
         log.info("[SLH-DSA] SHA-256 碰撞攻击复杂度 = 2^{}", sha256Bits / 2);
+        Tracer.trace("slhDsaCollision", new Object[]{
+            "sha256Bits", sha256Bits
+        }, "log2Ops=" + Math.log(slhDsaOps) / Math.log(2), "compare");
 
         // 量子加速对比
         log.info("[量子加速] RSA/ECC：Shor 多项式时间（指数级加速）");
@@ -373,6 +450,10 @@ public class QuantumResistanceAnalysisTest
 
         // 结论：格与哈希在量子下没有指数级加速，因此抗量子
         log.info("[总结] 后量子密码的安全性来自：(1) 格难题无量子多项式算法；(2) 哈希只受 Grover 二次加速");
+        Tracer.trace("end", new Object[]{
+            "rsaBits", rsaBits, "eccBits", eccBits,
+            "mlKemDimension", mlKemDimension, "sha256Bits", sha256Bits
+        }, "PQC assumptions compared", "end");
     }
 
     // =====================================================================
@@ -391,9 +472,14 @@ public class QuantumResistanceAnalysisTest
      *
      * <p>本测试验证 NIST 后量子标准的参数选择是否符合这一原则。
      */
+    @TraceExecution(value = "后量子参数选择原则", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void parameterChoicesFollowQuantumSecurityPrinciples()
     {
+        Tracer.trace("start", new Object[]{
+            "standard", "NIST PQC"
+        }, "量子安全 128/192/256-bit", "start");
+
         // ML-KEM 参数：512/768/1024 对应 128/192/256-bit 经典安全性
         // 量子下没有加速，所以参数不变
         int[] mlKemLevels = { 512, 768, 1024 };
@@ -401,6 +487,10 @@ public class QuantumResistanceAnalysisTest
         int[] mlKemQuantumSecurity = { 128, 192, 256 }; // 无加速
         log.info("[ML-KEM] 参数级别 = {}, 经典安全 = {}, 量子安全 = {}",
             Arrays.toString(mlKemLevels), Arrays.toString(mlKemClassicalSecurity), Arrays.toString(mlKemQuantumSecurity));
+        Tracer.trace("mlKemParams", new Object[]{
+            "levels", Arrays.toString(mlKemLevels),
+            "classical", Arrays.toString(mlKemClassicalSecurity)
+        }, "quantum=" + Arrays.toString(mlKemQuantumSecurity), "params");
 
         // ML-DSA 参数：44/65/87 对应 128/192/256-bit 经典安全性
         // 量子下没有加速，所以参数不变
@@ -409,12 +499,19 @@ public class QuantumResistanceAnalysisTest
         int[] mlDsaQuantumSecurity = { 128, 192, 256 }; // 无加速
         log.info("[ML-DSA] 参数级别 = {}, 经典安全 = {}, 量子安全 = {}",
             Arrays.toString(mlDsaLevels), Arrays.toString(mlDsaClassicalSecurity), Arrays.toString(mlDsaQuantumSecurity));
+        Tracer.trace("mlDsaParams", new Object[]{
+            "levels", Arrays.toString(mlDsaLevels),
+            "classical", Arrays.toString(mlDsaClassicalSecurity)
+        }, "quantum=" + Arrays.toString(mlDsaQuantumSecurity), "params");
 
         // SLH-DSA 参数：用 SHAKE256（输出 256 字节 = 2048 位）
         // 量子下 Grover 二次加速，所以 2048/2 = 1024-bit，再减去常数因子 ≈ 128-bit
         int shake256OutputBits = 256 * 8;
         int slhDsaQuantumSecurity = shake256OutputBits / 2 - 20; // 保守估计
         log.info("[SLH-DSA] SHAKE256 输出 {} bit，量子安全 ≈ {} bit", shake256OutputBits, slhDsaQuantumSecurity);
+        Tracer.trace("slhDsaParams", new Object[]{
+            "outputBits", shake256OutputBits
+        }, slhDsaQuantumSecurity, "params");
 
         // 对比：经典 RSA-2048 ≈ 112-bit，ECC-256 ≈ 128-bit
         // 量子下 RSA/ECC 崩溃（Shor 多项式时间），所以必须换后量子
@@ -424,11 +521,27 @@ public class QuantumResistanceAnalysisTest
         int eccQuantumSecurity = 0; // Shor 崩溃
         log.info("[经典] RSA-2048 = {}-bit, ECC-256 = {}-bit", rsa2048ClassicalSecurity, ecc256ClassicalSecurity);
         log.info("[量子] RSA/ECC = 0-bit (Shor 崩溃)，必须换后量子方案");
+        Tracer.trace("classicalBaseline", new Object[]{
+            "rsa2048", rsa2048ClassicalSecurity, "ecc256", ecc256ClassicalSecurity,
+            "rsaQuantum", rsaQuantumSecurity, "eccQuantum", eccQuantumSecurity
+        }, "Shor 崩溃，必须迁移 PQC", "params");
 
         // 结论：后量子参数选择遵循"量子下仍 128-bit"原则
         Assert.assertTrue("ML-KEM-512 量子下仍 128-bit", mlKemQuantumSecurity[0] >= 128);
         Assert.assertTrue("ML-DSA-44 量子下仍 128-bit", mlDsaQuantumSecurity[0] >= 128);
         Assert.assertTrue("SLH-DSA-SHAKE256 量子下仍 128-bit", slhDsaQuantumSecurity >= 128);
+
+        Tracer.traceDecision("quantum128Check", new Object[]{
+            "mlKem512", mlKemQuantumSecurity[0], "mlDsa44", mlDsaQuantumSecurity[0],
+            "slhDsa", slhDsaQuantumSecurity
+        }, mlKemQuantumSecurity[0] >= 128 && mlDsaQuantumSecurity[0] >= 128 && slhDsaQuantumSecurity >= 128,
+            "params", "三者量子安全均 ≥ 128 bit");
+
         log.info("[总结] 后量子参数选择原则：量子下仍保持 128/192/256-bit 安全性");
+        Tracer.trace("end", new Object[]{
+            "mlKemLevels", Arrays.toString(mlKemLevels),
+            "mlDsaLevels", Arrays.toString(mlDsaLevels),
+            "slhDsaSecurity", slhDsaQuantumSecurity
+        }, "NIST PQC parameters verified", "end");
     }
 }

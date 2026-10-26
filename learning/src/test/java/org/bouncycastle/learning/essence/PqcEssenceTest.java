@@ -32,7 +32,11 @@ import org.bouncycastle.jcajce.interfaces.MLDSAPrivateKey;
 import org.bouncycastle.jcajce.interfaces.MLDSAPublicKey;
 import org.bouncycastle.jcajce.spec.MLDSAParameterSpec;
 import org.bouncycastle.jcajce.spec.MLDSAPublicKeySpec;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -149,6 +153,9 @@ import org.junit.Test;
 @Slf4j
 public class PqcEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     /** 环 R_q 的维数（教科书里也写作 d 或 n）：所有多项式都是 256 个系数，X^256 被折回 −X^0。 */
     private static final int N = 256;
 
@@ -996,9 +1003,13 @@ public class PqcEssenceTest
     /**
      * 命题一：R_q 里只有一个数组和一个负号。X^256 = -1 是环的全部额外规则。
      */
+    @TraceExecution(value = "环元素与负循环卷积", algorithm = "PQC", flow = "PQC-MATH")
     @Test
     public void ringElementsAreCoefficientVectorsAndMultiplicationIsNegacyclic()
     {
+        Tracer.trace("start", new Object[]{"q_dsa", Q_DSA, "q_kem", Q_KEM, "N", N},
+            "环 R_q = Z_q[X]/(X^256+1)", "start");
+
         // X^256 = -1：从 1 出发乘 256 次 X，得到的不是 1 而是 -1（即 q-1 落在 0 号位）
         int[] x256 = monomial(0);
         for (int i = 0; i < N; i++)
@@ -1007,13 +1018,22 @@ public class PqcEssenceTest
         }
         Assert.assertEquals("X^256 的 0 号系数必须是 -1（也就是 q-1）", Q_DSA - 1, x256[0]);
         Assert.assertTrue("其余 255 个系数必须为 0", allZeroExcept(x256, 0));
+        Tracer.trace("mulByX^256", new Object[]{"init", "X^0", "steps", N},
+            new Object[]{"x256[0]", x256[0], "x256[1]", x256[1], "x256[255]", x256[255]}, "ring");
 
         int[] a = randomPoly(Q_DSA, "ring".getBytes());
         int[] b = randomPoly(Q_DSA, "ring-b".getBytes());
         int[] c = randomPoly(Q_DSA, "ring-c".getBytes());
+        Tracer.trace("randomPoly", new Object[]{"seed_a", "ring", "seed_b", "ring-b", "seed_c", "ring-c"},
+            new Object[]{"a[0..3]", Arrays.toString(Arrays.copyOf(a, 4)),
+                "b[0..3]", Arrays.toString(Arrays.copyOf(b, 4)),
+                "c[0..3]", Arrays.toString(Arrays.copyOf(c, 4))}, "ring");
 
         // 环乘法的基本代数律：交换、结合、单位元、分配律
         Assert.assertTrue("环乘法必须交换", same(mulPoly(Q_DSA, a, b), mulPoly(Q_DSA, b, a)));
+        Tracer.trace("mulPoly", new Object[]{"a[0..3]", Arrays.toString(Arrays.copyOf(a, 4)),
+                "b[0..3]", Arrays.toString(Arrays.copyOf(b, 4))},
+            new Object[]{"(a*b)[0..3]", Arrays.toString(Arrays.copyOf(mulPoly(Q_DSA, a, b), 4))}, "ring");
         Assert.assertTrue("环乘法必须结合",
             same(mulPoly(Q_DSA, mulPoly(Q_DSA, a, b), c), mulPoly(Q_DSA, a, mulPoly(Q_DSA, b, c))));
         Assert.assertTrue("1 是单位元", same(mulPoly(Q_DSA, a, monomial(0)), a));
@@ -1022,6 +1042,8 @@ public class PqcEssenceTest
                 addPoly(Q_DSA, mulPoly(Q_DSA, a, b), mulPoly(Q_DSA, a, c))));
         Assert.assertTrue("乘 X 就是左移一位（与卷积定义一致）",
             same(mulPoly(Q_DSA, monomial(1), a), mulByX(Q_DSA, a)));
+        Tracer.trace("mulByX", new Object[]{"a[0..3]", Arrays.toString(Arrays.copyOf(a, 4))},
+            new Object[]{"X*a[0..3]", Arrays.toString(Arrays.copyOf(mulByX(Q_DSA, a), 4))}, "ring");
         Assert.assertTrue("乘 0 得 0", allZero(mulPoly(Q_DSA, a, new int[N])));
         // 常数 7 的多项式 = 把 monomial(0) 整体乘 7
         Assert.assertTrue("数乘 = 用常数多项式乘（R_q 是 Z_q 上的代数）",
@@ -1031,24 +1053,36 @@ public class PqcEssenceTest
         int[] xHi = mulPoly(Q_DSA, monomial(N - 1), monomial(N - 1));
         Assert.assertEquals("X^255 · X^255 = X^510 = X^254·X^256 = -X^254", Q_DSA - 1, xHi[N - 2]);
         Assert.assertTrue("其余系数必须为 0", allZeroExcept(xHi, N - 2));
+        Tracer.trace("X^255*X^255", new Object[]{"left", "X^255", "right", "X^255"},
+            new Object[]{"xHi[254]", xHi[N - 2], "xHi[0]", xHi[0]}, "ring");
 
         // Kyber 用同一个环，只是模数换成 3329
         int[] expectedKem = new int[N];
         expectedKem[N - 2] = Q_KEM - 1;
         Assert.assertTrue("ML-KEM 的环同样是 X^256 = -1",
             same(mulPoly(Q_KEM, monomial(N - 1), monomial(N - 1)), expectedKem));
+        Tracer.trace("kem-ring", new Object[]{"q_kem", Q_KEM, "left", "X^255", "right", "X^255"},
+            new Object[]{"(X^255)^2[254]", expectedKem[N - 2]}, "ring");
         log.info("[PQC-环] q_dsa={} q_kem={} 维数 {}，绕回取负 -> negacyclic", Q_DSA, Q_KEM, N);
+        Tracer.trace("end", new Object[]{"N", N, "q_dsa", Q_DSA},
+            "negacyclic ring verified", "end");
     }
 
     /**
      * 命题二：NTT 是换基，不是新数学。教科书求值、蝴蝶实现、逐点乘三者必须完全一致。
      */
+    @TraceExecution(value = "NTT 是换基", algorithm = "PQC", flow = "PQC-MATH")
     @Test
     public void nttIsAChangeOfBasisThatMakesConvolutionPointwise()
     {
+        Tracer.trace("start", new Object[]{"psi", PSI_DSA, "N", N, "q", Q_DSA},
+            "NTT change of basis", "start");
+
         // ψ 必须满足 ψ^256 = -1（等价于 ψ 是 512 次本原单位根）。BC 源码里注释掉的 1753 正是它。
         Assert.assertEquals("1753^256 mod q 必须等于 -1", Q_DSA - 1, powMod(PSI_DSA, N, Q_DSA));
         Assert.assertEquals("于是 1753^512 = 1", 1, powMod(PSI_DSA, 2L * N, Q_DSA));
+        Tracer.trace("psi-order", new Object[]{"psi", PSI_DSA, "exp256", N, "exp512", 2L * N},
+            new Object[]{"psi^256", powMod(PSI_DSA, N, Q_DSA), "psi^512", powMod(PSI_DSA, 2L * N, Q_DSA)}, "ntt");
 
         // r_i = ψ^(2i+1) 是 X^256+1 的 256 个互不相同的根 —— "X^256+1 在 Z_q 上完全分裂"的构造性证明
         int[] roots = roots(Q_DSA, PSI_DSA);
@@ -1064,26 +1098,46 @@ public class PqcEssenceTest
             }
         }
         Assert.assertTrue("每个根都必须满足 r^256 = -1", everyRootNegates);
+        Tracer.trace("roots", new Object[]{"count", roots.length, "exponent", N},
+            new Object[]{"roots[0..3]", Arrays.toString(Arrays.copyOf(roots, 4)),
+                "roots[255]", roots[255], "distinct", countDistinct(roots),
+                "everyRootNegates", everyRootNegates}, "ntt");
 
         // NTT(1) 必须等于"根自身的幂"检查：1 在每点取值 1
         Assert.assertTrue("常数 1 的象必须全是 1",
             allInRange(nttBook(Q_DSA, PSI_DSA, monomial(0)), 1, 2));
         // X 的象就是根表本身：这就是"NTT == 求值"最直接的证据
         Assert.assertTrue("X 的象必须正好是 256 个根", same(nttBook(Q_DSA, PSI_DSA, monomial(1)), roots));
+        Tracer.trace("ntt-eval", new Object[]{"basis", "1, X", "psi", PSI_DSA},
+            new Object[]{"NTT(1)[0..3]", Arrays.toString(Arrays.copyOf(nttBook(Q_DSA, PSI_DSA, monomial(0)), 4)),
+                "NTT(X)[0..3]", Arrays.toString(Arrays.copyOf(nttBook(Q_DSA, PSI_DSA, monomial(1)), 4))}, "ntt");
 
         int[] p = randomPoly(Q_DSA, "ntt-a".getBytes());
         int[] q = randomPoly(Q_DSA, "ntt-b".getBytes());
+        Tracer.trace("randomPoly", new Object[]{"seed_p", "ntt-a", "seed_q", "ntt-b"},
+            new Object[]{"p[0..3]", Arrays.toString(Arrays.copyOf(p, 4)),
+                "q[0..3]", Arrays.toString(Arrays.copyOf(q, 4))}, "ntt");
 
         // 正逆变换互逆：这就是"换基"的意思 —— 双射，不丢信息
         Assert.assertTrue("逆变换必须完全还原系数：NTT^-1(NTT(p)) = p",
             same(invNttBook(Q_DSA, PSI_DSA, nttBook(Q_DSA, PSI_DSA, p)), p));
+        Tracer.trace("inverse-ntt", new Object[]{"p[0..3]", Arrays.toString(Arrays.copyOf(p, 4))},
+            new Object[]{"invNtt(ntt(p))[0..3]", Arrays.toString(
+                Arrays.copyOf(invNttBook(Q_DSA, PSI_DSA, nttBook(Q_DSA, PSI_DSA, p)), 4))}, "ntt");
         // 蝴蝶版必须和教科书版逐系数相等：加速没有改变数学
         Assert.assertTrue("快速 NTT 必须与教科书 NTT 逐系数相等",
             same(nttFast(Q_DSA, PSI_DSA, p), nttBook(Q_DSA, PSI_DSA, p)));
+        Tracer.trace("ntt-fast", new Object[]{"p[0..3]", Arrays.toString(Arrays.copyOf(p, 4))},
+            new Object[]{"nttFast(p)[0..3]", Arrays.toString(Arrays.copyOf(nttFast(Q_DSA, PSI_DSA, p), 4)),
+                "nttBook(p)[0..3]", Arrays.toString(Arrays.copyOf(nttBook(Q_DSA, PSI_DSA, p), 4))}, "ntt");
         // 环里卷积的象 = 象的逐点乘 —— NTT 存在的全部理由
         Assert.assertTrue("NTT(p*q) 必须等于 NTT(p)·NTT(q)（逐点）",
             same(nttBook(Q_DSA, PSI_DSA, mulPoly(Q_DSA, p, q)),
                 pointwiseMul(Q_DSA, nttBook(Q_DSA, PSI_DSA, p), nttBook(Q_DSA, PSI_DSA, q))));
+        Tracer.trace("convolution", new Object[]{"p[0..3]", Arrays.toString(Arrays.copyOf(p, 4)),
+                "q[0..3]", Arrays.toString(Arrays.copyOf(q, 4))},
+            new Object[]{"pointwise(pHat,qHat)[0..3]", Arrays.toString(Arrays.copyOf(
+                pointwiseMul(Q_DSA, nttBook(Q_DSA, PSI_DSA, p), nttBook(Q_DSA, PSI_DSA, q)), 4))}, "ntt");
         // 换基是线性的
         Assert.assertTrue("NTT 必须线性：NTT(p+q) = NTT(p)+NTT(q)",
             same(nttFast(Q_DSA, PSI_DSA, addPoly(Q_DSA, p, q)),
@@ -1094,17 +1148,25 @@ public class PqcEssenceTest
                 invNttBook(Q_DSA, PSI_DSA,
                     pointwiseMul(Q_DSA, nttFast(Q_DSA, PSI_DSA, p), nttFast(Q_DSA, PSI_DSA, q)))));
         log.info("[PQC-NTT] ψ={}，{} 个一次因子；O(n^2) 求值与 O(n log n) 蝴蝶逐系数相同", PSI_DSA, N);
+        Tracer.trace("end", new Object[]{"psi", PSI_DSA, "roots", N},
+            "NTT == evaluation; fast == book", "end");
     }
 
     /**
      * 命题三：q 不是随便挑的。"有没有 512 次单位根"决定了 NTT 的形状，这就是两族算法的差别。
      */
+    @TraceExecution(value = "模数为单位根而选", algorithm = "PQC", flow = "PQC-MATH")
     @Test
     public void moduliAreChosenForRootsOfUnity()
     {
+        Tracer.trace("start", new Object[]{"q_dsa", Q_DSA, "q_kem", Q_KEM},
+            "moduli for roots of unity", "start");
+
         // 结构恒等式：q = 2^23 - 2^13 + 1（这个形状让模约减可以用移位而不是除法）
         Assert.assertEquals("Dilithium 的 q 就是 2^23-2^13+1", (1 << 23) - (1 << 13) + 1, Q_DSA);
         Assert.assertEquals("Kyber 的 q 就是 13*2^8+1", 13 * (1 << 8) + 1, Q_KEM);
+        Tracer.trace("q-form", new Object[]{"q_dsa", Q_DSA, "q_kem", Q_KEM},
+            new Object[]{"2^23-2^13+1", (1 << 23) - (1 << 13) + 1, "13*2^8+1", 13 * (1 << 8) + 1}, "moduli");
 
         // Z_q^* 是 q-1 阶循环群 -> 512 次单位根存在 <=> 512 | (q-1)
         // 术语：循环群 (cyclic group) = 全体非零元素恰是某个生成元 g 的幂 g^0..g^(q−2)（素数域的经典结论）；
@@ -1116,12 +1178,19 @@ public class PqcEssenceTest
             0, (Q_KEM - 1) % (2 * N));
         Assert.assertEquals("但 256 整除 q_kem - 1，所以 Kyber 有 256 阶子群，够它把环切成 128 个二次因子",
             0, (Q_KEM - 1) % N);
+        Tracer.traceDecision("512 | q_dsa-1", new Object[]{"q_dsa-1", Q_DSA - 1, "512", 2 * N},
+            (Q_DSA - 1) % (2 * N) == 0, "moduli", "(q_dsa-1) % 512 == 0");
+        Tracer.traceDecision("512 | q_kem-1", new Object[]{"q_kem-1", Q_KEM - 1, "512", 2 * N},
+            (Q_KEM - 1) % (2 * N) == 0, "moduli", "(q_kem-1) % 512 == 0");
 
         // 2-adic 余量：Dilithium 的 q-1 含 2^13，8 级蝴蝶只用掉 2^8，还剩 2^5
         Assert.assertEquals("q_dsa - 1 里 2 的幂次是 13（NTT 长度最多能到 2^13 = 8192）",
             13, Long.numberOfTrailingZeros(Q_DSA - 1L));
         Assert.assertEquals("q_kem - 1 里 2 的幂次只有 8（正好够 256，一点余量都没有）",
             8, Long.numberOfTrailingZeros(Q_KEM - 1L));
+        Tracer.trace("2-adic", new Object[]{"q_dsa-1", Q_DSA - 1, "q_kem-1", Q_KEM - 1},
+            new Object[]{"v2(q_dsa-1)", Long.numberOfTrailingZeros(Q_DSA - 1L),
+                "v2(q_kem-1)", Long.numberOfTrailingZeros(Q_KEM - 1L)}, "moduli");
 
         // 穷举证明"Kyber 域里一个 512 次单位根都没有"（全部 3328 个非零元素都试过，一个 for 循环）
         int kemRoots = 0;
@@ -1133,15 +1202,20 @@ public class PqcEssenceTest
             }
         }
         Assert.assertEquals("X^256+1 在 Z_3329 里没有一次因子", 0, kemRoots);
+        Tracer.trace("kem-roots", new Object[]{"domain", Q_KEM - 1, "exponent", N},
+            new Object[]{"count(r^256 == -1)", kemRoots}, "moduli");
         // 反过来在 Dilithium 域里，X^256+1 有 256 个一次因子（命题二已经用构造法证完：
         // r_i = ψ^(2i+1) 互不相同且都满足 r^256 = -1）。这里只把"为什么够用"的因子分解摆出来。
         Assert.assertEquals("q_dsa - 1 = 2^13 · 1023，而 1023 = 3·11·31（2 的部分有 13 级，远超 9 级）",
             1023, (Q_DSA - 1) >> 13);
         Assert.assertEquals("1023 确实是 3·11·31", 1023, 3 * 11 * 31);
+        Tracer.trace("factorization", new Object[]{"q_dsa-1", Q_DSA - 1},
+            new Object[]{"2^13", 1 << 13, "1023", (Q_DSA - 1) >> 13, "3*11*31", 3 * 11 * 31}, "moduli");
 
         // Montgomery：BC 公开了 q^-1 mod 2^32 = 58728449，我们验一遍，再证明"乘 q 凑 2^32 倍"的约减是对的
         long qInv = BigInteger.valueOf(Q_DSA).modInverse(BigInteger.ONE.shiftLeft(32)).longValue();
         Assert.assertEquals("BC 的 DilithiumQinv 就是 q^-1 mod 2^32", MLDSAEngine.DilithiumQinv, qInv);
+        Tracer.trace("qInv", new Object[]{"q", Q_DSA, "R", 1L << 32}, qInv, "moduli");
 
         //  Montgomery 约减见 redc()：注意这里是"减" —— BC 存的是 +q^-1，
         //  代价是结果多乘了一个 R^-1，所以 BC 才到处写 invNttToMont：
@@ -1153,8 +1227,15 @@ public class PqcEssenceTest
             Assert.assertEquals("Montgomery 约减必须等于 x·R^-1 mod q（全程只有乘法和移位，没有除法）",
                 mod((long)mod(x, Q_DSA) * rInv, Q_DSA), redc(x, qInv));
         }
+        Tracer.trace("redc", new Object[]{"x0", 0L, "x4", 4096L, "x5", 8380416L, "x8", 70331653613824L},
+            new Object[]{"redc(0)", redc(0L, qInv), "redc(4096)", redc(4096L, qInv),
+                "redc(8380416)", redc(8380416L, qInv), "redc(70331653613824)", redc(70331653613824L, qInv)}, "moduli");
         Assert.assertEquals("2^32 的模逆乘回去必须还原：R·R^-1 = 1 mod q", 1, mod((long)rInv * (1L << 32), Q_DSA));
+        Tracer.trace("R*R^-1", new Object[]{"rInv", rInv, "R", 1L << 32},
+            mod((long)rInv * (1L << 32), Q_DSA), "moduli");
         log.info("[PQC-模数] q_dsa-1 = 2^13·3·11·31（13 级单位根），q_kem-1 = 2^8·13（只有 8 级）");
+        Tracer.trace("end", new Object[]{"q_dsa", Q_DSA, "q_kem", Q_KEM},
+            "v2(q-1) decides NTT depth", "end");
     }
 
     /**
@@ -1177,9 +1258,13 @@ public class PqcEssenceTest
      * 安全性侧：少发低 13 bit 让每个系数多出 2^13 种候选，配上短噪声 s2 后正是 Module-LWE
      * 样本的形状 —— 公钥字节发得出去，s1 仍算不出来。
      */
+    @TraceExecution(value = "公钥只是多项式的高位", algorithm = "PQC", flow = "PQC-PUBKEY")
     @Test
     public void publicKeyIsJustTheHighBitsOfOnePolynomial()
     {
+        Tracer.trace("start", new Object[]{"param", "ml_dsa_65", "seed", "t-is-high-bits"},
+            "pk = rho || t1", "start");
+
         MLDSAParameters p = MLDSAParameters.ml_dsa_65;
         byte[] seed = shakeBytes("t-is-high-bits", MLDSAEngine.SeedBytes);
         Assert.assertEquals("BC 的种子固定 32 字节", 32, seed.length);
@@ -1187,6 +1272,9 @@ public class PqcEssenceTest
         MLDSAPrivateKeyParameters priv = dsaPriv(p, seed);
         int k = MLDSAEngine.getInstance(p, ANY).getDilithiumK();
         int l = MLDSAEngine.getInstance(p, ANY).getDilithiumL();
+        Tracer.trace("keygen", new Object[]{"param", p.getName(), "seed", seed},
+            new Object[]{"k", k, "l", l, "rhoBytes", priv.getRho().length,
+                "t1Bytes", priv.getT1().length, "t0Bytes", priv.getT0().length}, "keygen");
 
         // 裁判 1：BC 公开的打包字节数 == 我们自己 pack() 出来的长度
         Assert.assertEquals("t1 每项 10 bit -> 每项 320 字节", 320, MLDSAEngine.DilithiumPolyT1PackedBytes);
@@ -1198,6 +1286,10 @@ public class PqcEssenceTest
         }
         Assert.assertEquals("我们的 10-bit 打包长度必须等于 BC 的 T1PackedBytes",
             MLDSAEngine.DilithiumPolyT1PackedBytes, pack(T1_BITS, t1Coeffs).length);
+        Tracer.trace("t1-pack", new Object[]{"bits", T1_BITS,
+                "coeffs[0..3]", Arrays.toString(Arrays.copyOf(t1Coeffs, 4))},
+            new Object[]{"bytes", pack(T1_BITS, t1Coeffs).length,
+                "bcBytes", MLDSAEngine.DilithiumPolyT1PackedBytes}, "t1-pack");
 
         // 裁判 2：拿 BC 真实密钥的 t1 字节，用我们的 unpack/pack 走一圈，必须逐字节还原
         byte[] t1Bytes = Arrays.copyOfRange(priv.getT1(), 0, MLDSAEngine.DilithiumPolyT1PackedBytes);
@@ -1205,6 +1297,9 @@ public class PqcEssenceTest
         Assert.assertTrue("t1 的系数必须落在 10 bit 内", allInRange(t1Real, 0, 1 << T1_BITS));
         Assert.assertArrayEquals("我们的 10-bit 打包必须逐字节复现 BC 的 t1 编码",
             t1Bytes, pack(T1_BITS, t1Real));
+        Tracer.trace("unpack-t1", new Object[]{"t1Bytes", t1Bytes.length, "bits", T1_BITS},
+            new Object[]{"t1Real[0..3]", Arrays.toString(Arrays.copyOf(t1Real, 4)),
+                "packMatches", Arrays.equals(t1Bytes, pack(T1_BITS, t1Real))}, "unpack-t1");
 
         // 裁判 3：t0 是 13 bit 的"偏置中心化"编码 —— BC 存的是 (2^12 - a0)，我们把这条规则也写出来
         byte[] t0Bytes = Arrays.copyOfRange(priv.getT0(), 0, MLDSAEngine.DilithiumPolyT0PackedBytes);
@@ -1221,6 +1316,9 @@ public class PqcEssenceTest
             allInRange(t0Real, -(half - 1), half + 1));
         Assert.assertArrayEquals("我们的 13-bit 偏置打包必须逐字节复现 BC 的 t0 编码",
             t0Bytes, pack(D_T, t0Stored));
+        Tracer.trace("t0-bias", new Object[]{"half", half, "d", D_T},
+            new Object[]{"t0Stored[0..3]", Arrays.toString(Arrays.copyOf(t0Stored, 4)),
+                "t0Real[0..3]", Arrays.toString(Arrays.copyOf(t0Real, 4))}, "t0-bias");
 
         // 分解恒等式：t1·2^13 + t0 == 原来的 t（在 Z_q 里），这就是公钥只发 t1 还能签名的原因
         int[] t = new int[N];
@@ -1228,6 +1326,9 @@ public class PqcEssenceTest
         {
             t[i] = mod((long)t1Real[i] * (1 << D_T) + t0Real[i], Q_DSA);
         }
+        Tracer.trace("reconstruct-t", new Object[]{"t1[0..3]", Arrays.toString(Arrays.copyOf(t1Real, 4)),
+                "t0[0..3]", Arrays.toString(Arrays.copyOf(t0Real, 4))},
+            new Object[]{"t[0..3]", Arrays.toString(Arrays.copyOf(t, 4))}, "reconstruct-t");
         for (int i : new int[]{ 0, 1, 127, 255 })
         {
             int[] back = power2Round(Q_DSA, D_T, t[i]);
@@ -1248,6 +1349,8 @@ public class PqcEssenceTest
         }
         Assert.assertTrue("power2Round 必须对整个多项式都可逆", same(t, rebuilt));
         Assert.assertTrue("t1 就是 t 的高位：t1 = (t + 2^12 - 1) >> 13", t1IsHighBits);
+        Tracer.traceDecision("t1 is high bits", new Object[]{"coeffs", N, "d", D_T},
+            t1IsHighBits, "highBits", "power2Round(t)[0] == t1 for all i");
 
         // 公钥编码 = ρ(32) ‖ t1 的 k 份：长度不是魔法
         MLDSAPublicKeyParameters pub = new MLDSAPublicKeyParameters(p, priv.getRho(), priv.getT1());
@@ -1256,9 +1359,18 @@ public class PqcEssenceTest
             Calc.concat(priv.getRho(), priv.getT1()).length, pub.getEncoded().length);
         Assert.assertArrayEquals("我们的打包必须能重建整份 t1", t1Bytes,
             Arrays.copyOfRange(pub.getEncoded(), 32, 32 + MLDSAEngine.DilithiumPolyT1PackedBytes));
+        Tracer.trace("pk-encoded", new Object[]{"rhoBytes", priv.getRho().length, "k", k},
+            new Object[]{"pkBytes", pub.getEncoded().length, "expected", 32 + k * 320,
+                "rhoPlusT1", Calc.concat(priv.getRho(), priv.getT1()).length}, "pk-encoded");
+        Tracer.traceDecision("pk = rho || t1", new Object[]{"pkBytes", pub.getEncoded().length,
+                "rhoPlusT1", Calc.concat(priv.getRho(), priv.getT1()).length},
+            pub.getEncoded().length == Calc.concat(priv.getRho(), priv.getT1()).length,
+            "compare", "encoded length == 32 + k*320");
         log.info("[PQC-分解] {} k={} l={}：t1={} bit（{} 字节/项），t0={} bit 偏置（{} 字节/项），pk={} 字节",
             p.getName(), k, l, T1_BITS, MLDSAEngine.DilithiumPolyT1PackedBytes,
             D_T, MLDSAEngine.DilithiumPolyT0PackedBytes, pub.getEncoded().length);
+        Tracer.trace("end", new Object[]{"param", p.getName(), "pkBytes", pub.getEncoded().length},
+            "t1 is high bits; pack matches BC", "end");
     }
 
     /**
@@ -1279,9 +1391,13 @@ public class PqcEssenceTest
      * 两者只在"绕回接缝"附近可能给出不同的 a1，MakeHint 记下这批系数（≤ ω 个），UseHint 只需
      * "高位加 hint 再 mod M"就把两边对齐 —— 每个 hint 只说"跨没跨界"这 1 bit，不泄漏跨界多少。
      */
+    @TraceExecution(value = "γ2 分解与 hint 边界", algorithm = "PQC", flow = "PQC-MATH")
     @Test
     public void gammaDecompositionHasExactlyOneBoundaryProblemAndThatIsWhereHintsLive()
     {
+        Tracer.trace("start", new Object[]{"q", Q_DSA, "modes", "M=44,16"},
+            "gamma2 decomposition + hints", "start");
+
         // ml-dsa-44 用 γ2 = (q-1)/88（于是 α = 2γ2 = (q-1)/44，a1 有 44 个取值），
         // ml-dsa-65/87 用 γ2 = (q-1)/32（α = (q-1)/16，a1 有 16 个取值）—— 都能整除，因为 q-1 因子够多
         for (int m : new int[]{ 44, 16 })
@@ -1289,6 +1405,8 @@ public class PqcEssenceTest
             int alpha = (Q_DSA - 1) / m;               // α = 2γ2
             int gamma2 = alpha / 2;
             Assert.assertEquals("q-1 必须是 α = 2γ2 的整数倍", 0, (Q_DSA - 1) % alpha);
+            Tracer.trace("decompose-params", new Object[]{"m", m, "alpha", alpha, "gamma2", gamma2},
+                new Object[]{"q-1 % alpha", (Q_DSA - 1) % alpha}, "encoding");
 
             // 恒等式与界：在所有"有代表性"的点上验证（含 q-1 附近的那条绕回边界）
             int[] probes = new int[2 * (gamma2 + 3) + 400];
@@ -1321,6 +1439,13 @@ public class PqcEssenceTest
                 }
             }
             Assert.assertTrue("必须真的探到绕回区间，否则这个测试什么都没验", wrapped > 0);
+            Tracer.trace("decompose", new Object[]{"m", m, "alpha", alpha,
+                    "probes[0]", probes[0], "probes[1]", probes[1],
+                    "probes[last]", probes[probes.length - 1], "wrapped", wrapped},
+                new Object[]{"a1(0)", decompose(Q_DSA, alpha, 0)[0],
+                    "a0(0)", decompose(Q_DSA, alpha, 0)[1],
+                    "a1(q-1)", decompose(Q_DSA, alpha, Q_DSA - 1)[0],
+                    "a0(q-1)", decompose(Q_DSA, alpha, Q_DSA - 1)[1]}, "encoding");
 
             // 加一个小噪声 e 后，只有"a 落在分界线下方 e 宽的那一段"才会改变 a1 ——
             // 段的宽度是 e/α 的比例，所以签名里只需要 ω 个提示位（稀疏性就在这里）。
@@ -1335,12 +1460,20 @@ public class PqcEssenceTest
             long expected = 20000L * e / alpha;                 // 理论上正好是 e/α 的比例
             Assert.assertTrue("hint 密度约等于 e/α（噪声越小提示越稀疏）：changed=" + changed + " expected~=" + expected,
                 changed > expected / 2 && changed < expected * 3 / 2 + 1);
+            Tracer.traceDecision("hint density ~ e/alpha", new Object[]{"alpha", alpha, "e", e,
+                    "changed", changed, "expected", expected},
+                changed > expected / 2 && changed < expected * 3 / 2 + 1,
+                "encoding", "changed in (expected/2, 1.5*expected]");
             // 单调性：噪声砍一半，需要提示的位置也几乎砍一半 —— 这就是 ω 的物理意义
             Assert.assertTrue("噪声减半，hint 数量也必须减半",
                 countCrossings(alpha, e / 2, spread) < changed);
+            Tracer.trace("noise-halving", new Object[]{"alpha", alpha, "e", e, "e/2", e / 2},
+                new Object[]{"changed(e)", changed, "changed(e/2)", countCrossings(alpha, e / 2, spread)}, "encoding");
             log.info("[PQC-分解] α = {}（γ2 = {}，a1 ∈ [0,{})）：恒等式成立，绕回段唯一，e={} 时 hint 比例 {}/20000（理论 {}）",
                 alpha, gamma2, m, e, changed, expected);
         }
+        Tracer.trace("end", new Object[]{"q", Q_DSA, "modes", 2},
+            "boundary is the only hint source", "end");
     }
 
     /**
@@ -1358,9 +1491,13 @@ public class PqcEssenceTest
      *   误差预算    ⌈q/2^(d_u+1)⌉：解密时 decompress∘compress 每系数的最大模偏差（在 Z_q 里中心化数）
      * </pre>
      */
+    @TraceExecution(value = "KEM 密文长度 = 压缩系数之和", algorithm = "PQC", flow = "PQC-MLKEM")
     @Test
     public void kemCiphertextLengthIsJustTheSumOfCompressedCoefficients()
     {
+        Tracer.trace("start", new Object[]{"levels", 3, "q", Q_KEM},
+            "ML-KEM compressed ciphertext lengths", "start");
+
         int[][] levels = new int[][]{
             // {k, d_u, d_v, 密文长度} —— FIPS 203 参数表的三列，第四列拿来和 BC 对
             new int[]{ 2, 10, 4, 768 },
@@ -1375,6 +1512,9 @@ public class PqcEssenceTest
         {
             int k = levels[i][0], du = levels[i][1], dv = levels[i][2], ct = levels[i][3];
             MLKEMEngine eng = MLKEMEngine.getInstance(params[i]);
+            Tracer.trace("params", new Object[]{"name", params[i].getName(), "k", k, "du", du, "dv", dv},
+                new Object[]{"ctBytes", eng.getCipherTextBytes(), "pkBytes", eng.getIndCpaPublicKeyBytes(),
+                    "skIndCpaBytes", eng.getIndCpaSecretKeyBytes(), "polyVecBytes", eng.getPolyVecBytes()}, "params");
             Assert.assertEquals("k 必须来自参数集", k, params[i].getK());
             Assert.assertEquals("BC 的密文长度必须等于 32·(k·d_u + d_v)", 32 * (k * du + dv), eng.getCipherTextBytes());
             Assert.assertEquals("密文长度是公开常识值（" + params[i].getName() + "）", ct, eng.getCipherTextBytes());
@@ -1395,6 +1535,9 @@ public class PqcEssenceTest
                 Assert.assertTrue("压缩结果必须能塞进 d 位：" + y, y >= 0 && y < (1 << du));
                 Assert.assertTrue("量化误差必须在 ceil(q/2^(d+1)) = " + maxErr + " 内：" + x + " -> " + y,
                     Math.abs(center(decompress(Q_KEM, du, y) - (long)x, Q_KEM)) <= maxErr);
+                Tracer.trace("compress", new Object[]{"x", x, "d", du, "q", Q_KEM},
+                    new Object[]{"y", y, "decompress(y)", decompress(Q_KEM, du, y),
+                        "err", center(decompress(Q_KEM, du, y) - (long)x, Q_KEM)}, "params");
             }
             log.info("[PQC-压缩] {} d_u={} d_v={} 密文 {} 字节，量化误差预算 <= {}",
                 params[i].getName(), du, dv, ct, maxErr);
@@ -1410,6 +1553,9 @@ public class PqcEssenceTest
         }
         Assert.assertEquals("Kyber 系数打包 12 bit -> 384 字节", 384, pack(12, coeffs).length);
         Assert.assertTrue("12-bit 打包/解包必须互逆", same(coeffs, unpack(12, N, pack(12, coeffs))));
+        Tracer.trace("pack12", new Object[]{"bits", 12, "coeffs[0..3]", Arrays.toString(Arrays.copyOf(coeffs, 4))},
+            new Object[]{"bytes", pack(12, coeffs).length,
+                "roundTrip", same(coeffs, unpack(12, N, pack(12, coeffs)))}, "params");
 
         byte[] d = shakeBytes("kem-d", MLKEMEngine.SymBytes);
         byte[] z = shakeBytes("kem-z", MLKEMEngine.SymBytes);
@@ -1418,6 +1564,17 @@ public class PqcEssenceTest
         int[] tReal = unpack(12, N, tBytes);
         Assert.assertTrue("公钥里的 t 系数必须落在 12 bit 内", allInRange(tReal, 0, 1 << 12));
         Assert.assertArrayEquals("我们的 12-bit 打包必须逐字节复现 BC 的 t 编码", tBytes, pack(12, tReal));
+        Tracer.trace("keygen", new Object[]{"param", p.getName(), "d", d, "z", z},
+            new Object[]{"pkBytes", kp[0].length, "skBytes", kp[5].length}, "keygen");
+        Tracer.trace("t-encoding", new Object[]{"tBytes", tBytes.length, "bits", 12},
+            new Object[]{"tReal[0..3]", Arrays.toString(Arrays.copyOf(tReal, 4)),
+                "packMatches", Arrays.equals(tBytes, pack(12, tReal))}, "keygen");
+        Tracer.trace("compare", new Object[]{"ml_kem_512", MLKEMParameters.ml_kem_512.getEncapsulationLength(),
+                "ml_kem_768", MLKEMParameters.ml_kem_768.getEncapsulationLength(),
+                "ml_kem_1024", MLKEMParameters.ml_kem_1024.getEncapsulationLength()},
+            new Object[]{"ct512", 768, "ct768", 1088, "ct1024", 1568}, "compare");
+        Tracer.trace("end", new Object[]{"q", Q_KEM, "levels", 3},
+            "ct = 32*(k*du+dv)", "end");
     }
 
     /**
@@ -1429,9 +1586,13 @@ public class PqcEssenceTest
      * （丢弃率 ~0.1%，条件分布仍是均匀的）。ML-DSA 全程不做高斯采样（GPV/Falcon 一系的核心技术）：
      * 均匀 y + 拒绝等价的"翻转到界内"就能让 z 的分布与私钥无关，工程上简单得多。
      */
+    @TraceExecution(value = "拒绝采样与二项差分", algorithm = "PQC", flow = "PQC-MATH")
     @Test
     public void samplingIsARejectionLoopAndABinomialDifferenceMadeVisible()
     {
+        Tracer.trace("start", new Object[]{"q", Q_DSA, "N", N},
+            "rejection sampling + binomial difference", "start");
+
         // ML-KEM 的中心二项式：η 个 ±1 相加，系数必落在 [-η, η]
         for (int eta : new int[]{ 2, 3 })
         {
@@ -1445,6 +1606,9 @@ public class PqcEssenceTest
                 sum += noise[i];
             }
             Assert.assertTrue("分布必须近似关于 0 对称", Math.abs((double)sum / noise.length) < 0.3);
+            Tracer.trace("cbd", new Object[]{"eta", eta, "bytes", N * 2 * eta / 8},
+                new Object[]{"noise[0..5]", Arrays.toString(Arrays.copyOf(noise, 6)),
+                    "sum", sum, "mean", (double)sum / noise.length}, "sampling");
         }
 
         // ML-DSA 的均匀采样：23-bit 窗口 + ">= q 就丢"，丢弃率小得可以忽略，但必须存在
@@ -1452,6 +1616,10 @@ public class PqcEssenceTest
         int[] kept = rejectField(2000, "field".getBytes());
         Assert.assertEquals("必须凑够 2000 个域元素", 2000, kept.length);
         Assert.assertTrue("所有样本都必须同时满足 < 2^23 与 < q", allInRange(kept, 0, Q_DSA));
+        Tracer.trace("rejectField", new Object[]{"need", 2000, "seed", "field",
+                "rejectValues", (1 << 23) - Q_DSA},
+            new Object[]{"kept[0..5]", Arrays.toString(Arrays.copyOf(kept, 6)),
+                "kept.length", kept.length}, "sampling");
 
         // 拒绝采样不改变均匀性：用 4 bit 抽 [0,10)，16 个符号里 6 个要丢，丢弃率看得见
         int[] drawn = rejectNibble(2000, "nib".getBytes());
@@ -1470,6 +1638,8 @@ public class PqcEssenceTest
             }
         }
         Assert.assertTrue("每个桶都应在期望 200 附近：" + Arrays.toString(bucket), bucketsEven);
+        Tracer.trace("rejectNibble", new Object[]{"need", 2000, "accept", "[0,10)"},
+            new Object[]{"bucket", Arrays.toString(bucket), "bucketsEven", bucketsEven}, "sampling");
 
         // ML-DSA 的挑战多项式：权重恰好 τ，位置互不相同。
         // 注意：这里 demo 取的"τ=80"不是 ml-dsa-44 的真挑战权重（FIPS 真值 τ=39/49/60），
@@ -1479,6 +1649,9 @@ public class PqcEssenceTest
         Assert.assertEquals("权重必须精确等于 τ", tau, slots.length);
         Assert.assertEquals("位置必须互不相同", tau, countDistinct(slots));
         Assert.assertTrue("位置必须落在 [0,256)", allInRange(slots, 0, N));
+        Tracer.trace("sampleInBall", new Object[]{"tau", tau},
+            new Object[]{"slots[0..5]", Arrays.toString(Arrays.copyOf(slots, 6)),
+                "distinct", countDistinct(slots), "inRange", allInRange(slots, 0, N)}, "sampling");
 
         // c 只有 τ 个 ±1 系数，所以 c·a == τ 次"带符号的 negacyclic 移位"相加 —— 两条路必须同一条答案
         int[] a = randomPoly(Q_DSA, "sparse-a".getBytes());
@@ -1497,11 +1670,20 @@ public class PqcEssenceTest
         }
         Assert.assertTrue("稀疏乘法必须等于环乘法（这就是 τ 个移位加 = 一次环乘）",
             same(mulPoly(Q_DSA, a, cPoly), modPoly(viaShifts)));
+        Tracer.trace("sparse-mul", new Object[]{"tau", tau,
+                "a[0..3]", Arrays.toString(Arrays.copyOf(a, 4))},
+            new Object[]{"viaShifts[0..3]", Arrays.toString(Arrays.copyOf(viaShifts, 4)),
+                "equalsMulPoly", same(mulPoly(Q_DSA, a, cPoly), modPoly(viaShifts))}, "sampling");
 
         // 同一个 seed 的采样必须逐比特可重复：这就是"内部函数是确定性的"
         Assert.assertTrue("采样器是确定性的：同 seed 同结果",
             Arrays.equals(cbd(2, shakeBytes("same", 64)), cbd(2, shakeBytes("same", 64))));
+        Tracer.traceDecision("same seed -> same sample", new Object[]{"eta", 2, "seed", "same"},
+            Arrays.equals(cbd(2, shakeBytes("same", 64)), cbd(2, shakeBytes("same", 64))),
+            "sampling", "cbd(2, seed) deterministic");
         log.info("[PQC-采样] CBD(η=2,3) 支持 [-η,η]；23-bit 窗口丢弃 0.1%；SampleInBall 权重 τ={}", tau);
+        Tracer.trace("end", new Object[]{"q", Q_DSA, "tau", tau},
+            "rejection keeps uniformity; CBD bounds noise", "end");
     }
 
     /**
@@ -1520,12 +1702,15 @@ public class PqcEssenceTest
      * 签名里的 c~ 是另一条哈希：c~ = SHAKE256(r ‖ M, 32/48/64)（r = 掩码 y 的承诺 w1 的压缩摘要），
      * c 再由 c~ 经 SampleInBall 展开 —— "Hash-then-sign" 的 PreHashed 变体只换 M 的进入方式，管线不变。
      */
+    @TraceExecution(value = "ML-DSA 是种子的纯函数", algorithm = "PQC", flow = "PQC-MLDSA")
     @Test
     public void mldsaIsAPureFunctionOfItsSeedAcrossEveryMode()
         throws Exception
     {
         Calc.useBc();
         byte[] msg = "post-quantum but still just hash-then-ring-math".getBytes();
+        Tracer.trace("start", new Object[]{"msgBytes", msg.length, "pureModes", 3, "jceModes", 6},
+            "ML-DSA deterministic by seed", "start");
 
         // ---- 裁判层：BC crypto 层（pure 模式，3 个安全级别）
         MLDSAParameters[] pure = new MLDSAParameters[]{
@@ -1548,6 +1733,9 @@ public class PqcEssenceTest
             Assert.assertArrayEquals("tr 是种子的确定性展开", direct[2], priv.getTr());
             Assert.assertArrayEquals("s1 是种子的确定性展开", direct[3], priv.getS1());
             Assert.assertArrayEquals("t0 是种子的确定性展开", direct[5], priv.getT0());
+            Tracer.trace("keygen", new Object[]{"param", p.getName(), "seed", seed},
+                new Object[]{"rhoBytes", priv.getRho().length, "trBytes", priv.getTr().length,
+                    "s1Bytes", priv.getS1().length, "t0Bytes", priv.getT0().length}, "keygen");
 
             // 参数表里有两种"k"，很容易混：MLDSAParameters.getK() 是 FIPS 安全等级（2/3/5），
             // 引擎里的 dilithiumK 才是 A 矩阵的行数（4/6/8）—— 公钥长度用的是后者。
@@ -1557,17 +1745,28 @@ public class PqcEssenceTest
 
             MLDSAPublicKeyParameters pub = new MLDSAPublicKeyParameters(p, priv.getRho(), priv.getT1());
             Assert.assertEquals("公钥长度 = 32 + k·320", 32 + k * T1_BITS * N / 8, pub.getEncoded().length);
+            Tracer.trace("keygen", new Object[]{"param", p.getName(), "k", k, "fipsK", p.getK()},
+                new Object[]{"pkBytes", pub.getEncoded().length, "expected", 32 + k * T1_BITS * N / 8}, "keygen");
 
             // 签名确定性：同一把钥匙、同一条消息，两次签名逐字节相同（FIPS 204 的 deterministic 模式）
             byte[] sig1 = dsaSign(priv, msg);
             byte[] sig2 = dsaSign(priv, msg);
             Assert.assertArrayEquals("ML-DSA 默认是确定性的：" + p.getName(), sig1, sig2);
             Assert.assertEquals("签名长度必须等于 FIPS 204 表值", sigLen[i], sig1.length);
+            Tracer.trace("sign", new Object[]{"param", p.getName(), "msgBytes", msg.length},
+                new Object[]{"sig1Bytes", sig1.length, "sig2Bytes", sig2.length,
+                    "deterministic", Arrays.equals(sig1, sig2)}, "sign");
             Assert.assertTrue("我们的验证器必须认它", dsaVerify(pub, msg, sig1));
+            Tracer.trace("verify", new Object[]{"param", p.getName(), "sigBytes", sig1.length},
+                dsaVerify(pub, msg, sig1), "verify");
             Assert.assertFalse("换消息必须失败", dsaVerify(pub, "other".getBytes(), sig1));
             byte[] bad = sig1.clone();
             bad[100] ^= 1;
             Assert.assertFalse("改一位必须失败", dsaVerify(pub, msg, bad));
+            Tracer.traceDecision("reject other message", new Object[]{"msg", "other"},
+                dsaVerify(pub, "other".getBytes(), sig1), "reject", "verify(other, sig1) == false");
+            Tracer.traceDecision("reject bit-flip", new Object[]{"byteIndex", 100},
+                dsaVerify(pub, msg, bad), "reject", "verify(msg, sig1 with bit 100 flipped) == false");
 
             // mu-mode：ML-DSA 只吃 mu = SHAKE256(tr ‖ M)，先把 mu 算出来再签，结果必须一模一样
             // 符号：tr = SHAKE256(pk, 64) 是公钥指纹（把签名钉死在这把公钥上，防跨公钥移植）；μ 恒 64 字节 = CrhBytes；
@@ -1584,6 +1783,9 @@ public class PqcEssenceTest
             MLDSASigner checkMu = new MLDSASigner();
             checkMu.init(false, pub);
             Assert.assertTrue("验签端同样可以只看 mu", checkMu.verifyMuSignature(mu, sig1));
+            Tracer.trace("mu-mode", new Object[]{"muBytes", mu.length, "sigBytes", sig1.length},
+                new Object[]{"verifyMu", checkMu.verifyMuSignature(mu, sig1),
+                    "sameAsSignMsg", Arrays.equals(sig1, sig2)}, "compare");
 
             log.info("[PQC-ML-DSA] {} 等级={} k={} l={} η={}：pk={} sig={}，确定性 + mu-mode 一致",
                 p.getName(), p.getK(), k, MLDSAEngine.getInstance(p, ANY).getDilithiumL(), ETA[i],
@@ -1610,16 +1812,22 @@ public class PqcEssenceTest
             signer.initSign(kp.getPrivate());
             signer.update(msg);
             byte[] sig = signer.sign();
+            Tracer.trace("sign", new Object[]{"mode", names[i], "msgBytes", msg.length},
+                new Object[]{"sigBytes", sig.length}, "sign");
 
             Signature verifier = Signature.getInstance(names[i], "BC");
             verifier.initVerify(kp.getPublic());
             verifier.update(msg);
             Assert.assertTrue(names[i] + "：JCE 必须自验通过", verifier.verify(sig));
+            Tracer.trace("verify", new Object[]{"mode", names[i], "sigBytes", sig.length},
+                verifier.verify(sig), "verify");
 
             Signature tampered = Signature.getInstance(names[i], "BC");
             tampered.initVerify(kp.getPublic());
             tampered.update("different".getBytes());
             Assert.assertFalse(names[i] + "：换消息必须失败", tampered.verify(sig));
+            Tracer.traceDecision("reject different message", new Object[]{"mode", names[i]},
+                tampered.verify(sig), "reject", "verify(different, sig) == false");
 
             if (!specs[i].getName().contains("SHA512"))
             {
@@ -1629,6 +1837,8 @@ public class PqcEssenceTest
                     new MLDSAPublicKeyParameters(p, ((MLDSAPublicKey)kp.getPublic()).getPublicData());
                 Assert.assertTrue(names[i] + "：手写验证器必须认 JCE 的签名",
                     dsaVerify(raw, msg, sig));
+                Tracer.trace("compare", new Object[]{"mode", names[i], "direction", "JCE->crypto"},
+                    dsaVerify(raw, msg, sig), "compare");
 
                 // 反向：我们只用 32 字节种子展开密钥，JCE 的 KeyFactory 必须接受这份原始编码
                 byte[] seed = shakeBytes(names[i], MLDSAEngine.SeedBytes);
@@ -1640,6 +1850,8 @@ public class PqcEssenceTest
                 crossCheck.update(msg);
                 Assert.assertTrue(names[i] + "：JCE 必须认我们（从种子展开的）公钥签出的签名",
                     crossCheck.verify(dsaSign(ours, msg)));
+                Tracer.trace("compare", new Object[]{"mode", names[i], "direction", "crypto->JCE"},
+                    crossCheck.verify(dsaSign(ours, msg)), "compare");
 
                 // 私钥只是 32 字节种子：JCE 的密钥类型也直接暴露这一点
                 Assert.assertEquals("JCE 私钥必须能回到种子形态",
@@ -1647,6 +1859,8 @@ public class PqcEssenceTest
             }
             log.info("[PQC-模式] {} 签名 {} 字节，JCE 双向互通", names[i], sig.length);
         }
+        Tracer.trace("end", new Object[]{"pureModes", pure.length, "jceModes", names.length},
+            "seed-deterministic + mu-mode consistent", "end");
     }
 
     /**
@@ -1671,9 +1885,13 @@ public class PqcEssenceTest
      * 另注意常见误解（本测试断言纠正过）：密钥不是嵌在密文里的明文，而是双方各自从
      * (coin, pk) 用同一条 G 现场重算出来的 —— 密文只是把 coin"藏"进格问题里的手段。
      */
+    @TraceExecution(value = "ML-KEM 封装纯粹且拒绝静默", algorithm = "PQC", flow = "PQC-MLKEM")
     @Test
     public void mlkemEncapsulationIsPureAndRejectionIsSilent()
     {
+        Tracer.trace("start", new Object[]{"levels", 3, "q", Q_KEM},
+            "ML-KEM encapsulation pure + silent reject", "start");
+
         MLKEMParameters[] params = new MLKEMParameters[]{
             MLKEMParameters.ml_kem_512, MLKEMParameters.ml_kem_768, MLKEMParameters.ml_kem_1024,
         };
@@ -1691,6 +1909,9 @@ public class PqcEssenceTest
             Assert.assertArrayEquals("同一对种子必须长出同一把钥匙：" + p.getName(), kp1[0], kp2[0]);
             Assert.assertArrayEquals("私钥种子就是 d||z（64 字节）", Calc.concat(d, z), kp1[5]);
             Assert.assertEquals("公钥 = t 打包 ‖ ρ", eng.getIndCpaPublicKeyBytes(), kp1[0].length + kp1[1].length);
+            Tracer.trace("keygen", new Object[]{"param", p.getName(), "d", d, "z", z},
+                new Object[]{"pkBytes", kp1[0].length, "skBytes", kp1[5].length,
+                    "deterministic", Arrays.equals(kp1[0], kp2[0])}, "keygen");
 
             MLKEMPublicKeyParameters pub = new MLKEMPublicKeyParameters(p, Calc.concat(kp1[0], kp1[1]));
             // 64 字节种子 == 展开后的私钥：两种写法必须给出同一把钥匙
@@ -1698,6 +1919,9 @@ public class PqcEssenceTest
             Assert.assertArrayEquals("私钥的公钥部分必须等于公钥编码", pub.getEncoded(), priv.getPublicKey());
             Assert.assertEquals("私钥编码长度 = 768k + 96", p.getK() * 768 + 96, priv.getEncoded().length);
             Assert.assertEquals("会话密钥固定 32 字节", 32, p.getSessionKeySize() / 8);
+            Tracer.trace("key-format", new Object[]{"param", p.getName(), "k", p.getK()},
+                new Object[]{"skBytes", priv.getEncoded().length, "pubFromPriv", priv.getPublicKey().length,
+                    "sessionKeyBytes", p.getSessionKeySize() / 8}, "keygen");
 
             // 封装是随机硬币的确定过程：同硬币同密文同密钥
             byte[] coin = shakeBytes("coin", MLKEMEngine.SymBytes);
@@ -1706,11 +1930,17 @@ public class PqcEssenceTest
             Assert.assertArrayEquals("给定硬币后封装是确定性的", e1[0], e2[0]);
             Assert.assertArrayEquals("给定硬币后密文也是确定性的", e1[1], e2[1]);
             Assert.assertEquals("密文长度由参数集决定", eng.getCipherTextBytes(), e1[1].length);
+            Tracer.trace("encap", new Object[]{"param", p.getName(), "coin", coin},
+                new Object[]{"K", e1[0], "ctBytes", e1[1].length,
+                    "ctDeterministic", Arrays.equals(e1[1], e2[1])}, "encap");
 
             // 解封装与封装共享同一个密钥 —— 双方没有传输密钥，只是各自算出
             Assert.assertArrayEquals("decap(enc) 必须等于 enc 端的密钥", e1[0], eng.kemDecrypt(priv, e1[1]));
             Assert.assertArrayEquals("MLKEMExtractor 与引擎必须给同一个答案",
                 e1[0], new MLKEMExtractor(priv).extractSecret(e1[1]));
+            Tracer.trace("decap", new Object[]{"param", p.getName(), "ctBytes", e1[1].length},
+                new Object[]{"K'", eng.kemDecrypt(priv, e1[1]),
+                    "extractorK", new MLKEMExtractor(priv).extractSecret(e1[1])}, "decap");
 
             // 换硬币 -> 密文和密钥都完全不同。这里必须纠正一个常见误解：
             // ML-KEM 的密钥不是"嵌在密文里的明文"，而是 (K, r) = G(r ‖ H(pk)) ——
@@ -1720,6 +1950,10 @@ public class PqcEssenceTest
             Assert.assertFalse("换硬币必须换密文", Arrays.equals(e1[1], e3[1]));
             Assert.assertFalse("换硬币也必须换密钥：K 由 G(r‖H(pk)) 现场导出，不是固定明文",
                 Arrays.equals(e1[0], e3[0]));
+            Tracer.traceDecision("new coin -> new ct", new Object[]{"param", p.getName()},
+                !Arrays.equals(e1[1], e3[1]), "compare", "coin != otherCoin => ct != ct'");
+            Tracer.traceDecision("new coin -> new K", new Object[]{"param", p.getName()},
+                !Arrays.equals(e1[0], e3[0]), "compare", "coin != otherCoin => K != K'");
             Assert.assertArrayEquals("但解封装必须能追回这次封装自己的那把 K", e3[0], eng.kemDecrypt(priv, e3[1]));
 
             // 走一遍"注入随机源"的公开 API：结果必须与固定硬币的同一条管线兼容
@@ -1727,6 +1961,8 @@ public class PqcEssenceTest
             Assert.assertEquals("随机封装的密文长度不变", eng.getCipherTextBytes(), swe.getEncapsulation().length);
             Assert.assertArrayEquals("随机封装的密钥必须能被解出来",
                 swe.getSecret(), new MLKEMExtractor(priv).extractSecret(swe.getEncapsulation()));
+            Tracer.trace("encap-random", new Object[]{"param", p.getName()},
+                new Object[]{"ctBytes", swe.getEncapsulation().length, "keyBytes", swe.getSecret().length}, "encap");
 
             // 隐式拒绝：改一个 bit（就地改克隆出来的密钥字节），不抛异常、不报错，只是导出另一个 32 字节"假密钥"
             byte[] tamperedCt = e1[1].clone();
@@ -1735,6 +1971,11 @@ public class PqcEssenceTest
             Assert.assertEquals("无效密文仍然返回 32 字节（没有任何错误通道）", 32, rejected.length);
             Assert.assertFalse("但它必须不是原来的密钥", Arrays.equals(e1[0], rejected));
             Assert.assertArrayEquals("隐式拒绝同样是确定性的：同输入必同输出", rejected, eng.kemDecrypt(priv, tamperedCt));
+            Tracer.traceDecision("implicit reject", new Object[]{"param", p.getName(), "tamperedByte", 40},
+                !Arrays.equals(e1[0], rejected), "compare", "rejected K != K (no exception)");
+            Tracer.traceDecision("reject deterministic", new Object[]{"param", p.getName(), "tamperedByte", 40},
+                Arrays.equals(rejected, eng.kemDecrypt(priv, tamperedCt)), "compare",
+                "same invalid ct -> same Ktilde");
             log.info("[PQC-ML-KEM] {} pk={} ct={}，封装/解封装都是确定过程，拒绝是静默的",
                 p.getName(), pub.getEncoded().length, eng.getCipherTextBytes());
         }
@@ -1749,6 +1990,14 @@ public class PqcEssenceTest
             MLKEMEngine.getInstance(MLKEMParameters.ml_kem_768).getIndCpaPublicKeyBytes());
         Assert.assertEquals("ML-KEM-1024 公钥 1568 字节", 1568,
             MLKEMEngine.getInstance(MLKEMParameters.ml_kem_1024).getIndCpaPublicKeyBytes());
+        Tracer.trace("compare", new Object[]{"ct512", MLKEMParameters.ml_kem_512.getEncapsulationLength(),
+                "ct768", MLKEMParameters.ml_kem_768.getEncapsulationLength(),
+                "ct1024", MLKEMParameters.ml_kem_1024.getEncapsulationLength()},
+            new Object[]{"pk512", MLKEMEngine.getInstance(MLKEMParameters.ml_kem_512).getIndCpaPublicKeyBytes(),
+                "pk768", MLKEMEngine.getInstance(MLKEMParameters.ml_kem_768).getIndCpaPublicKeyBytes(),
+                "pk1024", MLKEMEngine.getInstance(MLKEMParameters.ml_kem_1024).getIndCpaPublicKeyBytes()}, "compare");
+        Tracer.trace("end", new Object[]{"levels", params.length, "q", Q_KEM},
+            "encap/decap deterministic; rejection silent", "end");
     }
 
     /**
@@ -1786,9 +2035,13 @@ public class PqcEssenceTest
      * hint 只泄漏 O(1) bit：每条 hint 一个"跨没跨 α 刻度边界"的判定位，共 ≤ ω=80 bit，
      * 相对 2420 字节签名 ≈ 3% 且与 s1/s2 的取值无关（它只依赖公开刻度与噪声落点）。
      */
+    @TraceExecution(value = "签名 = 环乘 + 分解 + 打包", algorithm = "PQC", flow = "PQC-MLDSA")
     @Test
     public void signingIsOneRingMultiplyOneDecompositionAndOnePack()
     {
+        Tracer.trace("start", new Object[]{"param", "ml_dsa_44", "seed", "mldsa-essence"},
+            "sign = multiply + decompose + pack", "start");
+
         MLDSAParameters p = MLDSAParameters.ml_dsa_44;
         MLDSAEngine eng = MLDSAEngine.getInstance(p, ANY);
         byte[] seed = shakeBytes("mldsa-essence", MLDSAEngine.SeedBytes);
@@ -1796,6 +2049,10 @@ public class PqcEssenceTest
         MLDSAPublicKeyParameters pub = priv.getPublicKeyParameters();
         Assert.assertArrayEquals("从私钥取出的公钥必须等于我们自己拼的", pub.getEncoded(),
             new MLDSAPublicKeyParameters(p, priv.getRho(), priv.getT1()).getEncoded());
+        Tracer.trace("keygen", new Object[]{"seed", seed, "param", p.getName()},
+            new Object[]{"pkBytes", pub.getEncoded().length, "rhoBytes", priv.getRho().length,
+                "t1Bytes", priv.getT1().length, "s1Bytes", priv.getS1().length,
+                "t0Bytes", priv.getT0().length}, "keygen");
 
         // 步骤 0：s1 是"η 采样 + 4 bit（其实 3 bit）偏置打包"的产物 —— 用我们的 unpack 还原，幅度必须 <= η
         // 符号：η = 系数幅度（44 档 = 2）；stored ∈ [0, 2η] 只需 ⌈log2(2η+1)⌉ = 3 bit，标准仍按 4 bit/系数打包（128 字节/份）；
@@ -1813,6 +2070,10 @@ public class PqcEssenceTest
             allAbsAtMost(s1, eta));
         Assert.assertArrayEquals("我们的 η 打包必须逐字节复现 BC 的 s1 编码",
             Arrays.copyOf(priv.getS1(), etaBytes), pack(etaBits, s1Stored));
+        Tracer.trace("s1-eta", new Object[]{"eta", eta, "etaBits", etaBits},
+            new Object[]{"s1[0..3]", Arrays.toString(Arrays.copyOf(s1, 4)),
+                "absAtMost", allAbsAtMost(s1, eta),
+                "packMatches", Arrays.equals(Arrays.copyOf(priv.getS1(), etaBytes), pack(etaBits, s1Stored))}, "keygen");
 
         // 步骤 1：y 是一个"幅度 < γ1"的多项式 —— 这里用 23-bit 窗口的拒绝采样自己抽一个（while 循环直到凑满 256 个）
         // 符号：γ1 = 2^17（44 档）；真实协议是 y_i ← XOF(κ‖(256+i)) 以 21/22-bit 窗口拒绝后折成 (−γ1, γ1)，
@@ -1825,11 +2086,20 @@ public class PqcEssenceTest
             y[i] = mod((long)(gamma1 - 1) - yRaw[i] % (long)(gamma1 - 1), Q_DSA);
         }
         Assert.assertEquals("多项式就是 256 个系数", N, y.length);
+        Tracer.trace("mask-y", new Object[]{"gamma1", gamma1,
+                "yRaw[0..3]", Arrays.toString(Arrays.copyOf(yRaw, 4))},
+            new Object[]{"y[0..3]", Arrays.toString(Arrays.copyOf(y, 4)),
+                "coeffs", y.length}, "sign");
 
         // 步骤 2：NTT 域里做一次逐点乘（真实协议是 A∘y，这里用我们自己的环验证换基恒等式）
         int[] wy = nttFast(Q_DSA, PSI_DSA, mulPoly(Q_DSA, y, s1));
         Assert.assertTrue("换基恒等式：NTT(y*s1) = NTT(y)·NTT(s1)",
             same(wy, pointwiseMul(Q_DSA, nttFast(Q_DSA, PSI_DSA, y), nttFast(Q_DSA, PSI_DSA, s1))));
+        Tracer.trace("ntt-multiply", new Object[]{"y[0..3]", Arrays.toString(Arrays.copyOf(y, 4)),
+                "s1[0..3]", Arrays.toString(Arrays.copyOf(s1, 4))},
+            new Object[]{"NTT(y*s1)[0..3]", Arrays.toString(Arrays.copyOf(wy, 4)),
+                "identity", same(wy, pointwiseMul(Q_DSA, nttFast(Q_DSA, PSI_DSA, y),
+                    nttFast(Q_DSA, PSI_DSA, s1)))}, "sign");
 
         // 步骤 3：分解出 w1 并打包 —— γ2 分解（ml-dsa-44 用 γ2 = (q-1)/88，所以 w1 ∈ [0,44) 只要 6 bit）
         // 符号：w1 = HighBits(w) = decompose 的段号 a1；真实协议里它被压缩成 r（Compress(r1, 2γ2→4 bit/系数)），
@@ -1843,6 +2113,9 @@ public class PqcEssenceTest
         Assert.assertTrue("w1 必须在 [0, 44) 内，因此 6 bit 就够存", allInRange(w1, 0, 44));
         Assert.assertEquals("6-bit 打包：256·6/8 = 192 字节", 192, pack(6, w1).length);
         Assert.assertTrue("6-bit 打包/解包互逆", same(w1, unpack(6, N, pack(6, w1))));
+        Tracer.trace("decompose-w1", new Object[]{"gamma2", gamma2, "alpha", 2 * gamma2},
+            new Object[]{"w1[0..3]", Arrays.toString(Arrays.copyOf(w1, 4)),
+                "inRange", allInRange(w1, 0, 44), "packedBytes", pack(6, w1).length}, "sign");
 
         // 步骤 4：z = y + c·s1 的形状检查 —— c 是 τ-稀疏的，所以这一步是 τ 次移位加（见命题七）
         //
@@ -1879,8 +2152,16 @@ public class PqcEssenceTest
         byte[] sig = dsaSign(priv, msg);
         Assert.assertTrue("完整签名必须能被我们的手写验证器接受", dsaVerify(pub, msg, sig));
         Assert.assertEquals("ML-DSA-44 的签名长度 = c~(80) + z + hints", 2420, sig.length);
+        Tracer.trace("sign", new Object[]{"msgBytes", msg.length, "gamma1", gamma1},
+            new Object[]{"sigBytes", sig.length, "zBytes", 4 * 576, "hintBytes", 80 + 4}, "sign");
+        Tracer.trace("verify", new Object[]{"sigBytes", sig.length},
+            dsaVerify(pub, msg, sig), "verify");
+        Tracer.traceDecision("sig length = 2420", new Object[]{"sigBytes", sig.length},
+            sig.length == 2420, "compare", "32 + l*576 + (omega+k) == 2420");
         log.info("[PQC-本质] 一次环乘 + 一次 γ2 分解 + 一次打包 = 一张 {} 字节的后量子签名（γ1={}, γ2={}）",
             sig.length, gamma1, gamma2);
+        Tracer.trace("end", new Object[]{"param", p.getName(), "sigBytes", sig.length},
+            "one multiply + one decompose + one pack", "end");
     }
 
     /**
@@ -1894,9 +2175,13 @@ public class PqcEssenceTest
      * NIST 标准随文发布的固定 seed → 期望字节串叫 KAT（known-answer test）：实现逐字节复现官方表，
      * 才算"和参考实现等价"；本类用"长度 + 结构恒等式 + BC 裁判"覆盖同一张表的骨架。
      */
+    @TraceExecution(value = "参数集是一张表", algorithm = "PQC", flow = "PQC-MATH")
     @Test
     public void parameterSetsAreATableNotAClassHierarchy()
     {
+        Tracer.trace("start", new Object[]{"dsaModes", 6, "kemModes", 3},
+            "parameter sets as a table", "start");
+
         Calc.useBc();
         List<MLDSAParameters> dsa = Arrays.asList(
             MLDSAParameters.ml_dsa_44, MLDSAParameters.ml_dsa_65, MLDSAParameters.ml_dsa_87,
@@ -1910,6 +2195,9 @@ public class PqcEssenceTest
         Assert.assertEquals("后 3 个是 SHA-512 预哈希模式", Boolean.TRUE, Boolean.valueOf(dsa.get(3).isPreHash()));
         Assert.assertEquals("同级别的 pure / 预哈希共用 k",
             dsa.get(0).getK(), dsa.get(3).getK());
+        Tracer.trace("table", new Object[]{"dsaModes", dsa.size(), "kemModes", kem.size()},
+            new Object[]{"preHash[0]", dsa.get(0).isPreHash(), "preHash[3]", dsa.get(3).isPreHash(),
+                "fipsK[0]", dsa.get(0).getK(), "fipsK[3]", dsa.get(3).getK()}, "params");
 
         byte[] seed = shakeBytes("table", MLDSAEngine.SeedBytes);
         List<byte[]> pks = new ArrayList<byte[]>();
@@ -1934,6 +2222,10 @@ public class PqcEssenceTest
         Assert.assertTrue("公钥必须越来越长",
             pks.get(0).length < pks.get(1).length && pks.get(1).length < pks.get(2).length);
         Assert.assertEquals("签名长度表 = FIPS 204 Table", Arrays.asList(2420, 3309, 4627), sigLengths);
+        Tracer.trace("dsa-table", new Object[]{"seed", seed, "modes", dsa.size()},
+            new Object[]{"matrixK", matrixK.toString(), "fipsK", fipsK.toString(),
+                "sigLengths", sigLengths.toString(),
+                "pkLengths", pks.get(0).length + "/" + pks.get(1).length + "/" + pks.get(2).length}, "params");
 
         // ML-KEM 的"模式"只改变 k 与 du/dv，管线一行没动
         List<Integer> kemK = new ArrayList<Integer>();
@@ -1949,16 +2241,30 @@ public class PqcEssenceTest
         Assert.assertEquals(Arrays.asList(2, 3, 4), kemK);
         Assert.assertEquals("会话密钥永远是 SHA3-256 的 32 字节", Arrays.asList(32, 32, 32), sessionKeys);
         Assert.assertEquals("密文长度表", Arrays.asList(768, 1088, 1568), ctLengths);
+        Tracer.trace("kem-table", new Object[]{"modes", kem.size()},
+            new Object[]{"k", kemK.toString(), "sessionKeyBytes", sessionKeys.toString(),
+                "ctLengths", ctLengths.toString()}, "params");
 
         // ML-DSA 的密钥生成也只是同一条管线，注入的随机源不同而已
         MLDSAKeyPairGenerator gen = new MLDSAKeyPairGenerator();
         gen.init(new MLDSAKeyGenerationParameters(ANY, MLDSAParameters.ml_dsa_87));
         AsymmetricCipherKeyPair pair = gen.generateKeyPair();
         byte[] challenge = "k=8 l=7".getBytes();
+        Tracer.trace("keygen", new Object[]{"param", "ml_dsa_87"},
+            new Object[]{"pkBytes", ((MLDSAPublicKeyParameters)pair.getPublic()).getEncoded().length}, "params");
         Assert.assertTrue("最大级别同样可验", dsaVerify((MLDSAPublicKeyParameters)pair.getPublic(), challenge,
             dsaSign((MLDSAPrivateKeyParameters)pair.getPrivate(), challenge)));
+        Tracer.trace("verify", new Object[]{"msg", "k=8 l=7"},
+            dsaVerify((MLDSAPublicKeyParameters)pair.getPublic(), challenge,
+                dsaSign((MLDSAPrivateKeyParameters)pair.getPrivate(), challenge)), "params");
         Assert.assertEquals("ML-DSA-87 公钥 = 32 + 8*320", 2592,
             ((MLDSAPublicKeyParameters)pair.getPublic()).getEncoded().length);
+        Tracer.traceDecision("pk length = 32 + 8*320",
+            new Object[]{"pkBytes", ((MLDSAPublicKeyParameters)pair.getPublic()).getEncoded().length},
+            ((MLDSAPublicKeyParameters)pair.getPublic()).getEncoded().length == 2592,
+            "params", "pkBytes == 2592");
         log.info("[PQC-模式表] ML-DSA {} 种 + ML-KEM {} 种，全部是同一条管线上的一张表", dsa.size(), kem.size());
+        Tracer.trace("end", new Object[]{"dsaModes", dsa.size(), "kemModes", kem.size()},
+            "same pipeline, table-driven", "end");
     }
 }

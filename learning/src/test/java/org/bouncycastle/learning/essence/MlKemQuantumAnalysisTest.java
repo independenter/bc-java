@@ -6,7 +6,11 @@ import java.util.Arrays;
 
 import lombok.extern.slf4j.Slf4j;
 import org.bouncycastle.crypto.digests.SHAKEDigest;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -55,6 +59,9 @@ public class MlKemQuantumAnalysisTest
     private static final org.slf4j.Logger log =
         org.slf4j.LoggerFactory.getLogger(MlKemQuantumAnalysisTest.class);
 
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     // =====================================================================
     // 第一层：困难问题 —— Module-LWE 为什么量子下仍难
     // =====================================================================
@@ -71,6 +78,7 @@ public class MlKemQuantumAnalysisTest
      *   <li>格约减算法（LLL/BKZ）能找"近似最短向量"，但对 256 维格仍指数时间</li>
      * </ol>
      */
+    @TraceExecution(value = "Module-LWE：噪声让线性反解变困难", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void moduleLweIsHardBecauseOfNoise()
     {
@@ -79,6 +87,8 @@ public class MlKemQuantumAnalysisTest
         int n = 256;  // 多项式次数
 
         log.info("[Module-LWE] q={}, k={}, n={}", q, k, n);
+        Tracer.trace("start", new Object[]{"q", q, "k", k, "n", n},
+            "Module-LWE 结构演示", "start");
 
         // 1. 生成随机矩阵 A（k×k 个多项式，每个 n 个系数）
         int[][][] A = new int[k][k][n];
@@ -94,6 +104,10 @@ public class MlKemQuantumAnalysisTest
             }
         }
 
+        Tracer.trace("sampleMatrixA",
+            new Object[]{"q", q, "k", k, "n", n, "A[0][0][0]", A[0][0][0]},
+            "A ∈ R_q^{k×k}", "lattice");
+
         // 2. 生成短向量 s（系数从 [−1, 0, 1] 抽，模拟中心二项式）
         int[][] s = new int[k][n];
         for (int i = 0; i < k; i++)
@@ -104,9 +118,16 @@ public class MlKemQuantumAnalysisTest
             }
         }
 
+        Tracer.trace("sampleShortSecret",
+            new Object[]{"k", k, "n", n, "s[0][0]", s[0][0]},
+            "‖s‖∞ ≤ 1", "lattice");
+
         // 3. 无噪声版本：t = A·s (mod q)，反解 s 是平凡的
         int[][] tNoNoise = matVecMulMod(q, A, s);
         log.info("[无噪声] t[0][0] = {}", tNoNoise[0][0]);
+        Tracer.trace("matVecMulMod",
+            new Object[]{"q", q, "A[0][0][0]", A[0][0][0], "s[0][0]", s[0][0]},
+            "t[0][0] = " + tNoNoise[0][0], "lattice");
 
         // 4. 有噪声版本：t = A·s + e (mod q)，e 也是短向量
         int[][] e = new int[k][n];
@@ -126,6 +147,9 @@ public class MlKemQuantumAnalysisTest
             }
         }
         log.info("[有噪声] t[0][0] = {}，误差 e[0][0] = {}", tWithNoise[0][0], e[0][0]);
+        Tracer.trace("addNoise",
+            new Object[]{"tNoNoise[0][0]", tNoNoise[0][0], "e[0][0]", e[0][0]},
+            "t'[0][0] = " + tWithNoise[0][0], "lattice");
 
         // 5. 为什么"直接求逆"不行：A⁻¹·t = s + A⁻¹·e，误差被放大
         // 在 R_q 上 A 不一定可逆，但即使可逆，A⁻¹ 的系数也是 [0, q) 均匀分布，
@@ -136,7 +160,14 @@ public class MlKemQuantumAnalysisTest
         // BKZ-256 在经典下约 2^{118}，量子下 Grover 加速到 2^{59}，仍远超多项式
         int latticeDim = k * n; // 格的维度 = k·n = 512
         log.info("[SVP] 格维度 = k·n = {}，量子下仍指数时间", latticeDim);
+        Tracer.trace("latticeDimension",
+            new Object[]{"k", k, "n", n}, "dim = " + latticeDim, "lattice");
+        Tracer.traceDecision("svpCheck",
+            new Object[]{"latticeDim", latticeDim}, latticeDim >= 512,
+            "lattice", "格维度 ≥ 512 ?");
         Assert.assertTrue("格维度 ≥ 512", latticeDim >= 512);
+        Tracer.trace("end", new Object[]{"latticeDim", latticeDim},
+            "量子下仍指数时间（归约到 SVP）", "end");
     }
 
     /**
@@ -203,6 +234,7 @@ public class MlKemQuantumAnalysisTest
      *   <li>这就是 ML-KEM 三个级别（512/768/1024）的设计逻辑</li>
      * </ol>
      */
+    @TraceExecution(value = "Grover 对 LWE 只有二次加速", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void groverOnlyGivesQuadraticSpeedup()
     {
@@ -212,12 +244,18 @@ public class MlKemQuantumAnalysisTest
         int k512 = 2;
         int n = 256;
         int dim512 = k512 * n;
+        Tracer.trace("start", new Object[]{"k", k512, "n", n, "dim", dim512},
+            "Grover 二次加速", "start");
         // NIST 安全级别 1（≈ AES-128）：经典 2^118，量子 2^59（Grover 减半）
         int classicalSecurity512 = 118;
         int quantumSecurity512 = 59;
         log.info("[ML-KEM-512] 格维度={}, 经典安全性≈2^{}, 量子安全性≈2^{}",
             dim512, classicalSecurity512, quantumSecurity512);
         Assert.assertTrue("量子安全性 ≥ 50", quantumSecurity512 >= 50);
+        Tracer.trace("mlKem512",
+            new Object[]{"k", k512, "dim", dim512, "classicalBits", classicalSecurity512,
+                "quantumBits", quantumSecurity512},
+            "2^" + classicalSecurity512 + " → 2^" + quantumSecurity512, "grover");
 
         // 2. ML-KEM-768：k=3, 格维度 768
         int k768 = 3;
@@ -227,6 +265,10 @@ public class MlKemQuantumAnalysisTest
         int quantumSecurity768 = 91;
         log.info("[ML-KEM-768] 格维度={}, 量子安全性≈2^{}", dim768, quantumSecurity768);
         Assert.assertTrue("量子安全性 ≥ 80", quantumSecurity768 >= 80);
+        Tracer.trace("mlKem768",
+            new Object[]{"k", k768, "dim", dim768, "classicalBits", classicalSecurity768,
+                "quantumBits", quantumSecurity768},
+            "2^" + classicalSecurity768 + " → 2^" + quantumSecurity768, "grover");
 
         // 3. ML-KEM-1024：k=4, 格维度 1024
         int k1024 = 4;
@@ -236,9 +278,15 @@ public class MlKemQuantumAnalysisTest
         int quantumSecurity1024 = 128;
         log.info("[ML-KEM-1024] 格维度={}, 量子安全性≈2^{}", dim1024, quantumSecurity1024);
         Assert.assertTrue("量子安全性 ≥ 120", quantumSecurity1024 >= 120);
+        Tracer.trace("mlKem1024",
+            new Object[]{"k", k1024, "dim", dim1024, "classicalBits", classicalSecurity1024,
+                "quantumBits", quantumSecurity1024},
+            "2^" + classicalSecurity1024 + " → 2^" + quantumSecurity1024, "grover");
 
         // 4. 对比：RSA-2048 在量子下是多项式时间（Shor），完全破产
         log.info("[对比] RSA-2048 量子下 = 多项式时间（Shor），ML-KEM-512 量子下 ≈ 2^{100}");
+        Tracer.trace("end", new Object[]{"levels", 3, "maxQuantumBits", quantumSecurity1024},
+            "仅二次加速，不是多项式", "end");
     }
 
     // =====================================================================
@@ -261,6 +309,7 @@ public class MlKemQuantumAnalysisTest
      *
      * <p>本测试演示 FO 变换的核心逻辑。
      */
+    @TraceExecution(value = "FO 变换：IND-CPA 升级到 IND-CCA", algorithm = "PQC", flow = "PQC-MLKEM")
     @Test
     public void foTransformUpgradesCpaToCca()
     {
@@ -268,6 +317,10 @@ public class MlKemQuantumAnalysisTest
         int n = 256;
 
         log.info("[FO 变换] 把 IND-CPA 升级到 IND-CCA");
+        Tracer.trace("start", new Object[]{"q", q, "n", n},
+            "FO 变换（IND-CPA → IND-CCA）", "start");
+        Tracer.trace("keygen", new Object[]{"q", q, "n", n},
+            "测试聚焦 FO 层，KeyGen 密钥上下文省略", "keygen");
 
         // 1. 模拟封装：m → (K, r) = G(m)
         byte[] m = new byte[32];
@@ -280,6 +333,9 @@ public class MlKemQuantumAnalysisTest
 
         // 2. 模拟加密：用 r 封装得到 c（这里简化为 c = r，实际是多项式压缩）
         byte[] c = r.clone();
+        Tracer.trace("encap",
+            new Object[]{"m", bytesToHex(m, 4), "K", bytesToHex(K, 4), "r", bytesToHex(r, 4)},
+            "c = r（简化：省略多项式压缩）", "encap");
 
         // 3. 模拟解密：用私钥解密 c 得到 r'
         byte[] rPrime = c.clone(); // 简化：c 就是 r，解密后 r' = r
@@ -289,10 +345,16 @@ public class MlKemQuantumAnalysisTest
         byte[] input = concat(rPrime, Hc);
         byte[] KPrime = shake256(input, 32);
         log.info("[解密] r'={}..., K'={}...", bytesToHex(rPrime, 4), bytesToHex(KPrime, 4));
+        Tracer.trace("decap",
+            new Object[]{"r'", bytesToHex(rPrime, 4), "H(c)", bytesToHex(Hc, 4)},
+            "K' = " + bytesToHex(KPrime, 4), "decap");
 
         // 5. 合法密文：K' 与 K 不同（因为密钥导出路径不同），但这是确定的
         log.info("[合法] K={}..., K'={}...（两者不同，因为导出路径不同）",
             bytesToHex(K, 4), bytesToHex(KPrime, 4));
+        Tracer.trace("compareLegit",
+            new Object[]{"K", bytesToHex(K, 4), "K'", bytesToHex(KPrime, 4)},
+            "合法路径：导出路径不同，K ≠ K'", "compare");
 
         // 6. 模拟攻击者篡改密文
         byte[] cTampered = c.clone();
@@ -302,10 +364,19 @@ public class MlKemQuantumAnalysisTest
         byte[] inputTampered = concat(rTampered, HcTampered);
         byte[] KPrimeTampered = shake256(inputTampered, 32);
         log.info("[攻击] 篡改密文后 K'={}...", bytesToHex(KPrimeTampered, 4));
+        Tracer.trace("decapTampered",
+            new Object[]{"c'", bytesToHex(cTampered, 4)},
+            "K'' = " + bytesToHex(KPrimeTampered, 4), "decap");
 
         // 7. 关键：篡改后的 K' 与合法的 K' 完全不同
+        boolean sameKey = Arrays.equals(KPrime, KPrimeTampered);
+        Tracer.traceDecision("compareTampered",
+            new Object[]{"K'", bytesToHex(KPrime, 4), "K''", bytesToHex(KPrimeTampered, 4)},
+            !sameKey, "compare", "篡改后 K'' ≠ K' ?");
         Assert.assertFalse("篡改后密钥不同", Arrays.equals(KPrime, KPrimeTampered));
         log.info("[结论] 篡改密文 → 解密出错的 r' → 完全不同的 K' → 隐式拒绝");
+        Tracer.trace("end", new Object[]{"tamperedRejected", !sameKey},
+            "篡改密文 → 隐式拒绝", "end");
     }
 
     /**
@@ -365,10 +436,13 @@ public class MlKemQuantumAnalysisTest
      *   <li>SLH-DSA（对比）：基于哈希，签名大（7856 字节）但安全性假设最弱</li>
      * </ol>
      */
+    @TraceExecution(value = "ML-KEM 与经典/其他 PQC 的对比", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void compareWithClassicAndOtherPqc()
     {
         log.info("[对比] 经典 KEM vs PQC KEM");
+        Tracer.trace("start", new Object[]{"schemes", 3},
+            "经典 KEM vs PQC KEM", "start");
 
         // 1. RSA-2048：经典安全性 112-bit，量子下 = 0（Shor 破产）
         int rsaKeySize = 2048;
@@ -376,6 +450,10 @@ public class MlKemQuantumAnalysisTest
         int rsaQuantumSecurity = 0;
         log.info("[RSA-{}] 经典安全性 2^{}，量子安全性 = 0（Shor）",
             rsaKeySize, rsaClassicalSecurity);
+        Tracer.trace("rsa2048",
+            new Object[]{"keySize", rsaKeySize, "classicalBits", rsaClassicalSecurity,
+                "quantumBits", rsaQuantumSecurity},
+            "Shor 多项式时间破解", "compare");
 
         // 2. ECDH P-256：经典安全性 128-bit，量子下 = 0（Shor 破产）
         int ecdhKeySize = 256;
@@ -383,6 +461,10 @@ public class MlKemQuantumAnalysisTest
         int ecdhQuantumSecurity = 0;
         log.info("[ECDH P-{}] 经典安全性 2^{}，量子安全性 = 0（Shor）",
             ecdhKeySize, ecdhClassicalSecurity);
+        Tracer.trace("ecdhP256",
+            new Object[]{"keySize", ecdhKeySize, "classicalBits", ecdhClassicalSecurity,
+                "quantumBits", ecdhQuantumSecurity},
+            "Shor 多项式时间破解", "compare");
 
         // 3. ML-KEM-512：经典安全性 118-bit，量子下 59-bit（Grover 二次加速）
         int mlKemKeySize = 512;
@@ -390,6 +472,10 @@ public class MlKemQuantumAnalysisTest
         int mlKemQuantumSecurity = 59;
         log.info("[ML-KEM-{}] 经典安全性 2^{}，量子安全性 2^{}（Grover）",
             mlKemKeySize, mlKemClassicalSecurity, mlKemQuantumSecurity);
+        Tracer.trace("mlKem512",
+            new Object[]{"keySize", mlKemKeySize, "classicalBits", mlKemClassicalSecurity,
+                "quantumBits", mlKemQuantumSecurity},
+            "Grover 后仍 2^" + mlKemQuantumSecurity, "compare");
         Assert.assertTrue("ML-KEM 量子下仍安全", mlKemQuantumSecurity >= 59);
 
         // 4. 密文大小对比
@@ -398,9 +484,17 @@ public class MlKemQuantumAnalysisTest
         int mlKemCiphertextSize = 768; // ML-KEM-512
         log.info("[密文大小] RSA={} 字节, ECDH={} 字节, ML-KEM={} 字节",
             rsaCiphertextSize, ecdhCiphertextSize, mlKemCiphertextSize);
+        Tracer.trace("ciphertextSize",
+            new Object[]{"RSA", rsaCiphertextSize, "ECDH", ecdhCiphertextSize,
+                "ML-KEM", mlKemCiphertextSize},
+            "ML-KEM 密文最大（768 字节）", "compare");
 
         // 5. 结论：ML-KEM 密文大（768 字节 vs ECDH 32 字节），但量子下仍安全
         log.info("[结论] ML-KEM 用密文大小换量子安全性，这是格密码的代价");
+        Tracer.trace("end",
+            new Object[]{"mlKemQuantumBits", mlKemQuantumSecurity,
+                "ciphertextBytes", mlKemCiphertextSize},
+            "用密文大小换量子安全性", "end");
     }
 
     /**
@@ -410,10 +504,13 @@ public class MlKemQuantumAnalysisTest
      *
      * <p>本测试验证参数表的正确性。
      */
+    @TraceExecution(value = "ML-KEM 参数选择与 NIST 安全级别", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void parameterChoicesFollowQuantumSecurityLevels()
     {
         log.info("[参数选择] ML-KEM 三个级别的设计逻辑");
+        Tracer.trace("start", new Object[]{"levels", 3},
+            "ML-KEM 参数表", "start");
 
         // ML-KEM-512：NIST 级别 1（≈ AES-128）
         int k512 = 2;
@@ -425,6 +522,10 @@ public class MlKemQuantumAnalysisTest
         int ciphertextLen512 = k512 * n * du_512 / 8 + n * dv_512 / 8;
         log.info("[ML-KEM-512] k={}, η₁={}, η₂={}, d_u={}, d_v={} → 密文 {} 字节",
             k512, eta1_512, eta2_512, du_512, dv_512, ciphertextLen512);
+        Tracer.trace("mlKem512",
+            new Object[]{"k", k512, "eta1", eta1_512, "eta2", eta2_512,
+                "du", du_512, "dv", dv_512, "n", n},
+            "ciphertext = " + ciphertextLen512, "params");
         Assert.assertEquals("ML-KEM-512 密文 768 字节", 768, ciphertextLen512);
 
         // ML-KEM-768：NIST 级别 3（≈ AES-192）
@@ -436,6 +537,10 @@ public class MlKemQuantumAnalysisTest
         int ciphertextLen768 = k768 * n * du_768 / 8 + n * dv_768 / 8;
         log.info("[ML-KEM-768] k={}, η₁={}, η₂={}, d_u={}, d_v={} → 密文 {} 字节",
             k768, eta1_768, eta2_768, du_768, dv_768, ciphertextLen768);
+        Tracer.trace("mlKem768",
+            new Object[]{"k", k768, "eta1", eta1_768, "eta2", eta2_768,
+                "du", du_768, "dv", dv_768, "n", n},
+            "ciphertext = " + ciphertextLen768, "params");
         Assert.assertEquals("ML-KEM-768 密文 1088 字节", 1088, ciphertextLen768);
 
         // ML-KEM-1024：NIST 级别 5（≈ AES-256）
@@ -447,8 +552,20 @@ public class MlKemQuantumAnalysisTest
         int ciphertextLen1024 = k1024 * n * du_1024 / 8 + n * dv_1024 / 8;
         log.info("[ML-KEM-1024] k={}, η₁={}, η₂={}, d_u={}, d_v={} → 密文 {} 字节",
             k1024, eta1_1024, eta2_1024, du_1024, dv_1024, ciphertextLen1024);
+        Tracer.trace("mlKem1024",
+            new Object[]{"k", k1024, "eta1", eta1_1024, "eta2", eta2_1024,
+                "du", du_1024, "dv", dv_1024, "n", n},
+            "ciphertext = " + ciphertextLen1024, "params");
         Assert.assertEquals("ML-KEM-1024 密文 1568 字节", 1568, ciphertextLen1024);
 
+        Tracer.traceDecision("checkMonotonic",
+            new Object[]{"len512", ciphertextLen512, "len768", ciphertextLen768,
+                "len1024", ciphertextLen1024},
+            ciphertextLen512 < ciphertextLen768 && ciphertextLen768 < ciphertextLen1024,
+            "params", "密文长度随安全级别递增 ?");
+
         log.info("[结论] k 增大 → 格维度增大 → 量子安全性增大 → 密文也增大");
+        Tracer.trace("end", new Object[]{"maxCiphertext", ciphertextLen1024},
+            "k 增大 → 格维度增大 → 密文增大", "end");
     }
 }

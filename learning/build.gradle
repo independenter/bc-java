@@ -53,6 +53,7 @@ def bcJarTasks = [
     ':pg:jar', ':tls:jar', ':mls:jar', ':mail:jar', ':jmail:jar'
 ]
 
+compileJava.dependsOn(bcJarTasks)
 compileTestJava.dependsOn(bcJarTasks)
 
 // Run every learning test, overriding the root project's "AllTest*" filter.

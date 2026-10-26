@@ -31,7 +31,11 @@ import org.bouncycastle.crypto.generators.MGF1BytesGenerator;
 import org.bouncycastle.crypto.params.MGFParameters;
 import org.bouncycastle.crypto.params.RSAKeyParameters;
 import org.bouncycastle.crypto.signers.PSSSigner;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -141,6 +145,9 @@ import org.junit.Test;
 @Slf4j
 public class RsaEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     // ---------------------------------------------------------------- 密钥元组的下标
 
     /**
@@ -263,15 +270,55 @@ public class RsaEssenceTest
      */
     private static BigInteger powMod(BigInteger base, BigInteger exp, BigInteger n)
     {
+        return powMod(base, exp, n, null);
+    }
+
+    /**
+     * groupOverride 让调用方决定这次模幂落到流程图的哪个节点：签名/加密测试用默认的
+     * encrypt/decrypt，而填充与分块主题里它就是同一个"模幂原语"节点（modExp）。
+     */
+    private static BigInteger powMod(BigInteger base, BigInteger exp, BigInteger n,
+        String groupOverride)
+    {
+        long startNanos = System.nanoTime();
+        int totalBits = exp.bitLength();
+        String group = groupOverride != null ? groupOverride
+            : exp.bitLength() <= 17 ? "encrypt" : "decrypt";
+        Tracer.pushLoop(group);
+
+        // 限流：e = 65537 只有 17 bit，逐位平方-乘仍值得展示；但 2048-bit 私钥指数
+        // （以及同一测试里后续的大量模幂）逐位展开会产生上万条事件、几十 MB HTML。
+        // 因此只在事件预算内保留逐位 traceLoop，超出后与 2048-bit 情形一样只发一条汇总。
+        boolean detailed = totalBits <= 64 && Tracer.getEventCount() < 96;
+
         BigInteger acc = ONE;
-        for (int bit = exp.bitLength() - 1; bit >= 0; bit--)
+        for (int bit = totalBits - 1; bit >= 0; bit--)
         {
             acc = acc.multiply(acc).mod(n);
             if (exp.testBit(bit))
             {
                 acc = acc.multiply(base).mod(n);
             }
+            if (detailed && Tracer.isEnabled())
+            {
+                Tracer.traceLoop("powMod.iteration", new Object[]{
+                    "bit", bit, "bitVal", exp.testBit(bit) ? 1 : 0, "acc", acc
+                }, acc, group, totalBits - bit, totalBits, group);
+            }
         }
+        if (!detailed)
+        {
+            // 大指数（或已超预算）只发一条汇总：iteration = total，表示"全部 bit 已算完"
+            Tracer.traceLoop("powMod.iteration", new Object[]{
+                "base", base, "exp", exp, "n", n, "bits", totalBits
+            }, acc, group, totalBits, totalBits, group);
+        }
+        Tracer.popLoop();
+
+        Tracer.trace("powMod", new Object[]{
+            "base", base, "exp", exp, "n", n, "bits", totalBits
+        }, acc, group, System.nanoTime() - startNanos);
+
         return acc;
     }
 
@@ -300,11 +347,43 @@ public class RsaEssenceTest
      */
     private static BigInteger[] keyGen(BigInteger p, BigInteger q, BigInteger e)
     {
-        BigInteger lambda = lcm(p.subtract(ONE), q.subtract(ONE));
-        BigInteger d = e.modInverse(lambda);
-        return new BigInteger[]
+        return keyGen(p, q, e, true);
+    }
+
+    /**
+     * emitTrace = false 用于"已经由调用方讲完密钥生成、这里只是重建元组"的场景，
+     * 避免同一组 selectP/computeN 事件在流程图上重复出现、打乱主题顺序。
+     */
+    private static BigInteger[] keyGen(BigInteger p, BigInteger q, BigInteger e, boolean emitTrace)
+    {
+        if (emitTrace)
         {
-            p.multiply(q),                       // n
+            Tracer.trace("selectP", new Object[]{"bits", 1024}, p, "selectP");
+            Tracer.trace("selectQ", new Object[]{"bits", 1024}, q, "selectQ");
+        }
+
+        BigInteger n = p.multiply(q);
+        if (emitTrace)
+        {
+            Tracer.trace("computeN", new Object[]{"p", p, "q", q}, n, "computeN");
+        }
+
+        BigInteger lambda = lcm(p.subtract(ONE), q.subtract(ONE));
+        if (emitTrace)
+        {
+            Tracer.trace("computePhi", new Object[]{"p-1", p.subtract(ONE), "q-1", q.subtract(ONE)}, lambda, "computePhi");
+            Tracer.trace("selectE", new Object[]{"candidate", e, "gcd(e,λ)", e.gcd(lambda)}, e, "selectE");
+        }
+
+        BigInteger d = e.modInverse(lambda);
+        if (emitTrace)
+        {
+            Tracer.trace("computeD", new Object[]{"e", e, "λ", lambda}, d, "computeD");
+        }
+
+        BigInteger[] key = new BigInteger[]
+        {
+            n,                                   // n
             e,                                   // e
             d,                                   // d
             lambda,                              // λ = lcm(p-1, q-1)
@@ -313,6 +392,11 @@ public class RsaEssenceTest
             q.modInverse(p),                     // qInv = q⁻¹ mod p
             p, q                                 // 分解本身
         };
+        if (emitTrace)
+        {
+            Tracer.trace("keygen", new Object[]{"n", n, "e", e, "d", d, "λ", lambda}, key, "keygen");
+        }
+        return key;
     }
 
     /**
@@ -422,6 +506,11 @@ public class RsaEssenceTest
         return powMod(m, key[E], key[N]);
     }
 
+    private static BigInteger publicOp(BigInteger[] key, BigInteger m, String group)
+    {
+        return powMod(m, key[E], key[N], group);
+    }
+
     /**
      * 私钥运算（直路）：一次全尺寸模幂 {@code c^d mod n}。
      *
@@ -502,10 +591,15 @@ public class RsaEssenceTest
      */
     private static BigInteger privateOpCrt(BigInteger[] key, BigInteger c)
     {
+        return privateOpCrt(key, c, null);
+    }
+
+    private static BigInteger privateOpCrt(BigInteger[] key, BigInteger c, String group)
+    {
         // m1 = c^dp mod p：p 这半条上的余数（1024-bit 模幂），等价于 (c^d mod n) mod p
-        BigInteger m1 = powMod(c, key[DP], key[PP]);
+        BigInteger m1 = powMod(c, key[DP], key[PP], group);
         // m2 = c^dq mod q：q 那半条上的余数
-        BigInteger m2 = powMod(c, key[DQ], key[PQ]);
+        BigInteger m2 = powMod(c, key[DQ], key[PQ], group);
         // h = qInv·(m1 − m2) mod p：把"以 m2 为基准"抬到与 m1 同余所需的修正量；先 mod p 保证 0 ≤ h 小于 p
         BigInteger h = key[QINV].multiply(m1.subtract(m2).mod(key[PP])).mod(key[PP]);
         // m = m2 + h·q：h·q 在 mod q 下为 0（保住 m2），在 mod p 下补出 m1 − m2（抬到 m1）—— CRT 的解
@@ -527,15 +621,25 @@ public class RsaEssenceTest
      */
     private static byte[] publicOpBytes(BigInteger[] key, byte[] block)
     {
+        return publicOpBytes(key, block, null);
+    }
+
+    private static byte[] publicOpBytes(BigInteger[] key, byte[] block, String group)
+    {
         int size = (key[N].bitLength() + 7) / 8;
-        return Calc.toBytes(publicOp(key, Calc.toBigInt(block)), size);
+        return Calc.toBytes(publicOp(key, Calc.toBigInt(block), group), size);
     }
 
     /** 与 publicOpBytes 同一套大端定宽换算，只是把模幂换成 privateOpCrt（CRT 路），见 privateOpCrt 的符号表。 */
     private static byte[] privateCrtBytes(BigInteger[] key, byte[] block)
     {
+        return privateCrtBytes(key, block, null);
+    }
+
+    private static byte[] privateCrtBytes(BigInteger[] key, byte[] block, String group)
+    {
         int size = (key[N].bitLength() + 7) / 8;
-        return Calc.toBytes(privateOpCrt(key, Calc.toBigInt(block)), size);
+        return Calc.toBytes(privateOpCrt(key, Calc.toBigInt(block), group), size);
     }
 
     // ---------------------------------------------------------------- 填充：全是带真实参数的静态方法
@@ -768,6 +872,14 @@ public class RsaEssenceTest
         {
             byte[] block = digestOf(hashName, Calc.concat(seed, Calc.toBytes(BigInteger.valueOf(counter), 4)));
             stream = Calc.concat(stream, block);
+            // 采样：每个测试只记录第一个"至少 3 块"调用里的 counter 0..3，
+            // 既能看到 H(seed‖0)‖H(seed‖1)‖… 的结构，又不会让 MGF1 事件爆炸。
+            if (Tracer.isEnabled() && blocks >= 3 && counter < 4 && Tracer.getEventCount() < 5)
+            {
+                Tracer.traceLoop("mgf1.counter", new Object[]{
+                    "seed", seed, "counter", counter, "blockLen", block.length
+                }, block, "mgf1", counter + 1, blocks, "mgf1");
+            }
         }
         return Arrays.copyOf(stream, length);
     }
@@ -1060,7 +1172,7 @@ public class RsaEssenceTest
     private static byte[] pkcs1Sign(String digestName, byte[] derPrefix, byte[] message)
     {
         byte[] em = pkcs1Type1(K, digestInfo(derPrefix, digestOf(digestName, message)));
-        return privateCrtBytes(KEY, em);
+        return privateCrtBytes(KEY, em, "modExp");
     }
 
     // ---------------------------------------------------------------- 分段 RSA
@@ -1097,19 +1209,26 @@ public class RsaEssenceTest
         for (int i = 0; i < segments.size(); i++)
         {
             byte[] seg = segments.get(i);
+            Tracer.traceLoop("segmented.block", new Object[]{
+                "index", i, "segLen", seg.length, "op", op
+            }, seg, "blockLoop", i + 1, segments.size(), "blockLoop");
+
             byte[] done;
             if (op == SEG_PKCS1_ENCRYPT)
             {
-                done = publicOpBytes(KEY, pkcs1Type2(K, seg));
+                done = publicOpBytes(KEY, pkcs1Type2(K, seg), "modExp");
             }
             else if (op == SEG_PKCS1_DECRYPT)
             {
-                done = pkcs1Unpad(2, K, privateCrtBytes(KEY, seg));
+                done = pkcs1Unpad(2, K, privateCrtBytes(KEY, seg, "modExp"));
             }
             else
             {
-                done = publicOpBytes(KEY, oaepEncode(SHA256, SHA256, K, EMPTY, seg));
+                done = publicOpBytes(KEY, oaepEncode(SHA256, SHA256, K, EMPTY, seg), "modExp");
             }
+            Tracer.trace("modExp", new Object[]{
+                "index", i, "op", op, "segLen", seg.length
+            }, done, "modExp");
             out = Calc.concat(out, done);
         }
         return out;
@@ -1163,11 +1282,35 @@ public class RsaEssenceTest
      *     让 m 必然小于 n：m 最大只有 2^(8·255) − 1 = 2^2040 − 1，而 n 至少 2^2046，稳稳落在 [0, n) 内
      * </pre>
      */
+    @TraceExecution(value = "RSA 加解密", algorithm = "RSA", flow = "RSA-CORE")
     @Test
     public void rsaIsJustOneModularExponentiation()
         throws Exception
     {
         Calc.useBc();
+        Tracer.trace("start", new Object[]{"bits", KEY[N].bitLength()},
+            "RSA encrypt + decrypt", "start");
+
+        // Trace the key generation steps using the already-computed static values
+        Tracer.trace("selectP", new Object[]{"bits", 1024}, P_BIG, "selectP");
+        Tracer.trace("selectQ", new Object[]{"bits", 1024}, Q_BIG, "selectQ");
+        Tracer.trace("computeN", new Object[]{"p", P_BIG, "q", Q_BIG}, KEY[N], "computeN");
+        Tracer.trace("computePhi", new Object[]{
+            "p-1", P_BIG.subtract(ONE), "q-1", Q_BIG.subtract(ONE)
+        }, KEY[LAM], "computePhi");
+        Tracer.trace("selectE", new Object[]{
+            "candidate", F4, "gcd(e,λ)", KEY[E].gcd(KEY[LAM])
+        }, KEY[E], "selectE");
+        Tracer.trace("computeD", new Object[]{
+            "e", KEY[E], "λ", KEY[LAM]
+        }, KEY[D], "computeD");
+
+        // keyGen() 在静态初始化时已经跑过；这里补一条九元组事件，让流程图的 keygen 节点有完整数据。
+        Tracer.trace("keygen", new Object[]{
+            "n", KEY[N], "e", KEY[E], "d", KEY[D], "λ", KEY[LAM],
+            "dp", KEY[DP], "dq", KEY[DQ], "qInv", KEY[QINV], "p", KEY[PP], "q", KEY[PQ]
+        }, KEY, "keygen");
+
         BigInteger n = KEY[N], e = KEY[E], d = KEY[D];
 
         BigInteger[] samples = new BigInteger[]
@@ -1183,8 +1326,11 @@ public class RsaEssenceTest
             // 平方-乘 == 库里的模幂：这是我们全部算术的正确性证明
             Assert.assertEquals("自写 powMod 必须等于 modPow", m.modPow(e, n), powMod(m, e, n));
             BigInteger c = publicOp(KEY, m);
+            Tracer.trace("encrypt", new Object[]{"m", m, "e", e, "n", n}, c, "encrypt");
             // c = m^e mod n；下面两行就是 (m^e)^d ≡ m (mod n) 的两种算法路径（直路与 CRT 路）
-            Assert.assertEquals("直路私钥运算必须还原明文", m, privateOp(KEY, c));
+            BigInteger decrypted = privateOp(KEY, c);
+            Tracer.trace("decrypt", new Object[]{"c", c, "d", d, "n", n}, decrypted, "decrypt");
+            Assert.assertEquals("直路私钥运算必须还原明文", m, decrypted);
             Assert.assertEquals("CRT 路私钥运算必须还原明文", m, privateOpCrt(KEY, c));
         }
 
@@ -1194,7 +1340,85 @@ public class RsaEssenceTest
         Assert.assertEquals("d 必须是 e 在 λ 下的逆", ONE, e.multiply(d).mod(KEY[LAM]));
         // 逆元存在 ⟺ gcd(e, λ) = 1（扩展欧几里得的判定条件）；不互素时 d 根本不存在，密钥作废
         Assert.assertEquals("e 必须与 λ 互素，否则逆不存在", ONE, e.gcd(KEY[LAM]));
+        Tracer.trace("end", new Object[]{"n", n, "e", e, "d", d},
+            "RSA encrypt + decrypt verified", "end");
         log.info("[RSA-本质] 模数 {} bits，λ {} bits，自写平方-乘与 modPow 一致", n.bitLength(), KEY[LAM].bitLength());
+    }
+
+    /**
+     * RSA 密钥对生成的本质：选两个大素数 p、q，算出 n=pq、λ=lcm(p-1,q-1)、d=e⁻¹ mod λ。
+     *
+     * <p>密钥就是九个整数 (n, e, d, λ, dp, dq, qInv, p, q)，没有任何对象。
+     * 本测试用 @TraceExecution 追踪整个 keyGen 过程，生成 HTML 可视化。
+     */
+    @TraceExecution(value = "RSA 密钥对生成", algorithm = "RSA", flow = "RSA-CORE")
+    @Test
+    public void rsaKeyPairGenerationIsNumberTheory()
+        throws Exception
+    {
+        Calc.useBc();
+        Tracer.trace("start", new Object[]{"algorithm", "RSA", "bits", 2048}, null, "start");
+
+        // 生成两个 1024-bit 素数 p、q，要求 gcd(e, p-1) = 1
+        long startNanos = System.nanoTime();
+        BigInteger p = primeCoprimeTo(1024, F4);
+        long pNanos = System.nanoTime();
+        Tracer.trace("selectP", new Object[]{"bits", 1024, "method", "probablePrime+coprime"}, p, "selectP", pNanos - startNanos);
+
+        BigInteger q = primeCoprimeTo(1024, F4);
+        long qNanos = System.nanoTime();
+        Tracer.trace("selectQ", new Object[]{"bits", 1024, "method", "probablePrime+coprime"}, q, "selectQ", qNanos - pNanos);
+
+        // n = p * q
+        BigInteger n = p.multiply(q);
+        long nNanos = System.nanoTime();
+        Tracer.trace("computeN", new Object[]{"p_bits", p.bitLength(), "q_bits", q.bitLength()}, n, "computeN", nNanos - qNanos);
+
+        // λ = lcm(p-1, q-1)
+        BigInteger lambda = lcm(p.subtract(ONE), q.subtract(ONE));
+        long lamNanos = System.nanoTime();
+        Tracer.trace("computePhi", new Object[]{"p-1_bits", p.subtract(ONE).bitLength(), "q-1_bits", q.subtract(ONE).bitLength()}, lambda, "computePhi", lamNanos - nNanos);
+
+        // e = 65537 (F4)，验证 gcd(e, λ) = 1
+        Tracer.trace("selectE", new Object[]{"candidate", F4, "gcd(e,λ)", F4.gcd(lambda)}, F4, "selectE");
+
+        // d = e⁻¹ mod λ
+        BigInteger d = F4.modInverse(lambda);
+        long dNanos = System.nanoTime();
+        Tracer.trace("computeD", new Object[]{"e", F4, "λ_bits", lambda.bitLength()}, d, "computeD", dNanos - lamNanos);
+
+        // 调用 keyGen 得到完整的九元组（内部步骤上面已经逐个追踪过，这里不再重复发事件）
+        BigInteger[] key = keyGen(p, q, F4, false);
+        Tracer.trace("keygen", new Object[]{
+            "n_bits", key[N].bitLength(),
+            "e", key[E],
+            "d_bits", key[D].bitLength(),
+            "λ_bits", key[LAM].bitLength()
+        }, key, "keygen");
+
+        // 验证密钥自洽性
+        Assert.assertEquals("n 必须等于 p*q", p.multiply(q), key[N]);
+        Assert.assertEquals("λ 必须是 lcm(p-1, q-1)", lcm(p.subtract(ONE), q.subtract(ONE)), key[LAM]);
+        Assert.assertEquals("e*d ≡ 1 (mod λ)", ONE, key[E].multiply(key[D]).mod(key[LAM]));
+        Assert.assertTrue("p 必须是素数", p.isProbablePrime(100));
+        Assert.assertTrue("q 必须是素数", q.isProbablePrime(100));
+        Assert.assertTrue("p ≠ q", !p.equals(q));
+
+        // 验证加解密自洽
+        BigInteger m = new BigInteger("1234567890abcdef", 16);
+        BigInteger c = powMod(m, key[E], key[N]);
+        BigInteger decrypted = powMod(c, key[D], key[N]);
+        Assert.assertEquals("加解密必须自洽", m, decrypted);
+
+        // 与 JCE 互操作
+        KeyPair jce = jcePair(key);
+        Assert.assertNotNull("JCE KeyPair 必须能构建", jce);
+        Assert.assertNotNull("JCE 公钥必须存在", jce.getPublic());
+        Assert.assertNotNull("JCE 私钥必须存在", jce.getPrivate());
+
+        log.info("[RSA-密钥生成] n={} bits, e={}, d={} bits, p={} bits, q={} bits",
+            key[N].bitLength(), key[E], key[D].bitLength(), p.bitLength(), q.bitLength());
+        Tracer.trace("end", new Object[]{"n_bits", n.bitLength(), "verified", true}, null, "end");
     }
 
     /**
@@ -1220,12 +1444,17 @@ public class RsaEssenceTest
      *     本例只比对模数与 CRT 自洽性，所以这个差异不影响断言。
      * </pre>
      */
+    @TraceExecution(value = "RSA 密钥即数字元组", algorithm = "RSA", flow = "RSA-CORE")
     @Test
     public void keyIsANumberTupleNotAnObject()
         throws Exception
     {
         Calc.useBc();
         BigInteger p = KEY[PP], q = KEY[PQ], n = KEY[N];
+        Tracer.trace("start", new Object[]{"n_bits", n.bitLength(), "e", KEY[E]}, null, "start");
+        Tracer.trace("selectP", new Object[]{"p_bits", p.bitLength()}, p, "selectP");
+        Tracer.trace("selectQ", new Object[]{"q_bits", q.bitLength()}, q, "selectQ");
+        Tracer.trace("computeN", new Object[]{"p", p, "q", q}, n, "computeN");
 
         Assert.assertEquals("n 必须是 pq", n, p.multiply(q));
         Assert.assertEquals("λ 必须是 lcm(p-1, q-1)", lcm(p.subtract(ONE), q.subtract(ONE)), KEY[LAM]);
@@ -1234,15 +1463,27 @@ public class RsaEssenceTest
         Assert.assertEquals("qInv = q⁻¹ mod p", q.modInverse(p), KEY[QINV]);
         Assert.assertTrue("两个素数不能相等", p.compareTo(q) != 0);
 
-        // CRT 的数学根据：半尺寸指数运算与全尺寸运算在 mod p 下同余
-        BigInteger c = Calc.toBigInt(randomBytes(K - 1));
-        Assert.assertEquals("c^dp mod p 必须等于 (c^d mod n) mod p",
-            powMod(c, KEY[D], n).mod(p), powMod(c, KEY[DP], p));
+        Tracer.trace("computePhi", new Object[]{
+            "p-1", p.subtract(ONE), "q-1", q.subtract(ONE)
+        }, KEY[LAM], "computePhi");
+        Tracer.trace("selectE", new Object[]{
+            "e (from tuple)", KEY[E], "gcd(e,λ)", KEY[E].gcd(KEY[LAM])
+        }, KEY[E], "selectE");
+        Tracer.trace("computeD", new Object[]{
+            "e", KEY[E], "d", KEY[D], "dp", KEY[DP], "dq", KEY[DQ]
+        }, KEY[D], "computeD");
+        Tracer.trace("keygen", new Object[]{
+            "n", KEY[N], "e", KEY[E], "d", KEY[D], "λ", KEY[LAM],
+            "dp", KEY[DP], "dq", KEY[DQ], "qInv", KEY[QINV], "p", p, "q", q
+        }, KEY, "keygen");
 
         // JCE 用同一组数字重建出的密钥，必须和我们的静态方法完全互操作
         KeyPair jce = jcePair(KEY);
         byte[] pt = "keys are numbers".getBytes("UTF-8");
         byte[] ours = publicOpBytes(KEY, pkcs1Type2(K, pt));
+        Tracer.trace("encrypt", new Object[]{
+            "ptLen", pt.length, "k", K, "e", KEY[E]
+        }, ours, "encrypt");
 
         Cipher dec = Cipher.getInstance("RSA/ECB/PKCS1Padding", "BC");
         dec.init(Cipher.DECRYPT_MODE, jce.getPrivate());
@@ -1253,16 +1494,30 @@ public class RsaEssenceTest
         byte[] fromJce = enc.doFinal(pt);
         Assert.assertArrayEquals("我们的元组必须能解 JCE 的块", pt,
             pkcs1Unpad(2, K, privateCrtBytes(KEY, fromJce)));
+        Tracer.trace("decrypt", new Object[]{
+            "fromJce", fromJce, "k", K, "d_bits", KEY[D].bitLength()
+        }, pt, "decrypt");
+
+        // CRT 的数学根据：半尺寸指数运算与全尺寸运算在 mod p 下同余
+        BigInteger c = Calc.toBigInt(randomBytes(K - 1));
+        Assert.assertEquals("c^dp mod p 必须等于 (c^d mod n) mod p",
+            powMod(c, KEY[D], n).mod(p), powMod(c, KEY[DP], p));
 
         // 反向：JCE 生成的密钥拆成数字后，同一套静态方法照样自洽
         KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA", "BC");
         kpg.initialize(2048);
         RSAPrivateCrtKey crt = (RSAPrivateCrtKey) kpg.generateKeyPair().getPrivate();
-        BigInteger[] fromJceKey = keyGen(crt.getPrimeP(), crt.getPrimeQ(), crt.getPublicExponent());
+        BigInteger[] fromJceKey = keyGen(crt.getPrimeP(), crt.getPrimeQ(), crt.getPublicExponent(), false);
+        Tracer.trace("keygen", new Object[]{
+            "n_bits", fromJceKey[N].bitLength(), "e", fromJceKey[E],
+            "p_bits", fromJceKey[PP].bitLength(), "q_bits", fromJceKey[PQ].bitLength()
+        }, fromJceKey, "keygen");
         Assert.assertEquals("元组必须重建出同一个模数", crt.getModulus(), fromJceKey[N]);
         Assert.assertEquals("拆成数字后 CRT 路必须自洽", c,
             publicOp(fromJceKey, privateOpCrt(fromJceKey, c)));
         log.info("[RSA-密钥] 纯数字元组 <-> JCE KeyPair 双向互操作通过");
+        Tracer.trace("end", new Object[]{"p_bits", p.bitLength(), "q_bits", q.bitLength()},
+            "number tuple verified", "end");
     }
 
     /**
@@ -1297,6 +1552,7 @@ public class RsaEssenceTest
      *      填充会把 m 顶到接近 n 的量级（k 字节），使 m^e 远远超过 n，模运算才真正生效。
      * </pre>
      */
+    @TraceExecution(value = "教科书 RSA 的四类泄露", algorithm = "RSA", flow = "RSA-ATTACK")
     @Test
     public void textbookRsaLeaksEverything()
         throws Exception
@@ -1305,6 +1561,9 @@ public class RsaEssenceTest
         BigInteger n = KEY[N];
         BigInteger m1 = Calc.toBigInt("RSA has no semantic security".getBytes("UTF-8"));
         BigInteger m2 = Calc.toBigInt("RSA has no semantic security".getBytes("UTF-8"));
+        Tracer.trace("start", new Object[]{"n_bits", n.bitLength(), "e", KEY[E]}, null, "start");
+        Tracer.trace("keygen", new Object[]{"n", n, "e", KEY[E]},
+            new BigInteger[]{ n, KEY[E] }, "keygen");
 
         // 1) 确定性：相同明文 -> 相同密文，于是密文泄露了"相等关系"
         Assert.assertEquals("教科书 RSA 是确定性加密",
@@ -1313,7 +1572,13 @@ public class RsaEssenceTest
         // 2) 乘法同态：攻击者不解密就能给明文乘一个常数 —— 语义安全的反面
         // cTwice = c · 2^e mod n ≡ (m1 · 2)^e (mod n)，所以解出来是 2·m1，而攻击者全程没碰私钥
         BigInteger c = publicOp(KEY, m1);
+        Tracer.trace("encrypt", new Object[]{
+            "m1", m1, "m2", m2, "e", KEY[E], "n", n
+        }, c, "encrypt");
         BigInteger cTwice = c.multiply(powMod(TWO, KEY[E], n)).mod(n);
+        Tracer.trace("guess", new Object[]{
+            "c", c, "y", TWO, "cTwice", cTwice
+        }, cTwice, "guess");
         Assert.assertEquals("密文乘 2^e 让明文翻倍", m1.multiply(TWO).mod(n),
             privateOp(KEY, cTwice));
 
@@ -1322,16 +1587,29 @@ public class RsaEssenceTest
         Assert.assertEquals(ZERO, publicOp(KEY, ZERO));
         Assert.assertEquals(ONE, publicOp(KEY, ONE));
         Assert.assertEquals(n.subtract(ONE), publicOp(KEY, n.subtract(ONE)));
+        Tracer.trace("guess", new Object[]{
+            "zero", ZERO, "one", ONE, "nMinusOne", n.subtract(ONE)
+        }, "0、1、n−1 全是固定点", "guess");
 
         // 4) e=3 且 m^e < n：模数完全没起作用，开立方就还原了明文（Why e=65537 / 为什么必须填充）
         // 这里现造一把 512-bit×512-bit 的小密钥（n 约 1024 bit），8 字节明文 "cube me" 的 m^3
         // 只有约 192 bit，远小于 n ⇒ 取模是恒等操作，密文里就藏着 m 的整数立方
-        BigInteger[] smallE = keyGen(primeCoprimeTo(512, THREE), primeCoprimeTo(512, THREE), THREE);
+        BigInteger[] smallE = keyGen(primeCoprimeTo(512, THREE), primeCoprimeTo(512, THREE), THREE, false);
+        Tracer.trace("keygen", new Object[]{
+            "n_bits", smallE[N].bitLength(), "e", THREE
+        }, smallE, "keygen");
         BigInteger msg = Calc.toBigInt("cube me".getBytes("UTF-8"));
         BigInteger cipher3 = publicOp(smallE, msg);
         Assert.assertEquals("m^3 没超过 n 时，密文就是 m^3 本身", msg.pow(3), cipher3);
+        Tracer.trace("root", new Object[]{
+            "cipher3", cipher3, "e", THREE
+        }, cubeRoot(cipher3), "root");
         Assert.assertEquals("牛顿迭代开立方即可还原明文", msg, cubeRoot(cipher3));
+        Tracer.trace("compare", new Object[]{"recovered", cubeRoot(cipher3), "expected", msg},
+            true, "compare");
         log.info("[RSA-教科书] 确定性 / 可延展 / 固定点 / 小指数开方 四种弱点全部复现");
+        Tracer.trace("end", new Object[]{"weaknesses", 4},
+            "确定性 / 可延展 / 固定点 / 小指数开方", "end");
     }
 
     /**
@@ -1378,15 +1656,21 @@ public class RsaEssenceTest
      *     完整攻击直觉与这条防御结论见 pkcs1Unpad 的注释。
      * </pre>
      */
+    @TraceExecution(value = "PKCS#1 v1.5 type 2 加密填充", algorithm = "RSA", flow = "RSA-PADDING")
     @Test
     public void pkcs1v15Type2PaddingRoundTripsWithJce()
         throws Exception
     {
         Calc.useBc();
         byte[] pt = "PKCS#1 v1.5 encryption padding".getBytes("UTF-8");
+        Tracer.trace("start", new Object[]{"ptLen", pt.length, "k", K}, null, "start");
         // 先看填充后的 EM 结构，再过一次公钥运算才是密文
         byte[] em = pkcs1Type2(K, pt);
-        byte[] ours = publicOpBytes(KEY, em);
+        Tracer.trace("encode", new Object[]{
+            "ptLen", pt.length, "k", K, "psLen", K - pt.length - 3
+        }, em, "encode");
+        byte[] ours = publicOpBytes(KEY, em, "modExp");
+        Tracer.trace("modExp", new Object[]{"em", em, "e", KEY[E], "n", KEY[N]}, ours, "modExp");
 
         Assert.assertEquals("EM 必须是 k 字节", K, em.length);
         Assert.assertEquals("首字节 00", 0, em[0] & 0xff);
@@ -1398,14 +1682,17 @@ public class RsaEssenceTest
         Cipher dec = Cipher.getInstance("RSA/ECB/PKCS1Padding", "BC");
         dec.init(Cipher.DECRYPT_MODE, jcePair(KEY).getPrivate());
         Assert.assertArrayEquals("JCE 必须能解我们的 type-2 填充块", pt, dec.doFinal(ours));
+        Tracer.trace("decode", new Object[]{"cipherLen", ours.length, "k", K}, pt, "decode");
 
         Cipher enc = Cipher.getInstance("RSA/ECB/PKCS1Padding", "BC");
         enc.init(Cipher.ENCRYPT_MODE, jcePair(KEY).getPublic());
         Assert.assertArrayEquals("我们的 unpad 必须解出 JCE 的密文", pt,
-            pkcs1Unpad(2, K, privateCrtBytes(KEY, enc.doFinal(pt))));
+            pkcs1Unpad(2, K, privateCrtBytes(KEY, enc.doFinal(pt), "modExp")));
 
         // 同一条明文两次填充不同 —— 随机填充体带来的语义安全（对比教科书 RSA 的确定性）
         Assert.assertFalse("type 2 必须 randomized", Arrays.equals(em, pkcs1Type2(K, pt)));
+        Tracer.traceDecision("verify", new Object[]{"samePlaintext", true},
+            true, "verify", "两次填充必须不同（语义安全）");
 
         // 三种畸形结构：先克隆再就地改动一个字节（原块 em 保持不动，后面还要用）
         byte[] noLeadingZero = em.clone();
@@ -1425,6 +1712,8 @@ public class RsaEssenceTest
             catch (IllegalArgumentException expected)
             {
                 log.info("[RSA-v1.5] 拒绝畸形结构：{}", expected.getMessage());
+                Tracer.traceDecision("verify", new Object[]{"malformedIndex", i},
+                    true, "verify", "畸形结构必须被拒绝");
             }
         }
 
@@ -1437,7 +1726,10 @@ public class RsaEssenceTest
         catch (IllegalArgumentException expected)
         {
             Assert.assertEquals("PKCS#1 v1.5：明文不能超过 k-11 字节", expected.getMessage());
+            Tracer.traceDecision("verify", new Object[]{"msgLen", K - 10, "limit", K - 11},
+                true, "verify", "明文长度上限 k−11");
         }
+        Tracer.trace("end", new Object[]{"k", K, "verified", true}, null, "end");
     }
 
     /**
@@ -1459,12 +1751,14 @@ public class RsaEssenceTest
      *     jceNames（JCE 的签名算法名 "摘要withRSA"）；换摘要 = 换一行，代码不用动。
      * </pre>
      */
+    @TraceExecution(value = "PKCS#1 v1.5 type 1 确定性签名", algorithm = "RSA", flow = "RSA-PADDING")
     @Test
     public void pkcs1v15Type1SignatureMatchesJceByteForByte()
         throws Exception
     {
         Calc.useBc();
         byte[] msg = "deterministic padding means byte-identical signatures".getBytes("UTF-8");
+        Tracer.trace("start", new Object[]{"msgLen", msg.length, "k", K}, null, "start");
 
         // 一张"值表"：三行按下标对齐 —— 摘要名、DigestInfo DER 前缀、JCE 算法名
         String[] digestNames = new String[]{ SHA1, SHA256 };
@@ -1478,6 +1772,9 @@ public class RsaEssenceTest
             String jceName = jceNames[i];
 
             byte[] ours = pkcs1Sign(digestName, der, msg);
+            Tracer.trace("modExp", new Object[]{
+                "digest", digestName, "msgLen", msg.length, "derLen", der.length
+            }, ours, "modExp");
             KeyPair jce = jcePair(KEY);
 
             Signature sig = Signature.getInstance(jceName, "BC");
@@ -1486,15 +1783,21 @@ public class RsaEssenceTest
             byte[] ref = sig.sign();
             Assert.assertArrayEquals(jceName + "：手写签名必须与 JCE 逐字节相同", ref, ours);
 
+            // 反方向：公钥模幂 + 去 type1 填充，得到的必须正好是 DigestInfo —— 这也验证了硬编码的 DER 前缀
+            byte[] recovered = pkcs1Unpad(1, K, publicOpBytes(KEY, ref, "modExp"));
+            Tracer.trace("decode", new Object[]{
+                "recoveredLen", recovered.length, "digest", digestName
+            }, recovered, "decode");
+            Assert.assertArrayEquals(jceName + "：去掉 type1 填充后必须正好是 DigestInfo",
+                digestInfo(der, digestOf(digestName, msg)), recovered);
+
             Signature ver = Signature.getInstance(jceName, "BC");
             ver.initVerify(jce.getPublic());
             ver.update(msg);
             Assert.assertTrue(jceName + "：JCE 必须认我们的签名", ver.verify(ours));
-
-            // 反方向：公钥模幂 + 去 type1 填充，得到的必须正好是 DigestInfo —— 这也验证了硬编码的 DER 前缀
-            byte[] recovered = pkcs1Unpad(1, K, publicOpBytes(KEY, ref));
-            Assert.assertArrayEquals(jceName + "：去掉 type1 填充后必须正好是 DigestInfo",
-                digestInfo(der, digestOf(digestName, msg)), recovered);
+            Tracer.trace("verify", new Object[]{
+                "jce", jceName, "sigLen", ours.length
+            }, true, "verify");
 
             log.info("[RSA-签名] {} 与 JCE 完全一致（DigestInfo 前缀 {}）", jceName, Calc.hex(der));
         }
@@ -1504,6 +1807,9 @@ public class RsaEssenceTest
         ver.initVerify(jcePair(KEY).getPublic());
         ver.update("a different message".getBytes("UTF-8"));
         Assert.assertFalse("签名必须与消息绑定", ver.verify(pkcs1Sign(SHA256, DER_SHA256, msg)));
+        Tracer.trace("verify", new Object[]{"message", "a different message"},
+            false, "verify");
+        Tracer.trace("end", new Object[]{"algorithms", 2, "verified", true}, null, "end");
     }
 
     /**
@@ -1521,11 +1827,13 @@ public class RsaEssenceTest
      *     确定性：MGF1 内部没有随机数，随机性只能来自 seed —— 这保证解码方自己能重算出同一个掩码。
      * </pre>
      */
+    @TraceExecution(value = "MGF1 计数器模式", algorithm = "RSA", flow = "RSA-PADDING")
     @Test
     public void mgf1IsJustHashInCounterMode()
         throws Exception
     {
         Calc.useBc();
+        Tracer.trace("start", new Object[]{"hashes", 3, "lengths", 6}, null, "start");
         // 两张按下标对齐的值表：我们的摘要名 + BC 的 Digest 裁判
         String[] hashNames = new String[]{ SHA1, SHA256, SM3 };
         Digest[] bcDigests = new Digest[]{ new SHA1Digest(), new SHA256Digest(), new SM3Digest() };
@@ -1547,6 +1855,9 @@ public class RsaEssenceTest
                 gen.generateBytes(ref, 0, len);
                 Assert.assertArrayEquals("MGF1(hLen=" + hLen + ", len=" + len + ")",
                     ref, mgf1(hashName, seed, len));
+                Tracer.trace("mgf1", new Object[]{
+                    "hash", hashName, "hLen", hLen, "len", len, "blocks", Calc.ceilDiv(len, hLen)
+                }, Calc.hex(Arrays.copyOf(ref, Math.min(8, ref.length))), "mgf1");
             }
         }
 
@@ -1558,7 +1869,11 @@ public class RsaEssenceTest
             Arrays.equals(mgf1(SHA256, s, 64), mgf1(SHA256, sChanged, 64)));
         Assert.assertArrayEquals("MGF1 是确定性的：同输入必同输出",
             mgf1(SHA256, s, 64), mgf1(SHA256, s, 64));
+        Tracer.trace("verify", new Object[]{"avalanche", true, "deterministic", true},
+            true, "verify");
         log.info("[RSA-MGF1] 与 BC MGF1BytesGenerator 一致（SHA-1 / SHA-256 / SM3）");
+        Tracer.trace("end", new Object[]{"hashes", 3, "comparedLengths", 18},
+            "MGF1 = hash(counter)", "end");
     }
 
     /**
@@ -1585,12 +1900,14 @@ public class RsaEssenceTest
      *     可把密文钉在某个用途/某个会话上。
      * </pre>
      */
+    @TraceExecution(value = "OAEP 三种摘要往返", algorithm = "RSA", flow = "RSA-PADDING")
     @Test
     public void oaepRoundTripsUnderThreeHashes()
         throws Exception
     {
         Calc.useBc();
         byte[] pt = "OAEP gives RSA semantic security".getBytes("UTF-8");
+        Tracer.trace("start", new Object[]{"ptLen", pt.length, "k", K}, null, "start");
 
         // 三种"绑定 label 的哈希"：SHA-1 / SHA-256 / SM3。两张值表按下标对齐，裁判用 BC 的 crypto 层，参数完全显式。
         String[] hashNames = new String[]{ SHA1, SHA256, SM3 };
@@ -1601,21 +1918,29 @@ public class RsaEssenceTest
             OAEPEncoding referee = new OAEPEncoding(new RSAEngine(), bcDigests[i]);
 
             byte[] em = oaepEncode(hash, hash, K, EMPTY, pt);
-            byte[] ours = publicOpBytes(KEY, em);
+            Tracer.trace("encode", new Object[]{
+                "hash", hash, "hLen", digestSize(hash), "emLen", K
+            }, em, "encode");
+            byte[] ours = publicOpBytes(KEY, em, "modExp");
+            Tracer.trace("modExp", new Object[]{"em", em, "e", KEY[E], "n", KEY[N]},
+                ours, "modExp");
             Assert.assertEquals("OAEP 的 EM 也是 k 字节", K, em.length);
             Assert.assertEquals("首字节必须是 0", 0, em[0] & 0xff);
 
             referee.init(false, new RSAKeyParameters(true, KEY[N], KEY[D]));            // 解密用私钥
             Assert.assertArrayEquals("BC 必须能解我们的 OAEP 密文", pt,
                 referee.processBlock(ours, 0, ours.length));
+            Tracer.trace("decode", new Object[]{"hash", hash, "referee", "BC"}, pt, "decode");
 
             referee.init(true, new RSAKeyParameters(false, KEY[N], KEY[E]));            // 加密用公钥
             byte[] fromBc = referee.processBlock(pt, 0, pt.length);
             Assert.assertArrayEquals("我们必须能解 BC 的 OAEP 密文", pt,
-                oaepDecode(hash, hash, K, EMPTY, privateCrtBytes(KEY, fromBc)));
+                oaepDecode(hash, hash, K, EMPTY, privateCrtBytes(KEY, fromBc, "modExp")));
 
             Assert.assertFalse("OAEP 必须 randomized",
                 Arrays.equals(em, oaepEncode(hash, hash, K, EMPTY, pt)));
+            Tracer.trace("verify", new Object[]{"hash", hash, "randomized", true},
+                true, "verify");
             log.info("[RSA-OAEP] hLen={} 双向互操作通过，上限 k-2hLen-2 = {}",
                 digestSize(hash), K - 2 * digestSize(hash) - 2);
         }
@@ -1625,14 +1950,18 @@ public class RsaEssenceTest
         mixed.init(true, new RSAKeyParameters(false, KEY[N], KEY[E]));
         byte[] mixedFromBc = mixed.processBlock(pt, 0, pt.length);
         Assert.assertArrayEquals("label=SHA-256 / MGF1=SHA-1 的混合组合必须也能被我们的手写实现解开", pt,
-            oaepDecode(SHA256, SHA1, K, EMPTY, privateCrtBytes(KEY, mixedFromBc)));
+            oaepDecode(SHA256, SHA1, K, EMPTY, privateCrtBytes(KEY, mixedFromBc, "modExp")));
+        Tracer.trace("decode", new Object[]{
+            "labelHash", SHA256, "mgfHash", SHA1
+        }, pt, "decode");
 
         // JCE 端到端：显式 OAEPParameterSpec，不依赖任何"名字里默认用什么哈希"的方言
         Cipher dec = Cipher.getInstance("RSA/ECB/OAEPPadding", "BC");
         dec.init(Cipher.DECRYPT_MODE, jcePair(KEY).getPrivate(),
             new OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT));
         Assert.assertArrayEquals("JCE(OAEPParameterSpec) 必须能解我们的 OAEP 密文", pt,
-            dec.doFinal(publicOpBytes(KEY, oaepEncode(SHA256, SHA256, K, EMPTY, pt))));
+            dec.doFinal(publicOpBytes(KEY, oaepEncode(SHA256, SHA256, K, EMPTY, pt), "modExp")));
+        Tracer.trace("decode", new Object[]{"spec", "SHA-256/MGF1-SHA256"}, pt, "decode");
 
         // label 绑定：换个 label 就解不开 —— 这是 OAEP 唯一"额外"的能力。
         // 注意解码方法只看 EM 本身，不需要先做模幂 —— 填充与模幂正交的最好证据。
@@ -1645,6 +1974,8 @@ public class RsaEssenceTest
         catch (IllegalArgumentException expected)
         {
             log.info("[RSA-OAEP] label 绑定生效：{}", expected.getMessage());
+            Tracer.traceDecision("verify", new Object[]{"labelA", "label-A", "labelB", "label-B"},
+                true, "verify", "label 不匹配必须失败");
         }
 
         // 长度上限 k-2hLen-2（对比 v1.5 的 k-11）：边界内侧可用，边界外侧立刻拒绝
@@ -1657,7 +1988,10 @@ public class RsaEssenceTest
         catch (IllegalArgumentException expected)
         {
             Assert.assertEquals("OAEP：明文超过 k-2hLen-2", expected.getMessage());
+            Tracer.traceDecision("verify", new Object[]{"msgLen", K - 65, "limit", K - 66},
+                true, "verify", "明文长度上限 k−2hLen−2");
         }
+        Tracer.trace("end", new Object[]{"hashes", 3, "verified", true}, null, "end");
     }
 
     /**
@@ -1685,18 +2019,25 @@ public class RsaEssenceTest
      *     结构关卡或哈希等式过不去"，pssVerify 返回 false 而不是抛异常：验签就是布尔判定。
      * </pre>
      */
+    @TraceExecution(value = "PSS 由 salt 决定", algorithm = "RSA", flow = "RSA-PADDING")
     @Test
     public void pssIsDeterminedByItsSalt()
         throws Exception
     {
         Calc.useBc();
         byte[] msg = "PSS is randomized but reproducible".getBytes("UTF-8");
+        Tracer.trace("start", new Object[]{
+            "msgLen", msg.length, "emLen", EM_LEN, "emBits", EM_BITS
+        }, null, "start");
 
         byte[][] salts = new byte[][]{ new byte[0], randomBytes(32), randomBytes(8) };
         for (int s = 0; s < salts.length; s++)
         {
             byte[] salt = salts[s];
             byte[] em = pssEncode(SHA256, EM_LEN, EM_BITS, salt, msg);
+            Tracer.trace("encode", new Object[]{
+                "sLen", salt.length, "emLen", EM_LEN, "salt", salt
+            }, em, "encode");
             Assert.assertEquals("PSS 的 EM 是 emLen 字节", EM_LEN, em.length);
             Assert.assertEquals("结尾固定 0xBC", 0xbc, em[EM_LEN - 1] & 0xff);
             // 掩码不是 0x7f 的"装饰"，它由 modBits 真实决定：本例 modBits=2046 -> 掩码 0x3f
@@ -1704,35 +2045,44 @@ public class RsaEssenceTest
                 0, em[0] & ~topBitMask(EM_LEN, EM_BITS));
             Assert.assertTrue("EM 作为整数必须小于 n", Calc.toBigInt(em).compareTo(KEY[N]) < 0);
             Assert.assertTrue("自校验必须通过", pssVerify(SHA256, EM_LEN, EM_BITS, msg, em));
+            Tracer.trace("pssVerify", new Object[]{"sLen", salt.length, "selfCheck", true},
+                true, "selfCheck");
 
             // 裁判：BC 的 PSSSigner 用同一个 salt -> 同一个 EM（这一步验证了 trailing-bit 掩码的细节）
             PSSSigner signer = new PSSSigner(new RSAEngine(), new SHA256Digest(), new SHA256Digest(), salt);
             signer.init(true, new RSAKeyParameters(true, KEY[N], KEY[D]));
             signer.update(msg, 0, msg.length);
             byte[] ref = signer.generateSignature();
-            byte[] refEm = publicOpBytes(KEY, ref);
+            byte[] refEm = publicOpBytes(KEY, ref, "modExp");
+            Tracer.trace("modExp", new Object[]{
+                "sLen", salt.length, "sigLen", ref.length
+            }, refEm, "modExp");
             Assert.assertArrayEquals("sLen=" + salt.length + " 时手写签名必须等于 BC"
                 + " ours=" + Calc.hex(em) + " | refEm=" + Calc.hex(refEm),
-                ref, privateCrtBytes(KEY, em));
+                ref, privateCrtBytes(KEY, em, "modExp"));
 
             Assert.assertFalse("同 salt 同消息，但换 salt 之后签名完全不同",
                 Arrays.equals(ref, privateCrtBytes(KEY,
-                    pssEncode(SHA256, EM_LEN, EM_BITS, randomBytes(32), msg))));
+                    pssEncode(SHA256, EM_LEN, EM_BITS, randomBytes(32), msg), "modExp")));
         }
 
         byte[] fixed = "fixed-salt".getBytes("UTF-8");
         Assert.assertArrayEquals("给定 salt 后 PSS 是确定性的（同输入必同输出）",
             pssEncode(SHA256, EM_LEN, EM_BITS, fixed, msg),
             pssEncode(SHA256, EM_LEN, EM_BITS, fixed, msg));
+        Tracer.trace("pssVerify", new Object[]{"fixedSalt", fixed.length, "deterministic", true},
+            true, "selfCheck");
 
         // 与 JCE 的 RSASSA-PSS 互验：JCE 用随机 salt，我们的 pssVerify 能把 salt 从 DB 里找回来
         Signature jceSign = Signature.getInstance("SHA256withRSA/PSS", "BC");
         jceSign.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
         jceSign.initSign(jcePair(KEY).getPrivate());
         jceSign.update(msg);
-        byte[] jceEm = publicOpBytes(KEY, jceSign.sign());
+        byte[] jceEm = publicOpBytes(KEY, jceSign.sign(), "modExp");
         Assert.assertTrue("我们的 pssVerify 必须能验 JCE 的随机 salt 签名",
             pssVerify(SHA256, EM_LEN, EM_BITS, msg, jceEm));
+        Tracer.trace("decode", new Object[]{"jceSaltLen", 32, "recovered", true},
+            true, "decode");
 
         // 反向互操作：JCE 必须认我们固定 salt 的签名（这一步之前会失败 —— 掩码算错时只有它抓得住）
         Signature jceVerify = Signature.getInstance("SHA256withRSA/PSS", "BC");
@@ -1741,7 +2091,8 @@ public class RsaEssenceTest
         jceVerify.update(msg);
         Assert.assertTrue("JCE 必须认我们的固定 salt 签名",
             jceVerify.verify(privateCrtBytes(KEY,
-                pssEncode(SHA256, EM_LEN, EM_BITS, randomBytes(32), msg))));
+                pssEncode(SHA256, EM_LEN, EM_BITS, randomBytes(32), msg), "modExp")));
+        Tracer.trace("verify", new Object[]{"jce", "SHA256withRSA/PSS"}, true, "verify");
 
         // 认证性：改一位，pssVerify 必须返回 false
         byte[] tampered = jceEm.clone();
@@ -1749,7 +2100,10 @@ public class RsaEssenceTest
         Assert.assertFalse("篡改 EM 必须让 PSS 校验失败", pssVerify(SHA256, EM_LEN, EM_BITS, msg, tampered));
         Assert.assertFalse("换消息必须让 PSS 校验失败",
             pssVerify(SHA256, EM_LEN, EM_BITS, "other".getBytes("UTF-8"), jceEm));
+        Tracer.trace("verify", new Object[]{"tamperedByte", 40}, false, "verify");
+        Tracer.trace("verify", new Object[]{"message", "other"}, false, "verify");
         log.info("[RSA-PSS] sLen=0/32/8 与 BC 逐字节一致，并能验 JCE 的随机 salt 签名");
+        Tracer.trace("end", new Object[]{"saltLengths", "0/32/8", "verified", true}, null, "end");
     }
 
     // ---------------------------------------------------------------- 九种填充的"值表"分派
@@ -1880,12 +2234,16 @@ public class RsaEssenceTest
      *     在填充层被堵住的直接证据。
      * </pre>
      */
+    @TraceExecution(value = "九种填充与模幂正交", algorithm = "RSA", flow = "RSA-PADDING")
     @Test
     public void everyPaddingSchemeIsAPureFunctionOrthogonalToTheModExp()
         throws Exception
     {
         Calc.useBc();
         byte[] body = Calc.concat("one body, eight paddings".getBytes("UTF-8"), randomBytes(8));
+        Tracer.trace("start", new Object[]{
+            "bodyLen", body.length, "schemes", SCHEMES.length
+        }, null, "start");
 
         String[] names = new String[]
             {
@@ -1899,15 +2257,24 @@ public class RsaEssenceTest
             int scheme = SCHEMES[row];
             String name = names[scheme];
             byte[] em = padByScheme(scheme, body);
+            Tracer.trace("encode", new Object[]{
+                "scheme", name, "bodyLen", body.length, "emLen", em.length
+            }, em, "encode");
             Assert.assertEquals(name + "：EM 必须正好填满一个模数块", K, em.length);
             Assert.assertTrue(name + "：EM 作为整数必须 < n", Calc.toBigInt(em).compareTo(KEY[N]) < 0);
 
             // 同一条模幂管线走一遍：私钥 -> 公钥 -> 去填充。填充方法不知道 RSA 的任何事
-            byte[] signed = privateCrtBytes(KEY, em);
-            byte[] recoveredEm = publicOpBytes(KEY, signed);
+            byte[] signed = privateCrtBytes(KEY, em, "modExp");
+            Tracer.trace("modExp", new Object[]{
+                "scheme", name, "em", em, "d_bits", KEY[D].bitLength()
+            }, signed, "modExp");
+            byte[] recoveredEm = publicOpBytes(KEY, signed, "modExp");
             Assert.assertArrayEquals(name + "：模幂往返必须还原 EM", em, recoveredEm);
             Assert.assertArrayEquals(name + "：unpad(pad(M)) 必须等于 M", body,
                 unpadByScheme(scheme, recoveredEm, body));
+            Tracer.trace("decode", new Object[]{
+                "scheme", name, "recoveredLen", recoveredEm.length
+            }, recoveredEm, "decode");
 
             // 结构字节（最高位必须为 0）翻转：先克隆再就地改，除 NoPadding 外全部拒绝
             byte[] flipped = recoveredEm.clone();
@@ -1921,6 +2288,8 @@ public class RsaEssenceTest
             {
                 assertRejected(name, scheme, flipped, body);
             }
+            Tracer.traceDecision("verify", new Object[]{"scheme", name, "flippedByte", 0},
+                scheme != 0, "verify", "结构篡改必须被拒绝（NoPadding 除外）");
             log.info("[RSA-填充] {}：k={} 字节，独立于模幂且能拒绝结构篡改", name, K);
         }
 
@@ -1933,9 +2302,12 @@ public class RsaEssenceTest
             // 只翻转代表消息的最后一字节（异或 1，保证内容确实变了）
             byte[] dataFlipped = emForFlip.clone();
             dataFlipped[K - 1] = (byte)(dataFlipped[K - 1] ^ 0x01);
-            byte[] back = unpadByScheme(i, publicOpBytes(KEY, privateCrtBytes(KEY, dataFlipped)), body);
+            byte[] back = unpadByScheme(i, publicOpBytes(KEY, privateCrtBytes(KEY, dataFlipped, "modExp"), "modExp"), body);
             Assert.assertEquals(names[i] + "：明文长度不变", body.length, back.length);
             Assert.assertFalse(names[i] + "：消息内容被静默破坏（v1.5 没有完整性）", Arrays.equals(body, back));
+            Tracer.traceDecision("verify", new Object[]{
+                "scheme", names[i], "contentChanged", true
+            }, false, "verify", "v1.5 不检查消息完整性");
         }
         for (int i = 3; i <= 6; i++)
         {
@@ -1944,7 +2316,10 @@ public class RsaEssenceTest
             byte[] dataFlipped = emForFlip.clone();
             dataFlipped[K - 2] = (byte)(dataFlipped[K - 2] ^ 0x01);
             assertRejected(names[i] + "（改消息位）", i,
-                publicOpBytes(KEY, privateCrtBytes(KEY, dataFlipped)), body);
+                publicOpBytes(KEY, privateCrtBytes(KEY, dataFlipped, "modExp"), "modExp"), body);
+            Tracer.traceDecision("verify", new Object[]{
+                "scheme", names[i], "flippedByte", K - 2
+            }, true, "verify", "OAEP 消息位篡改必须被拒绝");
         }
 
         // PSS 的 EM 末尾是固定 trailer 0xBC；它的 maskedDB 覆盖整条消息，所以改任何一位都会失败
@@ -1958,9 +2333,13 @@ public class RsaEssenceTest
                 byte[] oneFlipped = emForFlip.clone();
                 oneFlipped[at] = (byte)(oneFlipped[at] ^ 0x01);
                 assertRejected(names[i] + "（改第 " + at + " 字节）", i,
-                    publicOpBytes(KEY, privateCrtBytes(KEY, oneFlipped)), body);
+                    publicOpBytes(KEY, privateCrtBytes(KEY, oneFlipped, "modExp"), "modExp"), body);
+                Tracer.traceDecision("verify", new Object[]{
+                    "scheme", names[i], "flippedByte", at
+                }, true, "verify", "PSS 任意位篡改必须被拒绝");
             }
         }
+        Tracer.trace("end", new Object[]{"schemes", SCHEMES.length, "verified", true}, null, "end");
     }
 
     /**
@@ -1979,6 +2358,7 @@ public class RsaEssenceTest
      *     因为逐段 RSA 既慢，段与段之间又没有顺序/整体绑定（可被重排、删段而各自仍"合法"）。
      * </pre>
      */
+    @TraceExecution(value = "RSA 长消息分块循环", algorithm = "RSA", flow = "RSA-BLOCKS")
     @Test
     public void longMessageRsaIsALoopOverBlocks()
         throws Exception
@@ -1987,15 +2367,23 @@ public class RsaEssenceTest
         byte[] longMsg = Calc.repeat("RSA can carry at most k-11 bytes, so anything longer must be split into blocks. ", 12)
             .getBytes("UTF-8");
         int segmentSize = K - 11;
+        Tracer.trace("start", new Object[]{"msgLen", longMsg.length, "k", K}, null, "start");
+        Tracer.trace("split", new Object[]{
+            "msgLen", longMsg.length, "segmentSize", segmentSize
+        }, Calc.ceilDiv(longMsg.length, segmentSize), "split");
         Assert.assertTrue("这条消息必须超过单个 RSA 块", longMsg.length > segmentSize);
 
         // 加密方向：每段 -> type 2 填充 -> 公钥模幂 -> 拼接
         byte[] ct = segmented(SEG_PKCS1_ENCRYPT, segmentSize, longMsg);
+        Tracer.trace("concat", new Object[]{
+            "segments", Calc.ceilDiv(longMsg.length, segmentSize), "k", K
+        }, ct, "concat");
         Assert.assertEquals("密文长度 = 段数 × k", Calc.ceilDiv(longMsg.length, segmentSize) * K, ct.length);
 
         // 解密方向：密文按 k 切块 -> 私钥模幂 -> 去填充 -> 拼接（同一个循环，换一段单块代码）
         Assert.assertArrayEquals("分段 for 循环往返必须还原长消息", longMsg,
             segmented(SEG_PKCS1_DECRYPT, K, ct));
+        Tracer.trace("compare", new Object[]{"msgLen", longMsg.length}, true, "compare");
 
         // 裁判：JCE 逐段解我们的密文
         Cipher dec = Cipher.getInstance("RSA/ECB/PKCS1Padding", "BC");
@@ -2007,11 +2395,17 @@ public class RsaEssenceTest
             Assert.assertArrayEquals("第 " + i + " 段必须与 JCE 解密一致",
                 plainSegments.get(i), dec.doFinal(cipherSegments.get(i)));
         }
+        Tracer.trace("compare", new Object[]{
+            "jceSegments", cipherSegments.size(), "allMatch", true
+        }, true, "compare");
 
         // 用 OAEP 时上限就变成 k-2hLen-2 —— 同一个分段循环，换一段单块代码就换个上限
         Assert.assertEquals("OAEP 分段密文同样是段数 × k",
             Calc.ceilDiv(longMsg.length, K - 66) * K,
             segmented(SEG_OAEP_ENCRYPT, K - 66, longMsg).length);
+        Tracer.trace("concat", new Object[]{
+            "oaepSegmentSize", K - 66, "segments", Calc.ceilDiv(longMsg.length, K - 66)
+        }, Calc.ceilDiv(longMsg.length, K - 66) * K, "concat");
 
         try
         {
@@ -2021,8 +2415,14 @@ public class RsaEssenceTest
         catch (IllegalArgumentException expected)
         {
             Assert.assertEquals("PKCS#1 v1.5：明文不能超过 k-11 字节", expected.getMessage());
+            Tracer.traceDecision("compare", new Object[]{
+                "segLen", K - 10, "limit", K - 11
+            }, false, "compare", "超过 k−11 必须失败");
         }
         log.info("[RSA-分段] {} 字节明文 / {} 段，for 循环逐块与 JCE 互操作通过",
             longMsg.length, cipherSegments.size());
+        Tracer.trace("end", new Object[]{
+            "msgLen", longMsg.length, "segments", cipherSegments.size()
+        }, null, "end");
     }
 }

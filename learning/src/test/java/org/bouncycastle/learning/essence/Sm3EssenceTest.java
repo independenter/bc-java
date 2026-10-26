@@ -9,7 +9,11 @@ import org.bouncycastle.crypto.generators.KDF2BytesGenerator;
 import org.bouncycastle.crypto.macs.HMac;
 import org.bouncycastle.crypto.params.KDFParameters;
 import org.bouncycastle.crypto.params.KeyParameter;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 import static org.bouncycastle.learning.essence.Calc.M32;
@@ -47,6 +51,9 @@ import static org.bouncycastle.learning.essence.Calc.u32;
 @Slf4j
 public class Sm3EssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     /** HMAC / KDF 里 SM3 的分组长度（字节）。 */
     private static final int BLOCK_SIZE = Sm3.BLOCK_SIZE;
 
@@ -59,17 +66,39 @@ public class Sm3EssenceTest
      * 64 字节（恰好对齐，填充必须<b>再开一整块</b>）两种填充分支；
      * 期望值是 GB/T 32905 附录里的原文，逐位（256 bit = 64 个十六进制字符）比对。
      */
+    @TraceExecution(value = "SM3 标准向量与逐块压缩", algorithm = "SM3", flow = "SM3-HASH")
     @Test
     public void sm3EssenceMatchesGbt32905Vectors()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"vectors", "abc / abcd*16"}, null, "start");
+
         String abc = Calc.hex(Sm3.sm3("abc".getBytes("UTF-8")));
         log.info("[SM3-本质] SM3(\"abc\")            = {}", abc);
         Assert.assertEquals("66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0", abc);
 
+        // 追踪用（不改被测调用）：用 Sm3.mdPad / iv / wExpand / cf 复刻一次 "abc" 的块级与轮级过程
+        byte[] abcMsg = "abc".getBytes("UTF-8");
+        List<byte[]> abcBlocks = Sm3.mdPad(abcMsg);
+        byte[] abcBlock = abcBlocks.get(0);
+        Tracer.trace("pad", new Object[]{"msgLen", abcMsg.length, "blockSize", BLOCK_SIZE},
+            abcBlocks.size() + " block", "pad");
+        Tracer.trace("split", new Object[]{"msgLen", abcMsg.length, "blockLen", abcBlock.length},
+            Calc.hex(abcBlock), "split");
+        long[] v0 = Sm3.iv();
+        Tracer.trace("initV", null, Calc.hex(v0), "initV");
+        long[] v1 = Sm3.cf(v0, abcBlock);
+        Tracer.traceLoop("cfLoop", new Object[]{"block", 1, "blockLen", abcBlock.length},
+            Calc.hex(v1), "cfLoop", 1, abcBlocks.size(), "cfLoop");
+        long[] w = Sm3.wExpand(abcBlock);
+        Tracer.trace("expand", new Object[]{"W[0]", w[0], "W[15]", w[15]}, Calc.hex(w), "expand");
+        traceCompressRounds(v0, abcBlock);
+        Tracer.trace("finalize", new Object[]{"Vn", Calc.hex(v1)}, abc, "finalize");
+
         String abcd16 = Calc.hex(Sm3.sm3(Calc.repeat("abcd", 16).getBytes("UTF-8")));
         log.info("[SM3-本质] SM3(\"abcd\"*16)        = {}", abcd16);
         Assert.assertEquals("debe9ff92275b8a138604889c18e5a4d6fdb70e5387e5765293dcba39c0c5732", abcd16);
+        Tracer.trace("finalize", new Object[]{"vector", "abcd*16", "msgLen", 64}, abcd16, "finalize");
 
         // 与 JCE 第三方实现互相印证（不同长度覆盖所有填充分支）
         Calc.useBc();
@@ -81,7 +110,10 @@ public class Sm3EssenceTest
             Assert.assertArrayEquals("长度 " + len + " 的填充/折叠不一致",
                 Calc.digest("SM3", data), Sm3.sm3(data));
         }
+        Tracer.trace("finalize", new Object[]{"lengths", 11, "reference", "JCE SM3"},
+            "11 种长度全部一致", "finalize");
         log.info("[SM3-本质] 与 JCE SM3 在 11 种长度（含填充边界 55/56/63/64/119/120）上完全一致");
+        Tracer.trace("end", new Object[]{"vectors", 2, "crossChecks", 11}, null, "end");
     }
 
     /**
@@ -92,6 +124,7 @@ public class Sm3EssenceTest
      * 折叠式 Vᵢ = CF(Vᵢ₋₁, Bᵢ₋₁) 只要求"上一块的输出当下一块的输入"，所以循环怎么切都不改变结果 ——
      * 这就是可拼接性（streamability）的数学内容，也是 MessageDigest.update() 能分批喂的原因。
      */
+    @TraceExecution(value = "Merkle–Damgård 逐块折叠", algorithm = "SM3", flow = "SM3-HASH")
     @Test
     public void merkleDamgardIsJustALoopOverBlocks()
         throws Exception
@@ -99,16 +132,39 @@ public class Sm3EssenceTest
         byte[] head = Calc.repeat("head-", 5).getBytes("UTF-8");
         byte[] tail = Calc.repeat("-tail", 7).getBytes("UTF-8");
 
+        Tracer.trace("start", new Object[]{"headLen", head.length, "tailLen", tail.length}, null, "start");
+
         // 分块逐块推进后与整体推进必须相同（除了最后一块要带长度）：验证"推进顺序无关性"
         // whole 就是链接值 V：初值 V₀ = IV，循环里每步做 V = CF(V, B)
         long[] whole = Sm3.iv();
-        List<byte[]> wholeBlocks = Sm3.mdPad(Calc.concat(head, tail));
+        byte[] wholeMsg = Calc.concat(head, tail);
+        List<byte[]> wholeBlocks = Sm3.mdPad(wholeMsg);
+        Tracer.trace("pad", new Object[]{"msgLen", wholeMsg.length, "blockSize", BLOCK_SIZE},
+            wholeBlocks.size() + " blocks", "pad");
+        Tracer.trace("split", new Object[]{"blocks", wholeBlocks.size()},
+            wholeBlocks.get(0).length + " B/block", "split");
+        Tracer.trace("initV", null, Calc.hex(whole), "initV");
         for (int i = 0; i < wholeBlocks.size(); i++)
         {
             whole = Sm3.cf(whole, wholeBlocks.get(i));
+            if (i == 0)
+            {
+                Tracer.traceLoop("cfLoop", new Object[]{"block", i + 1, "blockLen", wholeBlocks.get(i).length},
+                    Calc.hex(whole), "cfLoop", i + 1, wholeBlocks.size(), "cfLoop");
+                long[] w = Sm3.wExpand(wholeBlocks.get(i));
+                Tracer.trace("expand", new Object[]{"block", i + 1, "W[0]", w[0], "W[67]", w[67]},
+                    Calc.hex(w), "expand");
+                traceCompressRounds(Sm3.iv(), wholeBlocks.get(i));
+            }
+            else
+            {
+                Tracer.traceLoop("cfLoop", new Object[]{"block", i + 1, "blocksLeft", wholeBlocks.size() - i - 1},
+                    Calc.hex(whole), "cfLoop", i + 1, wholeBlocks.size(), "cfLoop");
+            }
         }
         log.info("[SM3-本质] 整体折叠        = {}", Calc.hex(whole));
         Assert.assertArrayEquals(Calc.bytes32(whole), Sm3.sm3(Calc.concat(head, tail)));
+        Tracer.trace("finalize", new Object[]{"blocks", wholeBlocks.size()}, Calc.hex(whole), "finalize");
 
         // 逐字节喂入（流式）与一次性喂入等价 —— 这就是 MessageDigest.update() 的数学本质
         SM3Digest ref = new SM3Digest();
@@ -119,6 +175,9 @@ public class Sm3EssenceTest
         Assert.assertArrayEquals("流式 update 与一次性 digest 必须等价（Merkle–Damgård 可拼接性）",
             Sm3.sm3(Calc.concat(head, tail)), streamed);
         log.info("[SM3-本质] 流式 update == 一次性 digest：{}", Calc.hex(streamed));
+        Tracer.trace("finalize", new Object[]{"streamed", true, "digest", Calc.hex(streamed)},
+            Calc.hex(streamed), "finalize");
+        Tracer.trace("end", new Object[]{"blocks", wholeBlocks.size()}, null, "end");
     }
 
     /**
@@ -127,14 +186,32 @@ public class Sm3EssenceTest
      * <p>MAC (Message Authentication Code) = 带密钥的摘要：只有持有同一把密钥的人能算出同一个值，
      * 它同时给出<b>完整性</b>和<b>来源认证</b> —— 而普通哈希两者都不给（任何人都能重算 H(m)）。
      */
+    @TraceExecution(value = "HMAC 是哈希函数的组合", algorithm = "SM3", flow = "SM3-HMAC")
     @Test
     public void hmacSm3IsHashCompositionNotAClass()
         throws Exception
     {
         byte[] key = "key-for-sm3-hmac".getBytes("UTF-8");
         byte[] msg = "Hello functional HMAC".getBytes("UTF-8");
+        Tracer.trace("start", new Object[]{"keyLen", key.length, "msgLen", msg.length}, null, "start");
         byte[] ours = hmacSm3(key, msg);
         log.info("[SM3-HMAC] 普通过程 HMAC-SM3   = {}", Calc.hex(ours));
+
+        // 追踪用：按 HMAC 定义重算中间值（不改变上面的被测调用），把 k / ipad / opad / inner / outer 记下来
+        byte[] k = fitKey(key);
+        byte[] ipad = Calc.repeatedByte(0x36, BLOCK_SIZE);
+        byte[] opad = Calc.repeatedByte(0x5c, BLOCK_SIZE);
+        byte[] kIpad = Calc.xor(k, ipad);
+        byte[] kOpad = Calc.xor(k, opad);
+        byte[] inner = Sm3.sm3(Calc.concat(kIpad, msg));
+        byte[] outer = Sm3.sm3(Calc.concat(kOpad, inner));
+        Tracer.trace("fitKey", new Object[]{"keyLen", key.length, "key", Calc.hex(key)}, Calc.hex(k), "fitKey");
+        Tracer.trace("ipad", new Object[]{"ipad", Calc.hex(ipad), "K", Calc.hex(k)}, Calc.hex(kIpad), "ipad");
+        Tracer.trace("inner", new Object[]{"K^ipad", Calc.hex(kIpad), "msg", new String(msg, "UTF-8")},
+            Calc.hex(inner), "inner");
+        Tracer.trace("opad", new Object[]{"opad", Calc.hex(opad), "K", Calc.hex(k)}, Calc.hex(kOpad), "opad");
+        Tracer.trace("outer", new Object[]{"K^opad", Calc.hex(kOpad), "inner", Calc.hex(inner)},
+            Calc.hex(outer), "outer");
 
         Calc.useBc();
         HMac bc = new HMac(new SM3Digest());
@@ -144,6 +221,9 @@ public class Sm3EssenceTest
         bc.doFinal(expected, 0);
         Assert.assertArrayEquals("HMAC-SM3 与 BC HMac 不一致", expected, ours);
         Assert.assertNotEquals("HMAC 必须依赖密钥", Calc.hex(ours), Calc.hex(hmacSm3("other-key".getBytes("UTF-8"), msg)));
+        Tracer.traceDecision("compare", new Object[]{"ours", Calc.hex(ours), "bc", Calc.hex(expected),
+            "outer", Calc.hex(outer)}, true, "compare", "ours == BC HMac 且换密钥后不同");
+        Tracer.trace("end", new Object[]{"macLen", ours.length}, null, "end");
     }
 
     /**
@@ -199,11 +279,40 @@ public class Sm3EssenceTest
      * KDF 的作用是把任意长度的密钥材料 z 展开成任意长度的输出，并且每一段输出都只依赖 z 一次哈希。
      * 这里 klen 覆盖 1/16/32/33/64/100，专门测"不足一块""正好两块多"的截断分支。
      */
+    @TraceExecution(value = "KDF 是截断的哈希流", algorithm = "SM3", flow = "SM3-KDF")
     @Test
     public void kdfIsAnInfiniteHashStreamTruncated()
         throws Exception
     {
         byte[] z = Calc.unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e0f");
+        Tracer.trace("start", new Object[]{"z", Calc.hex(z), "zLen", z.length}, null, "start");
+
+        // 追踪用：只把 klen=33 的两段逐段展开，其余 klen 在 compare 里汇总（不改被测的 kdf 调用）
+        int detailKlen = 33;
+        int detailBlocks = Calc.ceilDiv(detailKlen, 32);
+        Tracer.trace("init", new Object[]{"klen", detailKlen, "hashLen", 32},
+            detailBlocks + " segments", "init");
+        byte[] detailStream = new byte[0];
+        for (int ct = 1; ct <= detailBlocks; ct++)
+        {
+            byte[] counterBytes = new byte[4];
+            for (int i = 0; i < 4; i++)
+            {
+                counterBytes[i] = (byte)(ct >>> (24 - 8 * i));
+            }
+            byte[] segment = Sm3.sm3(Calc.concat(z, counterBytes));
+            Tracer.traceLoop("ctLoop.segment", new Object[]{"ct", ct, "blocks", detailBlocks},
+                Calc.hex(segment), "ctLoop", ct, detailBlocks, "ctLoop");
+            Tracer.trace("hash", new Object[]{"ct", ct, "ct4", Calc.hex(counterBytes)},
+                Calc.hex(segment), "hash");
+            detailStream = Calc.concat(detailStream, segment);
+            Tracer.trace("concat", new Object[]{"ct", ct, "prevLen", detailStream.length - segment.length},
+                detailStream.length + " B", "concat");
+        }
+        byte[] detailOut = Arrays.copyOf(detailStream, detailKlen);
+        Tracer.trace("truncate", new Object[]{"streamLen", detailStream.length, "klen", detailKlen},
+            Calc.hex(detailOut), "truncate");
+
         for (int klen : new int[]{ 1, 16, 32, 33, 64, 100 })
         {
             byte[] ours = kdf(z, klen);
@@ -217,6 +326,9 @@ public class Sm3EssenceTest
             log.info("[SM3-KDF] klen={} -> {}", klen, Calc.hex(ours));
         }
         log.info("[SM3-KDF] 结论：KDF 就是一个 for 循环，把 ct 从 1 递增、不断把 hash(z‖ct) 拼到尾部再截断");
+        Tracer.traceDecision("compare", new Object[]{"klens", 6, "reference", "BC KDF2(SM3)"}, true,
+            "compare", "klen 1/16/32/33/64/100 全部一致");
+        Tracer.trace("end", new Object[]{"maxKlen", 100}, null, "end");
     }
 
     /**
@@ -263,12 +375,32 @@ public class Sm3EssenceTest
      * </pre>
      * 所以边界不是 64 而是 56 = 64 − 8：这是 MD 填充最容易写错的一处。
      */
+    @TraceExecution(value = "填充只认长度不认块对齐", algorithm = "SM3", flow = "SM3-HASH")
     @Test
     public void hashPaddingIsLengthAwareNotBlockAware()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"lengths", "0/55/56/64", "blockSize", BLOCK_SIZE}, null, "start");
+
         byte[] aligned = Calc.repeat("0123456789abcdef", 4).getBytes("UTF-8");   // 64 字节
         byte[] short0 = new byte[0];
+
+        Tracer.trace("pad", new Object[]{"msgLen", short0.length}, Sm3.mdPad(short0).size() + " block", "pad");
+        Tracer.trace("pad", new Object[]{"msgLen", 55}, Sm3.mdPad(new byte[55]).size() + " block", "pad");
+        Tracer.trace("pad", new Object[]{"msgLen", 56}, Sm3.mdPad(new byte[56]).size() + " blocks", "pad");
+        Tracer.trace("pad", new Object[]{"msgLen", aligned.length}, Sm3.mdPad(aligned).size() + " blocks", "pad");
+        Tracer.trace("split", new Object[]{"lengths", "0/55/56/64"},
+            "MD 块数 1/1/2/2；naive 64 字节 = 1 块", "split");
+        long[] v0 = Sm3.iv();
+        Tracer.trace("initV", null, Calc.hex(v0), "initV");
+        List<byte[]> naiveBlocks = Calc.chunks(aligned, BLOCK_SIZE);
+        long[] v = v0;
+        for (int i = 0; i < naiveBlocks.size(); i++)
+        {
+            v = Sm3.cf(v, naiveBlocks.get(i));
+            Tracer.traceLoop("cfLoop", new Object[]{"block", i + 1, "blockLen", naiveBlocks.get(i).length},
+                Calc.hex(v), "cfLoop", i + 1, naiveBlocks.size(), "cfLoop");
+        }
 
         log.info("[SM3-填充] 64 字节对齐消息的真实 SM3 = {}", Calc.hex(Sm3.sm3(aligned)));
         log.info("[SM3-填充] 去掉长度字段的\"伪 SM3\"    = {}", Calc.hex(naiveNoLength(aligned)));
@@ -279,6 +411,11 @@ public class Sm3EssenceTest
         Assert.assertEquals("56 字节消息要两个块（长度字段放不下）", 2,
             Sm3.mdPad(new byte[56]).size());
         Assert.assertEquals("55 字节消息只要一个块", 1, Sm3.mdPad(new byte[55]).size());
+        Tracer.trace("finalize", new Object[]{"mode", "SM3 (m‖0x80‖0^k‖len)", "blocks", Sm3.mdPad(aligned).size()},
+            Calc.hex(Sm3.sm3(aligned)), "finalize");
+        Tracer.trace("finalize", new Object[]{"mode", "naive (无长度字段)", "blocks", naiveBlocks.size()},
+            Calc.hex(naiveNoLength(aligned)), "finalize");
+        Tracer.trace("end", new Object[]{"paddingBoundary", 56}, null, "end");
     }
 
     /**
@@ -304,6 +441,48 @@ public class Sm3EssenceTest
     }
 
     /**
+     * 追踪专用：按 {@link Sm3#cf} 的 64 轮方程重跑一遍压缩，产生 compress 循环的逐轮事件。
+     * 这段是测试侧的展示用复刻，不参与任何断言，也不改变被测调用。
+     */
+    private static void traceCompressRounds(long[] v, byte[] block)
+    {
+        long[] w = Sm3.wExpand(block);
+        long[] wp = new long[64];
+        for (int i = 0; i < 64; i++)
+        {
+            wp[i] = u32(w[i] ^ w[i + 4]);
+        }
+        long a = v[0], b = v[1], c = v[2], d = v[3];
+        long e = v[4], f = v[5], g = v[6], h = v[7];
+        for (int j = 0; j < 64; j++)
+        {
+            long ss1 = rotl(u32(rotl(a, 12) + e + rotl(Sm3.tConstant(j), j)), 7);
+            long ss2 = u32(ss1 ^ rotl(a, 12));
+            long tt1 = u32(Sm3.ff(j, a, b, c) + d + ss2 + wp[j]);
+            long tt2 = u32(Sm3.gg(j, e, f, g) + h + ss1 + w[j]);
+            long na = tt1;
+            long nb = a;
+            long nc = rotl(b, 9);
+            long nd = c;
+            long ne = Sm3.p0(tt2);
+            long nf = e;
+            long ng = rotl(f, 19);
+            long nh = g;
+            a = na;
+            b = nb;
+            c = nc;
+            d = nd;
+            e = ne;
+            f = nf;
+            g = ng;
+            h = nh;
+            Tracer.traceLoop("compress.round", new Object[]{
+                "j", j, "W[j]", w[j], "W'[j]", wp[j]
+            }, Calc.hex(new long[]{ a, b, c, d, e, f, g, h }), "compress", j + 1, 64, "compress");
+        }
+    }
+
+    /**
      * 布尔函数与置换函数的本质：只由 与/或/非/异或/循环移位 构成，可被完全展开成表达式。
      *
      * <p>这里的符号（与 {@link Sm3} 的符号表同名同义）：
@@ -320,18 +499,37 @@ public class Sm3EssenceTest
      *   bitCount   统计一个 32-bit 字里有几个 1，用来量化"1 个输入比特被扩散成了几个输出比特"
      * </pre>
      */
+    @TraceExecution(value = "布尔函数分解为异或与循环移位", algorithm = "SM3", flow = "SM3-BOOL")
     @Test
     public void booleanFunctionsDecomposeToXorAndRotate()
     {
         long a = 0xdeadbeefL, b = 0x12345678L, c = 0xcafebabeL;
+        Tracer.trace("start", new Object[]{"a", Calc.hex(new long[]{a}), "b", Calc.hex(new long[]{b}),
+            "c", Calc.hex(new long[]{c})}, null, "start");
         // 前 16 轮 FF/GG 都是纯异或（线性）
         Assert.assertEquals(u32(a ^ b ^ c), Sm3.ff(0L, a, b, c));
         Assert.assertEquals(u32(a ^ b ^ c), Sm3.gg(15L, a, b, c));
         // 16 轮之后 FF 变成多数函数、GG 变成选择函数（引入非线性）
         Assert.assertEquals(u32((a & b) | (a & c) | (b & c)), Sm3.ff(16L, a, b, c));
         Assert.assertEquals(u32((a & b) | ((~a & M32) & c)), Sm3.gg(63L, a, b, c));
+        Tracer.trace("ff", new Object[]{"j0", 0, "j16", 16, "a", Calc.hex(new long[]{a}),
+            "b", Calc.hex(new long[]{b}), "c", Calc.hex(new long[]{c})},
+            "FF(0)=" + Calc.hex(new long[]{Sm3.ff(0L, a, b, c)}) + " (期望 "
+                + Calc.hex(new long[]{u32(a ^ b ^ c)}) + "); FF(16)="
+                + Calc.hex(new long[]{Sm3.ff(16L, a, b, c)}) + " (期望 "
+                + Calc.hex(new long[]{u32((a & b) | (a & c) | (b & c))}) + ")", "ff");
+        Tracer.trace("gg", new Object[]{"j15", 15, "j63", 63, "a", Calc.hex(new long[]{a}),
+            "b", Calc.hex(new long[]{b}), "c", Calc.hex(new long[]{c})},
+            "GG(15)=" + Calc.hex(new long[]{Sm3.gg(15L, a, b, c)}) + " (期望 "
+                + Calc.hex(new long[]{u32(a ^ b ^ c)}) + "); GG(63)="
+                + Calc.hex(new long[]{Sm3.gg(63L, a, b, c)}) + " (期望 "
+                + Calc.hex(new long[]{u32((a & b) | ((~a & M32) & c))}) + ")", "gg");
         // P0/P1 的"扩散"性质：单比特翻转，输出比特数远大于 1
         int flipped = Long.bitCount(Sm3.p0(1L)) + Long.bitCount(Sm3.p1(1L));
+        Tracer.trace("p0p1", new Object[]{"x", 1, "P0", Calc.hex(new long[]{Sm3.p0(1L)}),
+            "P1", Calc.hex(new long[]{Sm3.p1(1L)})},
+            "P0 期望 " + Calc.hex(new long[]{u32(rotl(1L, 9) ^ rotl(1L, 17) ^ 1L)}) + "；P1 期望 "
+                + Calc.hex(new long[]{u32(1L ^ rotl(1L, 15) ^ rotl(1L, 23))}) + "；扩散比特 " + flipped, "p0p1");
         log.info("[SM3-布尔函数] bitCount(P0(1)) + bitCount(P1(1)) = {}", flipped);
         Assert.assertTrue("P0/P1 必须把 1 个输入比特扩散到多个输出比特", flipped >= 6);
         Assert.assertNotEquals("P0 不是恒等映射", Long.valueOf(1L), Long.valueOf(Sm3.p0(1L)));
@@ -339,10 +537,16 @@ public class Sm3EssenceTest
         Assert.assertEquals(0x79cc4519L, Sm3.tConstant(0));
         Assert.assertEquals(0x7a879d8aL, Sm3.tConstant(16));
         Assert.assertEquals(Sm3.tConstant(16), Sm3.tConstant(63));
+        Tracer.trace("tconst", new Object[]{"T(0)", Sm3.tConstant(0), "T(16)", Sm3.tConstant(16),
+            "T(63)", Sm3.tConstant(63)},
+            "j<16 → 0x79cc4519；j>=16 → 0x7a879d8a；rotl(T(16),32)=T(16)", "tconst");
         // 循环移位取 j 的低 5 位（n & 31）：所以 SS1 里 rotl(T_j, j) 在 j=32 时等于不旋转
         Assert.assertEquals(Sm3.tConstant(16), rotl(Sm3.tConstant(16), 32));
         // 最后一行是"P0 就是那三项异或"的逐项展开核对：rotl(1,9)、rotl(1,17) 与 1 本身异或，
         // 说明 P0 完全由移位+异或构成，没有任何查表或隐藏状态；1L 代表只有最低位为 1 的那个字
         Assert.assertEquals(u32(rotl(1L, 9) ^ rotl(1L, 17) ^ 1L), Sm3.p0(1L));
+        Tracer.traceDecision("assert", new Object[]{"checks", 4, "failed", 0}, true, "assert",
+            "FF/GG/P0/P1/T_j 的分解式与期望值全部一致");
+        Tracer.trace("end", new Object[]{"passed", true}, null, "end");
     }
 }

@@ -11,7 +11,11 @@ import org.bouncycastle.asn1.ASN1Sequence;
 import org.bouncycastle.asn1.DERBitString;
 import org.bouncycastle.asn1.DEROctetString;
 import org.bouncycastle.asn1.DERSequence;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -119,6 +123,9 @@ import org.junit.Test;
 @Slf4j
 public class Sm9SignEssenceTest
 {
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     /** GmSSL tests/sm9test.c 的签名样例：ID = "Alice"，消息 = "Chinese IBS standard"。 */
     private static final byte[] ID_ALICE = "Alice".getBytes();
     /** 只在"换标识就验不过"的对照里出现：标识密码没有目录可查，读错三个字母 = 换了一把公钥。 */
@@ -142,11 +149,16 @@ public class Sm9SignEssenceTest
      * 测试①：私钥提取对上 GmSSL 的已知答案，并且把 H1 的"取前 40 字节、模 n−1 再加 1"
      * 这套细节独立复算一遍 —— 少一个字节、多一个 1，ds 就不是标准里那个点。
      */
+    @TraceExecution(value = "SM9 签名私钥提取与 H1 范围校验", algorithm = "SM9", flow = "SM9-SIGN")
     @Test
     public void privateKeyExtractMatchesGmsslAnswerAndHash1StaysInRange()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"id", "Alice", "message", MESSAGE, "ks_bits", HEX_KS.bitLength()}, null, "start");
+
         BigInteger[] ds = Sm9Math.signPrivateKeyExtract(HEX_KS, ID_ALICE);
+        Tracer.trace("signPrivateKeyExtract", new Object[]{"ks", HEX_KS, "id", "Alice", "hid", Sm9Math.HID_SIGN},
+            Sm9Math.pointToOctets(ds), "keygen");
 
         // 已知答案：ds 的 0x04‖x‖y 编码必须与 hex_ds 逐字符相同。
         // HEX_DS 抄自 GmSSL，只有 x(32)‖y(32) = 128 个 hex 字符，所以这里手工补上未压缩点前缀 "04"，
@@ -157,6 +169,10 @@ public class Sm9SignEssenceTest
         // 阶为 n：n·ds 必须回到无穷远点；本实现用长度为 0 的数组表示无穷远点，所以比 length。
         // G₁ 的阶是素数 n，非无穷远点的倍数只可能是 0 或 n ⇒ 这条断言同时确认了"它在 G₁ 里"。
         Assert.assertEquals("n·ds 必须是无穷远点", 0, Sm9Math.pointMul(Sm9Math.N, ds).length);
+        Tracer.traceDecision("checkDs", new Object[]{"ds", Sm9Math.pointToOctets(ds), "onCurve", Sm9Math.pointIsOnCurve(ds),
+                "n_ds_length", Sm9Math.pointMul(Sm9Math.N, ds).length},
+            Sm9Math.pointIsOnCurve(ds) && Sm9Math.pointMul(Sm9Math.N, ds).length == 0,
+            "keygen", "ds ∈ G₁ 且 n·ds = O");
 
         // 手工复算 H1(Alice, 0x01)：SM3(0x01‖ID‖hid‖1) ‖ SM3(0x01‖ID‖hid‖2) = 64 字节。
         // 四个拼件各有身份：0x01 是"H1 专用前缀"（H2 用 0x02，见测试②），作用是让同一批字节
@@ -170,6 +186,9 @@ public class Sm9SignEssenceTest
         // 取 40 字节是为了让"模 n−1 的偏斜 (bias)"小到可以忽略（2^320 相对 2^256 的模数）。
         BigInteger z = Calc.toBigInt(Arrays.copyOfRange(ha, 0, 40));
         BigInteger expected = z.mod(Sm9Math.N.subtract(BigInteger.ONE)).add(BigInteger.ONE);
+        Tracer.trace("hash1.manual", new Object[]{"prefix", 0x01, "id", "Alice", "hid", Sm9Math.HID_SIGN,
+            "material", ha}, Calc.hex(ha), "hash1");
+        Tracer.trace("hash1.modN", new Object[]{"z", z, "n_minus_1", Sm9Math.N.subtract(BigInteger.ONE)}, expected, "hash1");
         Assert.assertEquals(expected, Sm9Math.hash1(ID_ALICE, Sm9Math.HID_SIGN));
         Assert.assertTrue("H1 必须 >= 1", Sm9Math.hash1(ID_ALICE, Sm9Math.HID_SIGN).compareTo(BigInteger.ONE) >= 0);
         Assert.assertTrue("H1 必须 <= n−1", Sm9Math.hash1(ID_ALICE, Sm9Math.HID_SIGN).compareTo(Sm9Math.N) < 0);
@@ -185,43 +204,62 @@ public class Sm9SignEssenceTest
         Assert.assertFalse(h1x.equals(h1e));
         // 标识不同 => H1 不同 => 私钥不同（"公钥就是那串字节"的代价是标识一字不能错）
         Assert.assertFalse(h1.equals(Sm9Math.hash1(ID_BOB, Sm9Math.HID_SIGN)));
+        Tracer.traceDecision("hidIsolation", new Object[]{"h1_sign", h1, "h1_exch", h1x, "h1_enc", h1e},
+            !h1.equals(h1x) && !h1.equals(h1e) && !h1x.equals(h1e), "compare",
+            "H1(ID,0x01) / H1(ID,0x02) / H1(ID,0x03) 两两不同");
+        Tracer.traceDecision("idIsolation", new Object[]{"alice", h1, "bob", Sm9Math.hash1(ID_BOB, Sm9Math.HID_SIGN)},
+            !h1.equals(Sm9Math.hash1(ID_BOB, Sm9Math.HID_SIGN)), "compare", "H1(Alice) != H1(Bob)");
         log.info("ds = {}", Calc.hex(Sm9Math.pointToOctets(ds)));
+        Tracer.trace("end", new Object[]{"ds", Calc.hex(Sm9Math.pointToOctets(ds))}, null, "end");
     }
 
     /**
      * 测试②：把"验签为什么成立"写成断言 —— 签名侧的 w = g^r 与验签侧的 w = e(S,P')·g^h
      * 必须是<b>同一段 384 字节</b>，并且 S 确实等于 (r−h)·ds。
      */
+    @TraceExecution(value = "SM9 签名与验签算出同一个 w", algorithm = "SM9", flow = "SM9-SIGN")
     @Test
     public void signerAndVerifierComputeTheSame384ByteW()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"message", MESSAGE, "id", "Alice", "r", R}, null, "start");
+
         BigInteger[][] ppubs = Sm9Math.signMasterPublicKey(HEX_KS);
         BigInteger[] ds = Sm9Math.signPrivateKeyExtract(HEX_KS, ID_ALICE);
         byte[] signature = Sm9Math.sign(MESSAGE, ID_ALICE, HEX_KS, R);
+        Tracer.trace("sign", new Object[]{"ks", HEX_KS, "message", MESSAGE, "id", "Alice", "r", R},
+            signature, "genK");
 
         Assert.assertEquals("签名 = h(32) ‖ S(65)", 97, signature.length);
         // 签名值的两半：h 是大端 32 字节（不足 32 字节时前面补 0，标准规定定长），
         // 后 65 字节是 S 的 0x04‖x‖y 未压缩编码 —— 与 G₁ 里任何点同一种写法。
         BigInteger h = Calc.toBigInt(Arrays.copyOfRange(signature, 0, 32));
         BigInteger[] sPoint = Sm9Math.pointFromOctets(Arrays.copyOfRange(signature, 32, 97));
+        Tracer.trace("parseSignature", new Object[]{"signature", signature},
+            new Object[]{"h", Calc.hex(Calc.toBytes(h, 32)), "S", sPoint}, "genK");
 
         // S = l·ds, l = (r − h) mod n —— 从签名反推回私钥的标量乘
         // 这一步只是"照抄 A4"，但它同时说明：S 里除了 ds 没有任何秘密，公开可核。
         BigInteger l = Sm9Math.modnSub(R, h);
         Assert.assertEquals(Calc.hex(Sm9Math.pointToOctets(sPoint)),
             Calc.hex(Sm9Math.pointToOctets(Sm9Math.pointMul(l, ds))));
+        Tracer.trace("pointMul(l,ds)", new Object[]{"l", l, "ds", Sm9Math.pointToOctets(ds)},
+            Sm9Math.pointToOctets(Sm9Math.pointMul(l, ds)), "pointMul");
 
         // g = e(P1, Ppubs)：A2 的系统常数，384 字节，与用户无关，可预先算好缓存
         BigInteger[] g = Sm9Math.pairing(ppubs, Sm9Math.P1);
+        Tracer.trace("pairing.g", new Object[]{"Ppubs", ppubs, "P1", Sm9Math.P1}, g, "pointMul");
 
         // 路线一（签名方）：w = g^r
         byte[] wSigner = Sm9Math.fp12ToBytes(Sm9Math.fp12Pow(g, R));
+        Tracer.trace("fp12Pow.wSigner", new Object[]{"g", g, "r", R}, wSigner, "pointMul");
         // 路线二（验签方，手里只有 h、S、Ppubs）：w = e(S, H1·P2 + Ppubs) · g^h
         // P′ = H1·P2 + Ppubs 是 B1：两个 G₂ 点相加（twistMul 先做标量乘，twistAffineAdd 再作图加），
         // 它等于 (H1 + ks)·P2 —— 正好是私钥分母 (ks + H1) 出现在 G₂ 那一侧的镜像。
         BigInteger[][] pPrime = Sm9Math.twistAffineAdd(
             Sm9Math.twistMul(Sm9Math.hash1(ID_ALICE, Sm9Math.HID_SIGN), Sm9Math.P2), ppubs);
+        Tracer.trace("twistAffineAdd.Pprime", new Object[]{"h1", Sm9Math.hash1(ID_ALICE, Sm9Math.HID_SIGN),
+            "P2", Sm9Math.P2, "Ppubs", ppubs}, pPrime, "pointMul");
         byte[] wVerifier = Sm9Math.fp12ToBytes(
             Sm9Math.fp12Mul(Sm9Math.pairing(pPrime, sPoint), Sm9Math.fp12Pow(g, h)));
 
@@ -234,10 +272,17 @@ public class Sm9SignEssenceTest
         BigInteger hManual = Sm9Math.modnFromHash(Calc.concat(
             Sm3.sm3(Calc.concat(head, new byte[]{ 0, 0, 0, 1 })),
             Sm3.sm3(Calc.concat(head, new byte[]{ 0, 0, 0, 2 }))));
+        Tracer.trace("hash2.head", new Object[]{"prefix", 0x02, "message", MESSAGE, "w", wSigner}, head, "hash2");
+        Tracer.trace("hash2.modN", new Object[]{"message", MESSAGE, "w", wSigner}, hManual, "hash2");
         Assert.assertEquals(hManual, h);
         // w 相同 => H2(M‖w) 相同 => 验签通过
         Assert.assertTrue(Sm9Math.verify(MESSAGE, signature, ID_ALICE, ppubs));
+        Tracer.traceDecision("w.compare", new Object[]{"wSigner", wSigner, "wVerifier", wVerifier},
+            Arrays.equals(wSigner, wVerifier), "compare", "签名侧 g^r == 验签侧 e(S,P')·g^h");
+        Tracer.traceDecision("h.compare", new Object[]{"hManual", hManual, "h", h},
+            hManual.equals(h), "compare", "H2(M‖w) == 签名里的 h");
         log.info("h = {}", Calc.hex(Calc.toBytes(h, 32)));
+        Tracer.trace("end", new Object[]{"w", wSigner, "h", h}, null, "end");
     }
 
     /**
@@ -255,23 +300,33 @@ public class Sm9SignEssenceTest
      * "多项检查堆出来的"，而是"一个 384 字节的 w 必须一字不差"—— 想改任何一项，就得重算 w，
      * 而重算 w 需要 g^r 的离散对数或私钥点 ds。
      */
+    @TraceExecution(value = "SM9 验签拒绝篡改消息、错误标识与偏移签名", algorithm = "SM9", flow = "SM9-SIGN")
     @Test
     public void verifyRejectsChangedMessageWrongIdAndShiftedSignature()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"message", MESSAGE, "id", "Alice", "r", R}, null, "start");
+
         BigInteger[][] ppubs = Sm9Math.signMasterPublicKey(HEX_KS);
         byte[] signature = Sm9Math.sign(MESSAGE, ID_ALICE, HEX_KS, R);
 
         Assert.assertTrue("原签名必须通过",
             Sm9Math.verify(MESSAGE, signature, ID_ALICE, ppubs));
+        Tracer.traceDecision("verify.original", new Object[]{"message", MESSAGE, "id", "Alice", "signature", signature},
+            Sm9Math.verify(MESSAGE, signature, ID_ALICE, ppubs), "verify", "原签名必须通过");
 
         // 1) 消息改一个字节：H2 变，h 对不上
         byte[] tamperedMessage = MESSAGE.clone();
         tamperedMessage[tamperedMessage.length - 1] ^= 0x01;
         Assert.assertFalse(Sm9Math.verify(tamperedMessage, signature, ID_ALICE, ppubs));
+        Tracer.traceDecision("verify.tamperedMessage", new Object[]{"message", tamperedMessage, "id", "Alice",
+            "signature", signature}, Sm9Math.verify(tamperedMessage, signature, ID_ALICE, ppubs),
+            "verify", "改消息后验签必须为 false");
 
         // 2) 标识换成 Bob：H1 变，P' 变 —— 标识密码里"读错公钥"就是这么贵
         Assert.assertFalse(Sm9Math.verify(MESSAGE, signature, ID_BOB, ppubs));
+        Tracer.traceDecision("verify.wrongId", new Object[]{"message", MESSAGE, "id", "Bob", "signature", signature},
+            Sm9Math.verify(MESSAGE, signature, ID_BOB, ppubs), "verify", "换标识后验签必须为 false");
 
         // 3) 签名点加一个 P1：S' = S + P1 = (l + 1)·ds 仍在 n 阶群里，但 w 变了
         // 切片的两个边界就是签名的布局：[0,32) 是 h，[32,97) 是 S 的 0x04‖x‖y。
@@ -279,12 +334,22 @@ public class Sm9SignEssenceTest
             Sm9Math.pointAdd(Sm9Math.pointFromOctets(Arrays.copyOfRange(signature, 32, 97)), Sm9Math.P1));
         Assert.assertFalse(Sm9Math.verify(MESSAGE,
             Calc.concat(Arrays.copyOfRange(signature, 0, 32), shiftedS), ID_ALICE, ppubs));
+        Tracer.traceDecision("verify.shiftedS", new Object[]{"message", MESSAGE, "id", "Alice", "S_shifted", shiftedS},
+            Sm9Math.verify(MESSAGE, Calc.concat(Arrays.copyOfRange(signature, 0, 32), shiftedS), ID_ALICE, ppubs),
+            "verify", "S 换成 S+P1 后验签必须为 false");
 
         // 4) h 的最后一位改掉：l 变，S 也跟不上
         // 只改 h 不改 S 时，验签方算出的仍是 g^l·g^{h'} = g^{r + (h' − h)} —— 除非 h' = h，w 追不回来。
         byte[] bumpedH = signature.clone();
         bumpedH[31] = (byte) (bumpedH[31] ^ 0x01);
         Assert.assertFalse(Sm9Math.verify(MESSAGE, bumpedH, ID_ALICE, ppubs));
+        Tracer.traceDecision("verify.bumpedH", new Object[]{"message", MESSAGE, "id", "Alice", "signature_bumpedH", bumpedH},
+            Sm9Math.verify(MESSAGE, bumpedH, ID_ALICE, ppubs), "verify", "h 改一位后验签必须为 false");
+        Tracer.traceDecision("compare.tamperedLayout", new Object[]{"signatureLen", signature.length,
+                "shiftedSLen", shiftedS.length, "bumpedHLen", bumpedH.length},
+            signature.length == 97 && shiftedS.length == 65 && bumpedH.length == 97, "compare",
+            "篡改后的签名仍是合法长度（拒绝来自算法而非解析）");
+        Tracer.trace("end", new Object[]{"signature", signature, "rejected", 4}, null, "end");
     }
 
     /** 测试④：另一个 r 同样能签成 —— 顺带说明签名对 r 敏感（同一 r 同一消息则完全确定）。
@@ -295,20 +360,41 @@ public class Sm9SignEssenceTest
      * （没有任何一步掺了额外的随机源），这就是本文件能把 h、S 逐字节钉死复算的前提。
      * 实际部署里 r 必须由 CSPRNG 现采，一条签名用一次 —— 测试⑤演示复用的后果。
      */
+    @TraceExecution(value = "SM9 换 nonce 得到不同但有效的签名", algorithm = "SM9", flow = "SM9-SIGN")
     @Test
     public void anotherNonceProducesADifferentButValidSignature()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"message", MESSAGE, "id", "Alice", "r", R, "r_other", R_OTHER}, null, "start");
+
         BigInteger[][] ppubs = Sm9Math.signMasterPublicKey(HEX_KS);
         byte[] first = Sm9Math.sign(MESSAGE, ID_ALICE, HEX_KS, R);
         byte[] second = Sm9Math.sign(MESSAGE, ID_ALICE, HEX_KS, R_OTHER);
+        Tracer.trace("sign.r", new Object[]{"ks", HEX_KS, "message", MESSAGE, "id", "Alice", "r", R}, first, "genK");
+        Tracer.trace("sign.rOther", new Object[]{"ks", HEX_KS, "message", MESSAGE, "id", "Alice", "r", R_OTHER},
+            second, "genK");
 
         Assert.assertTrue(Sm9Math.verify(MESSAGE, second, ID_ALICE, ppubs));
+        Tracer.traceDecision("hash2.diff", new Object[]{"h_first", Arrays.copyOfRange(first, 0, 32),
+                "h_second", Arrays.copyOfRange(second, 0, 32)},
+            !Arrays.equals(Arrays.copyOfRange(first, 0, 32), Arrays.copyOfRange(second, 0, 32)),
+            "hash2", "r 不同 ⇒ w 不同 ⇒ H2(M‖w) 不同");
+        Tracer.trace("computeS.S", new Object[]{"S_first", Arrays.copyOfRange(first, 32, 97),
+            "S_second", Arrays.copyOfRange(second, 32, 97)}, Arrays.copyOfRange(second, 32, 97), "computeS");
+        Tracer.traceDecision("verify.second", new Object[]{"message", MESSAGE, "id", "Alice", "signature", second},
+            Sm9Math.verify(MESSAGE, second, ID_ALICE, ppubs), "verify", "换 r 后的签名仍然有效");
         Assert.assertFalse("r 不同则 w、h、S 全不同", Arrays.equals(first, second));
+        Tracer.traceDecision("compare.fullSignature", new Object[]{"first", first, "second", second},
+            !Arrays.equals(first, second), "compare", "两枚签名整体不同");
         // S = (r−h)·ds：换了 r，S 必然换点（同一 r、同一消息才谈得上"确定性"）
         // 单独比 S 这一段，是为了确认差异不是"只有 h 变了"—— 点也换了，即整条链都跟着 r 走。
         Assert.assertFalse(Arrays.equals(Arrays.copyOfRange(first, 32, 97),
             Arrays.copyOfRange(second, 32, 97)));
+        Tracer.traceDecision("compare.signatureS", new Object[]{"first.S", Arrays.copyOfRange(first, 32, 97),
+                "second.S", Arrays.copyOfRange(second, 32, 97)},
+            !Arrays.equals(Arrays.copyOfRange(first, 32, 97), Arrays.copyOfRange(second, 32, 97)),
+            "compare", "S 段也不同（不只是 h 变了）");
+        Tracer.trace("end", new Object[]{"first", first, "second", second}, null, "end");
     }
 
     /**
@@ -321,19 +407,26 @@ public class Sm9SignEssenceTest
      * 解出来的点应当与标准答案 hex_ds 一字不差 —— 拿到 ds 就能直接冒充 Alice 签名，
      * 因为签名全程只用 ds 做一次标量乘，从没要求谁"知道 ds 的离散对数"。
      */
+    @TraceExecution(value = "SM9 重用 nonce 泄露私钥点", algorithm = "SM9", flow = "SM9-SIGN")
     @Test
     public void reusedRandomLeaksThePrivateKeyPoint()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"message1", MESSAGE, "id", "Alice", "r", R}, null, "start");
+
         byte[] otherMessage = "Chinese IBS standarD".getBytes();  // 只改最后一个字节
         byte[] sig1 = Sm9Math.sign(MESSAGE, ID_ALICE, HEX_KS, R);
         byte[] sig2 = Sm9Math.sign(otherMessage, ID_ALICE, HEX_KS, R);
+        Tracer.trace("sign.reusedR", new Object[]{"ks", HEX_KS, "id", "Alice", "r", R,
+            "message1", MESSAGE, "message2", otherMessage}, new Object[]{"sig1", sig1, "sig2", sig2}, "genK");
 
         // 下标 1/2 只是"两条签名"；两条都是 97 字节，切片方式与测试③相同（h 在前 32 字节）。
         // 消息只差 1 bit 却必须换 w = g^r ⇒ 换 h，这正是 H2 抗碰撞在这里扮演的角色。
         BigInteger h1 = Calc.toBigInt(Arrays.copyOfRange(sig1, 0, 32));
         BigInteger h2 = Calc.toBigInt(Arrays.copyOfRange(sig2, 0, 32));
         Assert.assertFalse("消息不同则 h 不同", h1.equals(h2));
+        Tracer.traceDecision("computeS.hDiff", new Object[]{"h1", h1, "h2", h2}, !h1.equals(h2), "computeS",
+            "两条签名共用 r，但 H2 挑战不同");
 
         BigInteger[] s1 = Sm9Math.pointFromOctets(Arrays.copyOfRange(sig1, 32, 97));
         BigInteger[] s2 = Sm9Math.pointFromOctets(Arrays.copyOfRange(sig2, 32, 97));
@@ -343,11 +436,20 @@ public class Sm9SignEssenceTest
         // 系数为 0 意味着两条签名的 h 相同（等价于 H2 碰撞），那 (h₂−h₁)⁻¹ 不存在，攻击解不出来；
         // 对随机 oracle 来说这个概率可忽略，断言只是把它写成"这次真的能解"。
         Assert.assertTrue("系数为 0 就解不出来（等价于两条消息同哈希）", coefficient.signum() != 0);
+        Tracer.trace("computeS.pointDiff", new Object[]{"S1", s1, "S2", s2}, diff, "computeS");
+        Tracer.trace("computeS.coefficient", new Object[]{"h2", h2, "h1", h1}, coefficient, "computeS");
 
         // modnInv = 扩展欧几里得求模逆；点乘上它，就是"群里除以一个整数"。
         BigInteger[] recovered = Sm9Math.pointMul(Sm9Math.modnInv(coefficient), diff);
         Assert.assertEquals("04" + HEX_DS, Calc.hex(Sm9Math.pointToOctets(recovered)).toUpperCase());
+        Tracer.trace("computeS.recoveredDs", new Object[]{"coefficient", coefficient, "S1_minus_S2", diff},
+            Sm9Math.pointToOctets(recovered), "computeS");
+        Tracer.traceDecision("compare.recoveredDs", new Object[]{"recovered", Sm9Math.pointToOctets(recovered),
+                "expected", "04" + HEX_DS},
+            ("04" + HEX_DS).equalsIgnoreCase(Calc.hex(Sm9Math.pointToOctets(recovered))),
+            "compare", "恢复出的私钥点 ds == GmSSL hex_ds");
         log.info("同一个 r 签两条消息 => 直接解出私钥点 ds");
+        Tracer.trace("end", new Object[]{"recoveredDs", Sm9Math.pointToOctets(recovered)}, null, "end");
     }
 
     /**
@@ -369,24 +471,36 @@ public class Sm9SignEssenceTest
      * 用 OCTET STRING 装点也是一种常见变体（BouncyCastle 的 SM2 签名就是纯 ASN.1 INTEGER 结构），
      * 本测试断言的是 GM/T 0080-2020 / GmSSL 对 SM9 的写法。
      */
+    @TraceExecution(value = "SM9 签名 DER 结构（OCTET STRING h + BIT STRING S）", algorithm = "SM9", flow = "SM9-SIGN")
     @Test
     public void signatureDerWrapsOctetHAndBitStringS()
         throws Exception
     {
+        Tracer.trace("start", new Object[]{"message", MESSAGE, "id", "Alice", "r", R}, null, "start");
+
         byte[] signature = Sm9Math.sign(MESSAGE, ID_ALICE, HEX_KS, R);
         byte[] h = Arrays.copyOfRange(signature, 0, 32);
         byte[] s = Arrays.copyOfRange(signature, 32, 97);
+        Tracer.trace("sign.split", new Object[]{"signature", signature}, new Object[]{"h", h, "S", s}, "computeS");
 
         ASN1EncodableVector vector = new ASN1EncodableVector();
         vector.add(new DEROctetString(h));
         vector.add(new DERBitString(s));
         byte[] der = new DERSequence(vector).getEncoded();
+        Tracer.trace("DERSequence.encode", new Object[]{"h", h, "S", s}, der, "computeS");
 
         ASN1Sequence parsed = ASN1Sequence.getInstance(der);
         Assert.assertEquals(2, parsed.size());
+        Tracer.traceDecision("compare.fieldCount", new Object[]{"size", parsed.size()}, parsed.size() == 2,
+            "compare", "SEQUENCE 含 2 个元素");
         Assert.assertArrayEquals(h, ASN1OctetString.getInstance(parsed.getObjectAt(0)).getOctets());
+        Tracer.traceDecision("compare.octetStringH", new Object[]{"parsedH", ASN1OctetString.getInstance(parsed.getObjectAt(0)).getOctets(),
+                "h", h}, Arrays.equals(h, ASN1OctetString.getInstance(parsed.getObjectAt(0)).getOctets()),
+            "compare", "OCTET STRING h 与签名前半一致");
         byte[] fromBitString = ASN1BitString.getInstance(parsed.getObjectAt(1)).getOctets();
         Assert.assertArrayEquals(s, fromBitString);
+        Tracer.traceDecision("compare.bitStringS", new Object[]{"parsedS", fromBitString, "s", s},
+            Arrays.equals(s, fromBitString), "compare", "BIT STRING S 与签名后半一致");
         Assert.assertEquals(65, fromBitString.length);
         // 未压缩点的第一字节 0x04 是"格式前缀"(uncompressed)，不是坐标数据；
         // 用 BIT STRING 包装时它照样原样传输，取回来还得自己认这个前缀。
@@ -395,11 +509,17 @@ public class Sm9SignEssenceTest
         byte[] bitStringEncoding = ASN1BitString.getInstance(parsed.getObjectAt(1)).getEncoded();
         Assert.assertEquals(0x03, bitStringEncoding[0] & 0xff);
         Assert.assertEquals(0, bitStringEncoding[2] & 0xff);
+        Tracer.traceDecision("compare.bitStringLayout", new Object[]{"S_len", fromBitString.length,
+                "S_prefix", fromBitString[0] & 0xff, "tag", bitStringEncoding[0] & 0xff, "padBits", bitStringEncoding[2] & 0xff},
+            fromBitString.length == 65 && (fromBitString[0] & 0xff) == 0x04
+                && (bitStringEncoding[0] & 0xff) == 0x03 && (bitStringEncoding[2] & 0xff) == 0,
+            "compare", "S 为 65 字节未压缩点，BIT STRING tag=0x03、pad=0");
         // 逐字节数一下整包大小（这就是上面 TLV 的算术）：
         //   OCTET STRING h = 1(tag) + 1(len=32) + 32 = 34
         //   BIT STRING  S  = 1(tag) + 1(len=66) + 1(pad) + 65 = 68（Length 把 pad 字节自己也算进去）
         //   SEQUENCE       = 1(tag=0x30) + 1(len=102) + 34 + 68 = 104
         // 102 与 66 都小于 128，所以 Length 各占 1 字节；换成大于 127 的载荷才会出现多字节长度。
         log.info("SM9 签名 DER {} 字节", der.length);
+        Tracer.trace("end", new Object[]{"der", der, "derLen", der.length}, null, "end");
     }
 }

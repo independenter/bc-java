@@ -6,7 +6,11 @@ import java.util.Arrays;
 
 import lombok.extern.slf4j.Slf4j;
 import org.bouncycastle.crypto.digests.SHAKEDigest;
+import org.bouncycastle.learning.trace.TraceExecution;
+import org.bouncycastle.learning.trace.TraceExecutionRule;
+import org.bouncycastle.learning.trace.Tracer;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
 
 /**
@@ -59,6 +63,9 @@ public class MlDsaQuantumAnalysisTest
     private static final org.slf4j.Logger log =
         org.slf4j.LoggerFactory.getLogger(MlDsaQuantumAnalysisTest.class);
 
+    @Rule
+    public TraceExecutionRule traceRule = new TraceExecutionRule();
+
     // =====================================================================
     // 第一层：困难问题 —— Module-SIS 为什么量子下仍难
     // =====================================================================
@@ -81,6 +88,7 @@ public class MlDsaQuantumAnalysisTest
      *   <li>格约减算法（LLL/BKZ）能找"近似最短"，但对 256 维格仍指数时间</li>
      * </ol>
      */
+    @TraceExecution(value = "Module-SIS：短向量约束带来困难性", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void moduleSisIsHardBecauseOfShortness()
     {
@@ -90,6 +98,8 @@ public class MlDsaQuantumAnalysisTest
         int n = 256;     // 多项式次数
 
         log.info("[Module-SIS] q={}, k={}, l={}, n={}", q, k, l, n);
+        Tracer.trace("start", new Object[]{"q", q, "k", k, "l", l, "n", n},
+            "Module-SIS 结构演示", "start");
 
         // 1. 生成随机矩阵 A（k×l 个多项式）
         int[][][] A = new int[k][l][n];
@@ -105,12 +115,19 @@ public class MlDsaQuantumAnalysisTest
             }
         }
 
+        Tracer.trace("sampleMatrixA",
+            new Object[]{"q", q, "k", k, "l", l, "n", n, "A[0][0][0]", A[0][0][0]},
+            "A ∈ R_q^{k×l}", "lattice");
+
         // 2. 无"短"约束：找 z 使得 A·z = 0 (mod q)
         // 这是线性方程组，有 l·n = 1024 个未知数，k·n = 1024 个方程
         // 当 l > k 时（ML-DSA-65: l=5, k=6），有非平凡解
         // 但 ML-DSA-44 是 l=k=4，只有零解（除非 A 奇异）
         log.info("[无约束] 未知数 = l·n = {}，方程 = k·n = {}", l * n, k * n);
         log.info("[关键] 要非平凡解，必须 l > k（ML-DSA-65: l=5, k=6）");
+        Tracer.trace("constraintDim",
+            new Object[]{"unknowns", l * n, "equations", k * n},
+            "l = k = 4，仅有零解", "lattice");
 
         // 3. 有"短"约束：找 z 使得 A·z = 0 且 ‖z‖∞ ≤ B
         // 暴力搜索：每个系数有 (2B+1) 种选择，总共 (2B+1)^{l·n} 种
@@ -121,13 +138,28 @@ public class MlDsaQuantumAnalysisTest
         double searchSpaceBits = Math.log(2 * gamma1_44 + 1) / Math.log(2) * dim;
         log.info("[有约束] B = γ₁ = {}, 维度 = {}, 搜索空间 ≈ 2^{}",
             gamma1_44, dim, (int) searchSpaceBits);
+        Tracer.trace("searchSpace",
+            new Object[]{"gamma1", gamma1_44, "dim", dim},
+            "2^" + (int)searchSpaceBits, "lattice");
+        Tracer.traceDecision("searchSpaceCheck",
+            new Object[]{"bits", (int)searchSpaceBits}, searchSpaceBits >= 1000,
+            "lattice", "搜索空间 ≥ 2^1000 ?");
         Assert.assertTrue("搜索空间 ≥ 2^1000", searchSpaceBits >= 1000);
 
         // 4. 格约减算法：BKZ-256 的启发式复杂度 ≈ 2^{0.292·dim}
         double bkzComplexity = 0.292 * dim;
         log.info("[BKZ] 格约减复杂度 ≈ 2^{}，量子下 Grover 加速到 2^{}",
             (int) bkzComplexity, (int) (bkzComplexity / 2));
+        Tracer.trace("bkzComplexity",
+            new Object[]{"dim", dim, "exponent", 0.292},
+            "2^" + (int)bkzComplexity + "（Grover 后 2^" + (int)(bkzComplexity / 2) + "）",
+            "lattice");
+        Tracer.traceDecision("bkzCheck",
+            new Object[]{"bits", (int)bkzComplexity}, bkzComplexity >= 100,
+            "lattice", "BKZ 复杂度 ≥ 2^100 ?");
         Assert.assertTrue("BKZ 复杂度 ≥ 2^100", bkzComplexity >= 100);
+        Tracer.trace("end", new Object[]{"bkzBits", (int)bkzComplexity},
+            "量子下仍指数时间（归约到 SVP）", "end");
     }
 
     /**
@@ -140,18 +172,27 @@ public class MlDsaQuantumAnalysisTest
      *
      * <p>本测试演示两者的结构差异。
      */
+    @TraceExecution(value = "SIS 与 LWE 的对偶关系对比", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void compareSisAndLwe()
     {
         log.info("[SIS vs LWE] 两种困难问题的对比");
+        Tracer.trace("start", new Object[]{"problems", 2},
+            "SIS vs LWE", "start");
 
         // 1. SIS：找短 z 使得 A·z = 0 (mod q)
         log.info("[SIS] 等式约束：A·z = 0，困难性来自'短'");
         log.info("[SIS] 应用：签名（ML-DSA），签名 = 短向量 z");
+        Tracer.trace("sis",
+            new Object[]{"equation", "A·z = 0", "hardness", "短向量 z"},
+            "签名 = 短向量 z（ML-DSA）", "compare");
 
         // 2. LWE：从 (A, t = A·s + e) 反解 s
         log.info("[LWE] 噪声约束：t = A·s + e，困难性来自'噪声 e'");
         log.info("[LWE] 应用：加密/KEM（ML-KEM），密文 = 带噪声样本");
+        Tracer.trace("lwe",
+            new Object[]{"equation", "t = A·s + e", "hardness", "噪声 e"},
+            "密文 = 带噪声样本（ML-KEM）", "compare");
 
         // 3. 量子抗性：两者都没有已知的多项式时间量子算法
         log.info("[量子] SIS 和 LWE 量子下都归约到 SVP，最好算法仍指数时间");
@@ -160,7 +201,15 @@ public class MlDsaQuantumAnalysisTest
         int mldsaDim = 4 * 256; // ML-DSA-44: k=4, n=256
         int mlkemDim = 2 * 256; // ML-KEM-512: k=2, n=256
         log.info("[维度] ML-DSA-44 格维度={}, ML-KEM-512 格维度={}", mldsaDim, mlkemDim);
+        Tracer.trace("dimensions",
+            new Object[]{"mldsaDim", mldsaDim, "mlkemDim", mlkemDim},
+            "ML-DSA-44 维度 ≥ ML-KEM-512", "compare");
+        Tracer.traceDecision("dimCheck",
+            new Object[]{"mldsaDim", mldsaDim, "mlkemDim", mlkemDim},
+            mldsaDim >= mlkemDim, "compare", "ML-DSA 维度 ≥ ML-KEM ?");
         Assert.assertTrue("ML-DSA 维度 ≥ ML-KEM", mldsaDim >= mlkemDim);
+        Tracer.trace("end", new Object[]{"mldsaDim", mldsaDim, "mlkemDim", mlkemDim},
+            "两者都归约到 SVP", "end");
     }
 
     // =====================================================================
@@ -176,6 +225,7 @@ public class MlDsaQuantumAnalysisTest
      *
      * <p>本测试演示拒绝采样的核心逻辑。
      */
+    @TraceExecution(value = "拒绝采样隐藏 ML-DSA 私钥", algorithm = "PQC", flow = "PQC-MLDSA")
     @Test
     public void rejectionSamplingHidesSecretKey()
     {
@@ -186,6 +236,10 @@ public class MlDsaQuantumAnalysisTest
         int threshold = gamma1 - beta;
 
         log.info("[拒绝采样] γ₁={}, β={}, 阈值={}", gamma1, beta, threshold);
+        Tracer.trace("start",
+            new Object[]{"q", q, "n", n, "gamma1", gamma1, "beta", beta,
+                "threshold", threshold},
+            "拒绝采样", "start");
 
         // 1. 模拟签名：z = y + c·s1
         int[] y = new int[n];
@@ -221,6 +275,9 @@ public class MlDsaQuantumAnalysisTest
             z[i] = (y[i] + cs1[i]) % q;
             if (z[i] < 0) z[i] += q;
         }
+        Tracer.trace("sign",
+            new Object[]{"tau", tau, "gamma1", gamma1, "beta", beta, "z[0]", z[0]},
+            "z = y + c·s1 (mod q)", "sign");
 
         // 2. 检查 ‖z‖∞（中心化后）
         int maxAbs = 0;
@@ -234,10 +291,18 @@ public class MlDsaQuantumAnalysisTest
         log.info("[签名] ‖z‖∞ = {}，阈值 = {}", maxAbs, threshold);
         boolean accept = maxAbs < threshold;
         log.info("[结果] {}", accept ? "接受" : "拒绝（重做）");
+        Tracer.trace("norm",
+            new Object[]{"maxAbs", maxAbs, "threshold", threshold},
+            "‖z‖∞ = " + maxAbs, "sign");
+        Tracer.traceDecision("rejectionCheck",
+            new Object[]{"maxAbs", maxAbs, "threshold", threshold}, accept,
+            "reject", "‖z‖∞ < γ₁ − β ?");
 
         // 3. 拒绝采样的效果：z 的分布在 [−threshold, threshold] 内均匀
         // 与 s1 无关，签名不泄漏私钥
         log.info("[关键] 拒绝后 z 的分布与 s1 无关 → 签名不泄漏私钥");
+        Tracer.trace("end", new Object[]{"accepted", accept, "maxAbs", maxAbs},
+            "拒绝后分布与 s1 无关", "end");
     }
 
     /**
@@ -275,12 +340,15 @@ public class MlDsaQuantumAnalysisTest
      *
      * <p>本测试演示 Fiat-Shamir 的核心逻辑。
      */
+    @TraceExecution(value = "Fiat-Shamir：签名非交互化", algorithm = "PQC", flow = "PQC-MLDSA")
     @Test
     public void fiatShamirMakesSignatureNonInteractive()
     {
         int n = 256;
 
         log.info("[Fiat-Shamir] 把交互式证明变成非交互式签名");
+        Tracer.trace("start", new Object[]{"n", n, "tau", 39},
+            "Fiat-Shamir 变换", "start");
 
         // 1. 模拟承诺：w = A·y（简化为随机多项式）
         int[] w = new int[n];
@@ -289,6 +357,9 @@ public class MlDsaQuantumAnalysisTest
         {
             w[i] = new SecureRandom().nextInt(8380417);
         }
+        Tracer.trace("commitment",
+            new Object[]{"n", n, "w[0]", w[0]},
+            "w = A·y（简化为随机多项式）", "sign");
 
         // 2. 模拟消息
         byte[] message = "Hello, ML-DSA!".getBytes();
@@ -305,6 +376,9 @@ public class MlDsaQuantumAnalysisTest
         byte[] input = concat(wBytes, message);
         byte[] challengeHash = shake256(input, 32);
         log.info("[挑战] c = H(w ‖ message) = {}...", bytesToHex(challengeHash, 4));
+        Tracer.trace("challenge",
+            new Object[]{"message", "Hello, ML-DSA!", "hashBytes", challengeHash.length},
+            "c = " + bytesToHex(challengeHash, 4), "sign");
 
         // 4. 从 challengeHash 展开成稀疏多项式 c（sampleInBall）
         int[] c = sampleInBall(challengeHash, 39, n);
@@ -314,11 +388,23 @@ public class MlDsaQuantumAnalysisTest
             if (c[i] != 0) nonZero++;
         }
         log.info("[展开] c 有 {} 个非零系数（τ=39）", nonZero);
+        Tracer.trace("sampleInBall",
+            new Object[]{"tau", 39, "n", n, "nonZero", nonZero},
+            "signature = (z, c)", "sign");
+        Tracer.trace("verify",
+            new Object[]{"challengeHash", bytesToHex(challengeHash, 4),
+                "wBytes", wBytes.length, "message", "Hello, ML-DSA!"},
+            "验证方复算同一 c，无需交互", "verify");
+        Tracer.traceDecision("checkTau",
+            new Object[]{"nonZero", nonZero, "tau", 39}, nonZero == 39,
+            "compare", "c 的非零系数数 == τ ?");
         Assert.assertEquals("c 恰好 39 个非零系数", 39, nonZero);
 
         // 5. 响应：z = y + c·s1（这里简化为随机 z）
         log.info("[响应] z = y + c·s1，签名 = (z, c)");
         log.info("[关键] c 由 H(w ‖ message) 决定，不需要 Verifier 参与");
+        Tracer.trace("end", new Object[]{"nonZero", nonZero, "tau", 39},
+            "签名 = (z, c)，非交互", "end");
     }
 
     /**
@@ -401,28 +487,42 @@ public class MlDsaQuantumAnalysisTest
      *   <li>SLH-DSA-SHAKE-128s：签名 7856 字节，量子下仍安全但签名巨大</li>
      * </ol>
      */
+    @TraceExecution(value = "ML-DSA 与经典/其他 PQC 的对比", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void compareWithClassicAndOtherPqc()
     {
         log.info("[对比] 经典签名 vs PQC 签名");
+        Tracer.trace("start", new Object[]{"schemes", 4},
+            "经典签名 vs PQC 签名", "start");
 
         // 1. RSA-2048：签名 256 字节，量子下 = 0（Shor 破产）
         int rsaSignatureSize = 256;
         int rsaQuantumSecurity = 0;
         log.info("[RSA-2048] 签名 {} 字节，量子安全性 = 0（Shor）",
             rsaSignatureSize);
+        Tracer.trace("rsa2048",
+            new Object[]{"signatureBytes", rsaSignatureSize, "quantumBits", rsaQuantumSecurity},
+            "Shor 多项式时间破解", "compare");
 
         // 2. ECDSA P-256：签名 64 字节，量子下 = 0（Shor 破产）
         int ecdsaSignatureSize = 64;
         int ecdsaQuantumSecurity = 0;
         log.info("[ECDSA P-256] 签名 {} 字节，量子安全性 = 0（Shor）",
             ecdsaSignatureSize);
+        Tracer.trace("ecdsaP256",
+            new Object[]{"signatureBytes", ecdsaSignatureSize,
+                "quantumBits", ecdsaQuantumSecurity},
+            "Shor 多项式时间破解", "compare");
 
         // 3. ML-DSA-44：签名 2420 字节，量子下 ≈ 2^{100}
         int mldsa44SignatureSize = 2420;
         int mldsa44QuantumSecurity = 100;
         log.info("[ML-DSA-44] 签名 {} 字节，量子安全性 ≈ 2^{}",
             mldsa44SignatureSize, mldsa44QuantumSecurity);
+        Tracer.trace("mlDsa44",
+            new Object[]{"signatureBytes", mldsa44SignatureSize,
+                "quantumBits", mldsa44QuantumSecurity},
+            "Grover 后仍 2^" + mldsa44QuantumSecurity, "compare");
         Assert.assertTrue("ML-DSA 量子下仍安全", mldsa44QuantumSecurity >= 100);
 
         // 4. SLH-DSA-SHAKE-128s：签名 7856 字节，量子下 ≈ 2^{128}
@@ -430,9 +530,21 @@ public class MlDsaQuantumAnalysisTest
         int slhdsaQuantumSecurity = 128;
         log.info("[SLH-DSA-128s] 签名 {} 字节，量子安全性 ≈ 2^{}",
             slhdsaSignatureSize, slhdsaQuantumSecurity);
+        Tracer.trace("slhDsa128s",
+            new Object[]{"signatureBytes", slhdsaSignatureSize,
+                "quantumBits", slhdsaQuantumSecurity},
+            "仅依赖哈希，签名 7856 字节", "compare");
 
         // 5. 结论：ML-DSA 签名比 SLH-DSA 小 3 倍，但比经典签名大 40 倍
         log.info("[结论] ML-DSA 用签名大小换量子安全性，比 SLH-DSA 紧凑");
+        Tracer.trace("signatureSize",
+            new Object[]{"RSA", rsaSignatureSize, "ECDSA", ecdsaSignatureSize,
+                "ML-DSA", mldsa44SignatureSize, "SLH-DSA", slhdsaSignatureSize},
+            "ML-DSA 比 SLH-DSA 小 3 倍，比经典大 40 倍", "compare");
+        Tracer.trace("end",
+            new Object[]{"quantumBits", mldsa44QuantumSecurity,
+                "signatureBytes", mldsa44SignatureSize},
+            "用签名大小换量子安全性", "end");
     }
 
     /**
@@ -442,10 +554,13 @@ public class MlDsaQuantumAnalysisTest
      *
      * <p>本测试验证参数表的正确性。
      */
+    @TraceExecution(value = "ML-DSA 参数选择与 NIST 安全级别", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void parameterChoicesFollowQuantumSecurityLevels()
     {
         log.info("[参数选择] ML-DSA 三个级别的设计逻辑");
+        Tracer.trace("start", new Object[]{"levels", 3},
+            "ML-DSA 参数表", "start");
 
         // ML-DSA-44：NIST 级别 1（≈ AES-128）
         int k44 = 4;
@@ -455,6 +570,9 @@ public class MlDsaQuantumAnalysisTest
         int signatureLen44 = 2420; // FIPS 204 表 2
         log.info("[ML-DSA-44] k={}, l={}, η={}, τ={} → 签名 {} 字节",
             k44, l44, eta44, tau44, signatureLen44);
+        Tracer.trace("mlDsa44",
+            new Object[]{"k", k44, "l", l44, "eta", eta44, "tau", tau44},
+            "signatureLen = " + signatureLen44, "params");
         Assert.assertEquals("ML-DSA-44 签名 2420 字节", 2420, signatureLen44);
 
         // ML-DSA-65：NIST 级别 3（≈ AES-192）
@@ -465,6 +583,9 @@ public class MlDsaQuantumAnalysisTest
         int signatureLen65 = 3309; // FIPS 204 表 2
         log.info("[ML-DSA-65] k={}, l={}, η={}, τ={} → 签名 {} 字节",
             k65, l65, eta65, tau65, signatureLen65);
+        Tracer.trace("mlDsa65",
+            new Object[]{"k", k65, "l", l65, "eta", eta65, "tau", tau65},
+            "signatureLen = " + signatureLen65, "params");
         Assert.assertEquals("ML-DSA-65 签名 3309 字节", 3309, signatureLen65);
 
         // ML-DSA-87：NIST 级别 5（≈ AES-256）
@@ -475,9 +596,20 @@ public class MlDsaQuantumAnalysisTest
         int signatureLen87 = 4627; // FIPS 204 表 2
         log.info("[ML-DSA-87] k={}, l={}, η={}, τ={} → 签名 {} 字节",
             k87, l87, eta87, tau87, signatureLen87);
+        Tracer.trace("mlDsa87",
+            new Object[]{"k", k87, "l", l87, "eta", eta87, "tau", tau87},
+            "signatureLen = " + signatureLen87, "params");
         Assert.assertEquals("ML-DSA-87 签名 4627 字节", 4627, signatureLen87);
 
+        Tracer.traceDecision("checkMonotonic",
+            new Object[]{"len44", signatureLen44, "len65", signatureLen65,
+                "len87", signatureLen87},
+            signatureLen44 < signatureLen65 && signatureLen65 < signatureLen87,
+            "params", "签名长度随安全级别递增 ?");
+
         log.info("[结论] k/l 增大 → 格维度增大 → 量子安全性增大 → 签名也增大");
+        Tracer.trace("end", new Object[]{"maxSignature", signatureLen87},
+            "k/l 增大 → 格维度增大 → 签名增大", "end");
     }
 
     /**
@@ -488,6 +620,7 @@ public class MlDsaQuantumAnalysisTest
      *
      * <p>本测试演示 Grover 的影响。
      */
+    @TraceExecution(value = "Grover 让 ML-DSA 安全性减半", algorithm = "PQC", flow = "PQC-QUANTUM")
     @Test
     public void groverOnlyHalvesSecurity()
     {
@@ -499,8 +632,14 @@ public class MlDsaQuantumAnalysisTest
         int dim44 = k44 * n;
         double classicalSecurity44 = 0.292 * dim44; // BKZ 启发式
         double quantumSecurity44 = classicalSecurity44 / 2;
+        Tracer.trace("start", new Object[]{"k", k44, "n", n, "dim", dim44},
+            "Grover 二次加速", "start");
         log.info("[ML-DSA-44] 格维度={}, 经典安全性≈2^{}, 量子安全性≈2^{}",
             dim44, (int) classicalSecurity44, (int) quantumSecurity44);
+        Tracer.trace("mlDsa44",
+            new Object[]{"dim", dim44, "classicalBits", (int)classicalSecurity44,
+                "quantumBits", (int)quantumSecurity44},
+            "2^" + (int)classicalSecurity44 + " → 2^" + (int)quantumSecurity44, "grover");
         Assert.assertTrue("量子安全性 ≥ 100", quantumSecurity44 >= 100);
 
         // 2. ML-DSA-65：格维度 = 6·256 = 1536
@@ -509,6 +648,10 @@ public class MlDsaQuantumAnalysisTest
         double classicalSecurity65 = 0.292 * dim65;
         double quantumSecurity65 = classicalSecurity65 / 2;
         log.info("[ML-DSA-65] 格维度={}, 量子安全性≈2^{}", dim65, (int) quantumSecurity65);
+        Tracer.trace("mlDsa65",
+            new Object[]{"dim", dim65, "classicalBits", (int)classicalSecurity65,
+                "quantumBits", (int)quantumSecurity65},
+            "2^" + (int)classicalSecurity65 + " → 2^" + (int)quantumSecurity65, "grover");
         Assert.assertTrue("量子安全性 ≥ 150", quantumSecurity65 >= 150);
 
         // 3. ML-DSA-87：格维度 = 8·256 = 2048
@@ -517,9 +660,22 @@ public class MlDsaQuantumAnalysisTest
         double classicalSecurity87 = 0.292 * dim87;
         double quantumSecurity87 = classicalSecurity87 / 2;
         log.info("[ML-DSA-87] 格维度={}, 量子安全性≈2^{}", dim87, (int) quantumSecurity87);
+        Tracer.trace("mlDsa87",
+            new Object[]{"dim", dim87, "classicalBits", (int)classicalSecurity87,
+                "quantumBits", (int)quantumSecurity87},
+            "2^" + (int)classicalSecurity87 + " → 2^" + (int)quantumSecurity87, "grover");
         Assert.assertTrue("量子安全性 ≥ 200", quantumSecurity87 >= 200);
+
+        Tracer.traceDecision("halvingCheck",
+            new Object[]{"classicalBits44", (int)classicalSecurity44,
+                "quantumBits44", (int)quantumSecurity44},
+            (int)quantumSecurity44 == (int)classicalSecurity44 / 2,
+            "grover", "量子安全性 ≈ 经典安全性 / 2 ?");
 
         // 4. 对比：ECDSA P-256 在量子下是多项式时间（Shor），完全破产
         log.info("[对比] ECDSA P-256 量子下 = 多项式时间（Shor），ML-DSA-44 量子下 ≈ 2^{100}");
+        Tracer.trace("end",
+            new Object[]{"levels", 3, "maxQuantumBits", (int)quantumSecurity87},
+            "仅二次加速，不是多项式", "end");
     }
 }
