@@ -63,6 +63,39 @@ test {
     }
 }
 
+// 跑完测试后审计生成的 trace HTML：事件与流程图节点必须一一映射、顺序一致、无遗漏。
+// 没有 Node.js 时打印提示并跳过，不阻塞测试。
+def findNode() {
+    def os = org.gradle.internal.os.OperatingSystem.current()
+    def names = os.windows ? ['node.exe', 'node'] : ['node']
+    for (name in names) {
+        try {
+            def proc = [name, '--version'].execute()
+            proc.waitFor()
+            if (proc.exitValue() == 0) return name
+        } catch (ignored) {}
+    }
+    return null
+}
+
+def nodeCmd = findNode()
+
+tasks.register('traceAudit', Exec) {
+    group = 'verification'
+    description = '审计生成的 trace HTML：事件与流程图节点映射、顺序、覆盖、标题'
+    workingDir = projectDir
+    commandLine nodeCmd ?: 'echo', nodeCmd ? 'scripts/trace-audit.js' : 'Node.js not found — skipping trace audit'
+    onlyIf {
+        if (nodeCmd == null) {
+            logger.lifecycle('[traceAudit] Node.js not found on PATH — skipping trace HTML audit')
+            return false
+        }
+        return true
+    }
+}
+
+test.finalizedBy traceAudit
+
 // No coverage reports needed for learning code.
 tasks.named('jacocoTestReport') {
     enabled = false
