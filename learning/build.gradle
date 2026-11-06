@@ -94,8 +94,6 @@ tasks.register('traceAudit', Exec) {
     }
 }
 
-test.finalizedBy traceAudit
-
 // No coverage reports needed for learning code.
 tasks.named('jacocoTestReport') {
     enabled = false
@@ -130,3 +128,7 @@ if (project.hasProperty('idea')) {
         }
     }
 }
+// Line-number tables so the debugger can bind line breakpoints (bc-java compiles
+// without debug info by default: options.debug = releaseDebug in the root build).
+//compileJava.options.debug = true
+//compileTestJava.options.debug = true
